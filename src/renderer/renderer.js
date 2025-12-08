@@ -30,6 +30,7 @@ const elements = {
   settingsForm: document.getElementById('settings-form'),
   supabaseUrl: document.getElementById('supabase-url'),
   supabaseKey: document.getElementById('supabase-key'),
+  taskSecret: document.getElementById('task-secret'),
   openagiKey: document.getElementById('openagi-key'),
   outputFolder: document.getElementById('output-folder'),
   btnSelectOutput: document.getElementById('btn-select-output'),
@@ -56,7 +57,8 @@ async function init() {
   const config = await window.electronAPI.getConfig();
   if (config) {
     elements.supabaseUrl.value = config.supabaseUrl || '';
-    elements.supabaseKey.value = config.supabaseServiceKey || '';
+    elements.supabaseKey.value = config.supabaseAnonKey || '';
+    elements.taskSecret.value = config.taskSecret || '';
     elements.openagiKey.value = config.openAgiApiKey || '';
     elements.outputFolder.value = config.outputFolder || '';
     
@@ -74,11 +76,13 @@ async function init() {
 
 // Update connection info display
 function updateConnectionInfo(config) {
-  const hasSupabase = config.supabaseUrl && config.supabaseServiceKey;
+  const hasSupabase = config.supabaseUrl && config.supabaseAnonKey;
+  const hasTaskSecret = config.taskSecret;
   const hasOpenAgi = config.openAgiApiKey;
   
   let html = '<ul style="list-style: none; padding: 0; margin: 0;">';
   html += `<li>${hasSupabase ? '✅' : '❌'} Supabase configured</li>`;
+  html += `<li>${hasTaskSecret ? '✅' : '⚠️'} Task Secret ${hasTaskSecret ? 'configured' : '(optional until task assigned)'}</li>`;
   html += `<li>${hasOpenAgi ? '✅' : '❌'} OpenAGI (Lux) configured</li>`;
   html += '</ul>';
   
@@ -303,7 +307,8 @@ async function saveSettings(e) {
   
   const config = {
     supabaseUrl: elements.supabaseUrl.value.trim(),
-    supabaseServiceKey: elements.supabaseKey.value.trim(),
+    supabaseAnonKey: elements.supabaseKey.value.trim(),
+    taskSecret: elements.taskSecret.value.trim(),
     openAgiApiKey: elements.openagiKey.value.trim(),
     outputFolder: elements.outputFolder.value.trim()
   };
