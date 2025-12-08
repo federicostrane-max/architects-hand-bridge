@@ -6,21 +6,39 @@ class SupabaseClient {
     this.subscription = null;
     this.onStepCallback = null;
     this.onTaskCallback = null;
+    this.taskSecret = null;
   }
 
-  connect(url, serviceKey) {
-    if (!url || !serviceKey) {
-      throw new Error('Supabase URL and Service Key are required');
+  connect(url, anonKey, taskSecret = null) {
+    if (!url || !anonKey) {
+      throw new Error('Supabase URL and Anon Key are required');
     }
 
-    this.client = createClient(url, serviceKey, {
+    const options = {
       auth: {
         persistSession: false,
         autoRefreshToken: false
       }
-    });
+    };
+
+    // Add task_secret header if provided (for RLS policy authentication)
+    if (taskSecret) {
+      options.global = {
+        headers: {
+          'x-task-secret': taskSecret
+        }
+      };
+      this.taskSecret = taskSecret;
+    }
+
+    this.client = createClient(url, anonKey, options);
 
     return this.client;
+  }
+
+  // Allow updating task secret without full reconnect
+  setTaskSecret(taskSecret) {
+    this.taskSecret = taskSecret;
   }
 
   async testConnection() {
@@ -292,6 +310,7 @@ class SupabaseClient {
       this.subscription = null;
     }
     this.client = null;
+    this.taskSecret = null;
   }
 }
 
