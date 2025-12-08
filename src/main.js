@@ -10,7 +10,8 @@ let browserWindow = null;
 // Store config
 let config = {
   supabaseUrl: '',
-  supabaseServiceKey: '',
+  supabaseAnonKey: '',
+  taskSecret: '',
   openAgiApiKey: '',
   inputFolders: [],
   outputFolder: ''
