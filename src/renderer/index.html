@@ -122,9 +122,15 @@
               </div>
               
               <div class="form-group">
-                <label for="supabase-key">Supabase Service Role Key</label>
+                <label for="supabase-key">Supabase Anon Key</label>
                 <input type="password" id="supabase-key" placeholder="eyJhbGciOiJIUzI1NiIs..." />
-                <small>⚠️ This key stays on your PC only</small>
+                <small>ℹ️ Public anon key (safe to use client-side)</small>
+              </div>
+              
+              <div class="form-group">
+                <label for="task-secret">Task Secret (UUID)</label>
+                <input type="password" id="task-secret" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" />
+                <small>🔐 Required to access task data. Get this from Interface Expert when task is created.</small>
               </div>
               
               <div class="form-group">
