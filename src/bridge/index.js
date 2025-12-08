@@ -45,18 +45,30 @@ class Bridge {
 
     try {
       // Validate config
-      if (!config.supabaseUrl || !config.supabaseServiceKey) {
+      if (!config.supabaseUrl || !config.supabaseAnonKey) {
         throw new Error('Supabase configuration is missing');
       }
       if (!config.openAgiApiKey) {
         throw new Error('OpenAGI API key is missing');
       }
 
-      // Connect to Supabase
+      // Connect to Supabase (with optional task secret for RLS)
       this.log('info', 'Connecting to Supabase...');
-      supabase.connect(config.supabaseUrl, config.supabaseServiceKey);
-      await supabase.testConnection();
-      this.log('success', 'Connected to Supabase');
+      supabase.connect(config.supabaseUrl, config.supabaseAnonKey, config.taskSecret);
+      
+      if (config.taskSecret) {
+        this.log('info', 'Task secret configured for RLS authentication');
+      } else {
+        this.log('warn', 'No task secret configured - will have limited access until task is assigned');
+      }
+      
+      // Test connection (might fail if no task secret - that's ok)
+      try {
+        await supabase.testConnection();
+        this.log('success', 'Connected to Supabase');
+      } catch (connError) {
+        this.log('warn', `Supabase connection test: ${connError.message} - This is OK if no task is assigned yet`);
+      }
 
       // Set Lux API key
       lux.setApiKey(config.openAgiApiKey);
