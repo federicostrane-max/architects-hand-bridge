@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';">
+  <title>Architect's Hand - Local Bridge</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app-container">
+    <!-- Header -->
+    <header class="app-header">
+      <div class="header-left">
+        <h1>🤖 Architect's Hand</h1>
+        <span class="subtitle">Local Bridge</span>
+      </div>
+      <div class="header-right">
+        <div class="status-indicator" id="status-indicator">
+          <span class="status-dot"></span>
+          <span class="status-text">Disconnected</span>
+        </div>
+      </div>
+    </header>
+
+    <!-- Main Content -->
+    <main class="main-content">
+      <!-- Sidebar -->
+      <aside class="sidebar">
+        <nav class="nav-tabs">
+          <button class="nav-tab active" data-tab="dashboard">📊 Dashboard</button>
+          <button class="nav-tab" data-tab="tasks">📋 Tasks</button>
+          <button class="nav-tab" data-tab="settings">⚙️ Settings</button>
+        </nav>
+      </aside>
+
+      <!-- Content Area -->
+      <div class="content-area">
+        <!-- Dashboard Tab -->
+        <section class="tab-content active" id="tab-dashboard">
+          <div class="dashboard-grid">
+            <!-- Control Panel -->
+            <div class="card control-panel">
+              <h2>Control Panel</h2>
+              <div class="control-buttons">
+                <button class="btn btn-primary btn-large" id="btn-start">
+                  ▶️ Start Bridge
+                </button>
+                <button class="btn btn-warning" id="btn-pause" disabled>
+                  ⏸️ Pause
+                </button>
+                <button class="btn btn-danger" id="btn-stop" disabled>
+                  ⏹️ Stop
+                </button>
+              </div>
+              <div class="connection-info" id="connection-info">
+                <p>Configure your API keys in Settings to start</p>
+              </div>
+            </div>
+
+            <!-- Current Task -->
+            <div class="card current-task">
+              <h2>Current Task</h2>
+              <div id="current-task-content">
+                <p class="empty-state">No active task</p>
+              </div>
+            </div>
+
+            <!-- Current Step -->
+            <div class="card current-step">
+              <h2>Current Step</h2>
+              <div id="current-step-content">
+                <p class="empty-state">Waiting for task...</p>
+              </div>
+              <div class="step-progress" id="step-progress" style="display: none;">
+                <div class="progress-bar">
+                  <div class="progress-fill" id="progress-fill"></div>
+                </div>
+                <span class="progress-text" id="progress-text">0%</span>
+              </div>
+            </div>
+
+            <!-- Screenshot Preview -->
+            <div class="card screenshot-preview">
+              <h2>Browser View</h2>
+              <div class="screenshot-container" id="screenshot-container">
+                <p class="empty-state">No screenshot available</p>
+              </div>
+            </div>
+          </div>
+
+          <!-- Log Panel -->
+          <div class="card log-panel">
+            <div class="log-header">
+              <h2>📜 Activity Log</h2>
+              <button class="btn btn-small" id="btn-clear-log">Clear</button>
+            </div>
+            <div class="log-container" id="log-container">
+              <p class="log-entry log-info">Welcome to Architect's Hand Bridge</p>
+            </div>
+          </div>
+        </section>
+
+        <!-- Tasks Tab -->
+        <section class="tab-content" id="tab-tasks">
+          <div class="card">
+            <h2>Task Queue</h2>
+            <div class="task-list" id="task-list">
+              <p class="empty-state">No tasks in queue</p>
+            </div>
+          </div>
+        </section>
+
+        <!-- Settings Tab -->
+        <section class="tab-content" id="tab-settings">
+          <div class="card settings-card">
+            <h2>🔑 API Configuration</h2>
+            <form id="settings-form">
+              <div class="form-group">
+                <label for="supabase-url">Supabase URL</label>
+                <input type="text" id="supabase-url" placeholder="https://your-project.supabase.co" />
+              </div>
+              
+              <div class="form-group">
+                <label for="supabase-key">Supabase Service Role Key</label>
+                <input type="password" id="supabase-key" placeholder="eyJhbGciOiJIUzI1NiIs..." />
+                <small>⚠️ This key stays on your PC only</small>
+              </div>
+              
+              <div class="form-group">
+                <label for="openagi-key">OpenAGI (Lux) API Key</label>
+                <input type="password" id="openagi-key" placeholder="sk-..." />
+                <small>⚠️ This key stays on your PC only</small>
+              </div>
+
+              <div class="form-divider"></div>
+
+              <h2>📁 Default Folders</h2>
+              
+              <div class="form-group">
+                <label>Output Folder (for downloaded files)</label>
+                <div class="folder-input">
+                  <input type="text" id="output-folder" readonly placeholder="Click to select..." />
+                  <button type="button" class="btn" id="btn-select-output">Browse</button>
+                </div>
+              </div>
+
+              <div class="form-actions">
+                <button type="submit" class="btn btn-primary">💾 Save Settings</button>
+                <span class="save-status" id="save-status"></span>
+              </div>
+            </form>
+          </div>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <script src="renderer.js"></script>
+</body>
+</html>
