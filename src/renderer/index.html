@@ -39,11 +39,48 @@
         <!-- Dashboard Tab -->
         <section class="tab-content active" id="tab-dashboard">
           <div class="dashboard-grid">
+            
+            <!-- Auth Panel -->
+            <div class="card auth-panel" id="auth-panel">
+              <h2>🔐 Account</h2>
+              
+              <!-- Login Form (shown when logged out) -->
+              <div id="login-section">
+                <form id="login-form">
+                  <div class="form-group">
+                    <label for="login-email">Email</label>
+                    <input type="email" id="login-email" placeholder="your@email.com" required />
+                  </div>
+                  <div class="form-group">
+                    <label for="login-password">Password</label>
+                    <input type="password" id="login-password" placeholder="••••••••" required />
+                  </div>
+                  <div class="form-actions">
+                    <button type="submit" class="btn btn-primary">🔓 Login</button>
+                    <span class="login-error" id="login-error"></span>
+                  </div>
+                </form>
+                <p class="auth-hint">Usa le stesse credenziali della tua web app.</p>
+              </div>
+              
+              <!-- User Info (shown when logged in) -->
+              <div id="user-section" style="display: none;">
+                <div class="user-info">
+                  <span class="user-avatar">👤</span>
+                  <div class="user-details">
+                    <span class="user-email" id="user-email">-</span>
+                    <span class="user-status">✅ Logged in</span>
+                  </div>
+                </div>
+                <button class="btn btn-secondary" id="btn-logout">🚪 Logout</button>
+              </div>
+            </div>
+
             <!-- Control Panel -->
             <div class="card control-panel">
               <h2>Control Panel</h2>
               <div class="control-buttons">
-                <button class="btn btn-primary btn-large" id="btn-start">
+                <button class="btn btn-primary btn-large" id="btn-start" disabled>
                   ▶️ Start Bridge
                 </button>
                 <button class="btn btn-warning" id="btn-pause" disabled>
@@ -54,7 +91,7 @@
                 </button>
               </div>
               <div class="connection-info" id="connection-info">
-                <p>Configure your API keys in Settings to start</p>
+                <p>Login to start receiving tasks</p>
               </div>
             </div>
 
@@ -125,12 +162,6 @@
                 <label for="supabase-key">Supabase Anon Key</label>
                 <input type="password" id="supabase-key" placeholder="eyJhbGciOiJIUzI1NiIs..." />
                 <small>ℹ️ Public anon key (safe to use client-side)</small>
-              </div>
-              
-              <div class="form-group">
-                <label for="task-secret">Task Secret (UUID)</label>
-                <input type="password" id="task-secret" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" />
-                <small>🔐 Required to access task data. Get this from Interface Expert when task is created.</small>
               </div>
               
               <div class="form-group">
