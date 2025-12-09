@@ -17,21 +17,8 @@ class BrowserController {
 
     console.log('[Browser] Launching Chromium...');
 
-    // Determine executable path based on environment
-    let executablePath = null;
-    
-    // In packaged app, use bundled browser
-    if (process.resourcesPath) {
-      const possiblePaths = [
-        path.join(process.resourcesPath, 'playwright-browsers', 'chromium-*/chrome-win/chrome.exe'),
-        path.join(process.resourcesPath, 'playwright-browsers', 'chromium*/chrome.exe')
-      ];
-      // Will use system Playwright if bundled not found
-    }
-
-    this.browser = await chromium.launch({
-      headless: false, // Show browser window
-      executablePath: executablePath,
+    const launchOptions = {
+      headless: false,
       args: [
         '--disable-blink-features=AutomationControlled',
         '--disable-web-security',
@@ -41,7 +28,9 @@ class BrowserController {
         '--window-size=1280,800'
       ],
       ...options
-    });
+    };
+
+    this.browser = await chromium.launch(launchOptions);
 
     // Create context with viewport
     this.context = await this.browser.newContext({
