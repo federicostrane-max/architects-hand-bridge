@@ -16,6 +16,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   stopBridge: () => ipcRenderer.invoke('bridge:stop'),
   pauseBridge: () => ipcRenderer.invoke('bridge:pause'),
   resumeBridge: () => ipcRenderer.invoke('bridge:resume'),
+  getBridgeState: () => ipcRenderer.invoke('bridge:getState'),
   
   // Folder selection
   selectFolder: (options) => ipcRenderer.invoke('dialog:selectFolder', options),
