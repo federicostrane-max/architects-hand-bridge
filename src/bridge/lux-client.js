@@ -4,7 +4,6 @@
  */
 
 const https = require('https');
-const http = require('http');
 
 class LuxClient {
   constructor() {
@@ -25,10 +24,6 @@ class LuxClient {
 
   /**
    * Execute a step - send screenshot and instruction to Lux
-   * @param {string} screenshotBase64 - Base64 encoded screenshot
-   * @param {string} instruction - What to do
-   * @param {string} context - Additional context
-   * @returns {Object} - { status, actions, feedback, raw }
    */
   async executeStep(screenshotBase64, instruction, context = '') {
     if (!this.apiKey) {
@@ -39,12 +34,14 @@ class LuxClient {
       // Step 1: Get presigned URL for upload
       console.log('[Lux] Getting presigned URL...');
       const uploadInfo = await this.getPresignedUrl();
+      console.log('[Lux] Got presigned URL');
       
-      // Step 2: Upload screenshot to S3
+      // Step 2: Upload screenshot to S3 using the "url" field (NOT upload_url)
       console.log('[Lux] Uploading screenshot to S3...');
-      await this.uploadToS3(uploadInfo.upload_url, screenshotBase64);
+      await this.uploadToS3(uploadInfo.url, screenshotBase64);
+      console.log('[Lux] Screenshot uploaded successfully');
       
-      // Step 3: Call Lux API with the image URL
+      // Step 3: Call Lux API with the download_url
       console.log('[Lux] Calling Lux API...');
       const result = await this.callLuxApi(uploadInfo.download_url, instruction, context);
       
@@ -85,7 +82,12 @@ class LuxClient {
               return;
             }
             const parsed = JSON.parse(data);
-            console.log('[Lux] Got presigned URL');
+            // API returns: { url: "...", download_url: "...", ... }
+            console.log('[Lux] Presigned URL fields:', Object.keys(parsed).join(', '));
+            if (!parsed.url || !parsed.download_url) {
+              reject(new Error(`Invalid presigned URL response - missing url or download_url`));
+              return;
+            }
             resolve(parsed);
           } catch (e) {
             reject(new Error(`Failed to parse presigned URL response: ${e.message}`));
@@ -100,17 +102,23 @@ class LuxClient {
 
   /**
    * Upload image to S3 using presigned URL
-   * The presigned URL already contains all authentication - just PUT the raw data
    */
   async uploadToS3(presignedUrl, base64Image) {
     return new Promise((resolve, reject) => {
       const imageBuffer = Buffer.from(base64Image, 'base64');
-      const url = new URL(presignedUrl);
+      
+      let url;
+      try {
+        url = new URL(presignedUrl);
+      } catch (e) {
+        reject(new Error(`Invalid S3 URL format`));
+        return;
+      }
       
       const options = {
         hostname: url.hostname,
         port: 443,
-        path: url.pathname + url.search, // Include query string (contains signature)
+        path: url.pathname + url.search,
         method: 'PUT',
         headers: {
           'Content-Type': 'image/png',
@@ -123,10 +131,9 @@ class LuxClient {
         res.on('data', chunk => data += chunk);
         res.on('end', () => {
           if (res.statusCode >= 200 && res.statusCode < 300) {
-            console.log('[Lux] Screenshot uploaded successfully');
             resolve();
           } else {
-            reject(new Error(`S3 upload failed: ${res.statusCode} - ${data}`));
+            reject(new Error(`S3 upload failed: ${res.statusCode}`));
           }
         });
       });
@@ -142,12 +149,10 @@ class LuxClient {
    */
   async callLuxApi(imageUrl, instruction, context) {
     return new Promise((resolve, reject) => {
-      // Build the task description
       const taskDescription = context 
         ? `${context}\n\nCurrent instruction: ${instruction}`
         : instruction;
 
-      // Build messages
       const messages = [
         {
           role: 'user',
@@ -189,11 +194,12 @@ class LuxClient {
         res.on('end', () => {
           try {
             if (res.statusCode !== 200) {
-              reject(new Error(`Lux API error: ${res.statusCode} - ${data}`));
+              reject(new Error(`Lux API error: ${res.statusCode} - ${data.substring(0, 300)}`));
               return;
             }
 
             const response = JSON.parse(data);
+            console.log('[Lux] Raw response:', JSON.stringify(response).substring(0, 500));
             const result = this.parseResponse(response);
             resolve(result);
           } catch (e) {
@@ -215,19 +221,15 @@ class LuxClient {
     const actions = [];
     let feedback = '';
     
-    // Extract content from response
     const content = response.content || [];
     
     for (const block of content) {
       if (block.type === 'text') {
         feedback = block.text || '';
-        
-        // Try to parse actions from text
         const parsedActions = this.parseActionsFromText(block.text);
         actions.push(...parsedActions);
       }
       
-      // Handle tool_use blocks (Lux may return structured actions)
       if (block.type === 'tool_use') {
         const action = this.parseToolUse(block);
         if (action) {
@@ -236,7 +238,6 @@ class LuxClient {
       }
     }
 
-    // Check for computer_call in response (Lux specific format)
     if (response.computer_call) {
       const action = this.parseComputerCall(response.computer_call);
       if (action) {
@@ -254,14 +255,11 @@ class LuxClient {
 
   /**
    * Parse actions from text response
-   * Lux returns actions in format: action(params)
    */
   parseActionsFromText(text) {
     const actions = [];
     if (!text) return actions;
 
-    // Pattern: action_name(params)
-    // Examples: click(500, 300), type("hello"), scroll(0, 100, down), key(Enter)
     const actionPattern = /\b(click|type|scroll|key|drag|wait|done|complete)\s*\(([^)]*)\)/gi;
     
     let match;
@@ -304,9 +302,6 @@ class LuxClient {
     return actions;
   }
 
-  /**
-   * Parse tool_use block
-   */
   parseToolUse(block) {
     const name = block.name?.toLowerCase();
     const input = block.input || {};
@@ -349,9 +344,6 @@ class LuxClient {
     }
   }
 
-  /**
-   * Parse computer_call format (Lux specific)
-   */
   parseComputerCall(call) {
     const action = call.action?.toLowerCase();
     
@@ -399,55 +391,30 @@ class LuxClient {
     }
   }
 
-  /**
-   * Parse click from "x, y" format
-   */
   _parseClick(arg) {
-    // Handle formats: "500, 300" or "500,300" or just coordinates
     const coords = arg.split(',').map(s => parseInt(s.trim()));
     if (coords.length >= 2 && !isNaN(coords[0]) && !isNaN(coords[1])) {
-      return {
-        type: 'click',
-        x: coords[0],
-        y: coords[1],
-        button: 'left'
-      };
+      return { type: 'click', x: coords[0], y: coords[1], button: 'left' };
     }
     return null;
   }
 
-  /**
-   * Parse type from quoted string
-   */
   _parseType(arg) {
-    // Remove quotes if present
     const text = arg.replace(/^["']|["']$/g, '').trim();
     if (text) {
-      return {
-        type: 'type',
-        text: text
-      };
+      return { type: 'type', text: text };
     }
     return null;
   }
 
-  /**
-   * Parse key press
-   */
   _parseKey(arg) {
     const key = arg.replace(/^["']|["']$/g, '').trim();
     if (key) {
-      return {
-        type: 'key',
-        key: key
-      };
+      return { type: 'key', key: key };
     }
     return null;
   }
 
-  /**
-   * Parse scroll from "x, y, direction" format
-   */
   _parseScroll(arg) {
     const parts = arg.split(',').map(s => s.trim());
     if (parts.length >= 3) {
@@ -458,21 +425,12 @@ class LuxClient {
         direction: parts[2].toLowerCase()
       };
     }
-    // Simple format: just direction
     if (parts.length === 1) {
-      return {
-        type: 'scroll',
-        x: 0,
-        y: 0,
-        direction: parts[0].toLowerCase()
-      };
+      return { type: 'scroll', x: 0, y: 0, direction: parts[0].toLowerCase() };
     }
     return null;
   }
 
-  /**
-   * Parse drag from "x1, y1, x2, y2" format
-   */
   _parseDrag(arg) {
     const coords = arg.split(',').map(s => parseInt(s.trim()));
     if (coords.length >= 4) {
@@ -487,9 +445,6 @@ class LuxClient {
     return null;
   }
 
-  /**
-   * Reset session state
-   */
   resetSession() {
     this.taskId = null;
     this.messagesHistory = [];
@@ -497,5 +452,4 @@ class LuxClient {
   }
 }
 
-// Export singleton instance
 module.exports = new LuxClient();
