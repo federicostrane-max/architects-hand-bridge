@@ -1,44 +1,29 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
-// Expose protected methods to renderer
 contextBridge.exposeInMainWorld('electronAPI', {
   // Config
-  getConfig: () => ipcRenderer.invoke('get-config'),
-  saveConfig: (config) => ipcRenderer.invoke('save-config', config),
+  getConfig: () => ipcRenderer.invoke('config:get'),
+  saveConfig: (config) => ipcRenderer.invoke('config:save', config),
   
-  // Dialogs
-  selectFolder: (options) => ipcRenderer.invoke('select-folder', options),
-  selectFiles: (options) => ipcRenderer.invoke('select-files', options),
+  // Auth
+  login: (email, password) => ipcRenderer.invoke('auth:login', email, password),
+  logout: () => ipcRenderer.invoke('auth:logout'),
+  getSession: () => ipcRenderer.invoke('auth:getSession'),
+  onAuthChange: (callback) => ipcRenderer.on('auth:changed', (event, data) => callback(data)),
   
   // Bridge control
-  startBridge: () => ipcRenderer.invoke('start-bridge'),
-  stopBridge: () => ipcRenderer.invoke('stop-bridge'),
-  pauseBridge: () => ipcRenderer.invoke('pause-bridge'),
-  resumeBridge: () => ipcRenderer.invoke('resume-bridge'),
+  startBridge: () => ipcRenderer.invoke('bridge:start'),
+  stopBridge: () => ipcRenderer.invoke('bridge:stop'),
+  pauseBridge: () => ipcRenderer.invoke('bridge:pause'),
+  resumeBridge: () => ipcRenderer.invoke('bridge:resume'),
   
-  // Task control
-  cancelTask: (taskId) => ipcRenderer.invoke('cancel-task', taskId),
-  retryStep: (stepId) => ipcRenderer.invoke('retry-step', stepId),
+  // Folder selection
+  selectFolder: (options) => ipcRenderer.invoke('dialog:selectFolder', options),
   
   // Event listeners
-  onLog: (callback) => {
-    ipcRenderer.on('log', (event, data) => callback(data));
-  },
-  onStatusChange: (callback) => {
-    ipcRenderer.on('status-change', (event, data) => callback(data));
-  },
-  onTaskUpdate: (callback) => {
-    ipcRenderer.on('task-update', (event, data) => callback(data));
-  },
-  onStepUpdate: (callback) => {
-    ipcRenderer.on('step-update', (event, data) => callback(data));
-  },
-  onScreenshot: (callback) => {
-    ipcRenderer.on('screenshot', (event, data) => callback(data));
-  },
-  
-  // Remove listeners
-  removeAllListeners: (channel) => {
-    ipcRenderer.removeAllListeners(channel);
-  }
+  onLog: (callback) => ipcRenderer.on('log', (event, data) => callback(data)),
+  onStatusChange: (callback) => ipcRenderer.on('status:changed', (event, data) => callback(data)),
+  onTaskUpdate: (callback) => ipcRenderer.on('task:updated', (event, data) => callback(data)),
+  onStepUpdate: (callback) => ipcRenderer.on('step:updated', (event, data) => callback(data)),
+  onScreenshot: (callback) => ipcRenderer.on('screenshot', (event, data) => callback(data))
 });
