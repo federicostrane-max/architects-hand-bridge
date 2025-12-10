@@ -4,6 +4,7 @@
  */
 
 const https = require('https');
+const crypto = require('crypto');
 
 class LuxClient {
   constructor() {
@@ -23,11 +24,24 @@ class LuxClient {
   }
 
   /**
+   * Generate a new task ID (UUID v4)
+   */
+  generateTaskId() {
+    return crypto.randomUUID();
+  }
+
+  /**
    * Execute a step - send screenshot and instruction to Lux
    */
   async executeStep(screenshotBase64, instruction, context = '') {
     if (!this.apiKey) {
       throw new Error('API key not set');
+    }
+
+    // Generate task_id if not already set
+    if (!this.taskId) {
+      this.taskId = this.generateTaskId();
+      console.log(`[Lux] New task_id generated: ${this.taskId}`);
     }
 
     try {
@@ -171,10 +185,13 @@ class LuxClient {
 
       const requestBody = JSON.stringify({
         model: this.model,
+        task_id: this.taskId,  // Required field!
         messages: messages,
         task_description: taskDescription,
         max_tokens: 1024
       });
+
+      console.log('[Lux] Request body (truncated):', requestBody.substring(0, 200) + '...');
 
       const options = {
         hostname: this.baseUrl,
