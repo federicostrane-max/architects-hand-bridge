@@ -79,15 +79,18 @@ class Bridge {
       await browser.launch();
       this.log('success', 'Browser launched');
 
-      // Subscribe to realtime updates
-      this.setupRealtimeSubscriptions();
-
-      // Start polling for tasks
+      // Mark as running BEFORE setting up subscriptions
+      // This ensures the UI shows "connected" even if Realtime fails
       this.isRunning = true;
       this.sendStatus('connected');
+      this.log('success', 'Bridge started successfully');
+
+      // Setup realtime subscriptions (non-blocking, failures are OK)
+      this.setupRealtimeSubscriptions();
+
+      // Start polling for tasks (this is the reliable method)
       this.startPolling();
 
-      this.log('success', 'Bridge started successfully');
     } catch (error) {
       this.log('error', `Failed to start: ${error.message}`);
       this.sendStatus('disconnected');
@@ -96,25 +99,34 @@ class Bridge {
     }
   }
 
-  // Setup realtime subscriptions
+  // Setup realtime subscriptions (best-effort, polling is fallback)
   setupRealtimeSubscriptions() {
-    // Subscribe to new steps
-    supabase.subscribeToSteps((step) => {
-      this.log('info', `New step received: ${step.instruction?.substring(0, 50)}...`);
-      if (!this.isPaused) {
-        this.processStep(step);
-      }
-    });
+    try {
+      // Subscribe to new steps
+      supabase.subscribeToSteps((step) => {
+        this.log('info', `New step received via Realtime: ${step.instruction?.substring(0, 50)}...`);
+        if (!this.isPaused) {
+          this.processStep(step);
+        }
+      });
 
-    // Subscribe to task updates
-    supabase.subscribeToTasks((task, eventType) => {
-      this.log('info', `Task ${eventType}: ${task.task_description?.substring(0, 50)}...`);
-      this.sendTaskUpdate(task);
-    });
+      // Subscribe to task updates
+      supabase.subscribeToTasks((task, eventType) => {
+        this.log('info', `Task ${eventType} via Realtime: ${task.task_description?.substring(0, 50)}...`);
+        this.sendTaskUpdate(task);
+      });
+
+      this.log('info', 'Realtime subscriptions setup (polling active as fallback)');
+    } catch (error) {
+      // Realtime is optional - polling will handle everything
+      this.log('warn', `Realtime setup failed (using polling only): ${error.message}`);
+    }
   }
 
   // Start polling for pending steps
   startPolling() {
+    this.log('info', 'Starting task polling (every 2 seconds)...');
+    
     this.pollInterval = setInterval(async () => {
       if (this.isPaused || this.currentStep) {
         return; // Skip if paused or already processing a step
@@ -123,10 +135,14 @@ class Bridge {
       try {
         const step = await supabase.getNextPendingStep();
         if (step) {
+          this.log('info', `Found pending step via polling: ${step.instruction?.substring(0, 50)}...`);
           await this.processStep(step);
         }
       } catch (error) {
-        this.log('error', `Polling error: ${error.message}`);
+        // Don't spam logs for expected errors (no tasks)
+        if (!error.message.includes('no rows') && !error.message.includes('not found')) {
+          this.log('error', `Polling error: ${error.message}`);
+        }
       }
     }, 2000); // Poll every 2 seconds
   }
@@ -171,13 +187,15 @@ class Bridge {
       await supabase.updateStep(step.id, { screenshot_before: beforeUrl });
 
       // Send to Lux for action
-      this.log('info', 'Sending to Lux...');
+      this.log('info', 'Sending to Lux for analysis...');
       const luxResult = await lux.executeStep(screenshotBefore, step.instruction, step.instruction_context);
 
       this.log('info', `Lux response: ${luxResult.status} - ${luxResult.feedback || 'No feedback'}`);
 
       // Execute actions in browser
       if (luxResult.actions && luxResult.actions.length > 0) {
+        this.log('info', `Executing ${luxResult.actions.length} actions...`);
+        
         for (const action of luxResult.actions) {
           if (this.isPaused) {
             this.log('warn', 'Paused during action execution');
@@ -189,8 +207,11 @@ class Bridge {
             break;
           }
 
+          this.log('info', `Executing: ${action.type}`);
           await browser.executeAction(action);
         }
+      } else {
+        this.log('warn', 'No actions received from Lux');
       }
 
       // Take screenshot after actions
