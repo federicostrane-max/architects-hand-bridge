@@ -8,6 +8,7 @@ class LuxClient {
 
   setApiKey(key) {
     this.apiKey = key;
+    console.log(`[Lux] API key set (starts with: ${key?.substring(0, 8)}...)`);
   }
 
   async request(endpoint, body) {
@@ -30,6 +31,9 @@ class LuxClient {
         }
       };
 
+      console.log(`[Lux] Request to: https://${this.baseUrl}${endpoint}`);
+      console.log(`[Lux] Model: ${body.model}`);
+
       const req = https.request(options, (res) => {
         let data = '';
 
@@ -38,20 +42,24 @@ class LuxClient {
         });
 
         res.on('end', () => {
+          console.log(`[Lux] Response status: ${res.statusCode}`);
           try {
             const parsed = JSON.parse(data);
             if (res.statusCode >= 400) {
-              reject(new Error(parsed.error?.message || `API error: ${res.statusCode}`));
+              console.error(`[Lux] API Error:`, parsed);
+              reject(new Error(parsed.error?.message || parsed.message || `API error: ${res.statusCode}`));
             } else {
               resolve(parsed);
             }
           } catch (e) {
-            reject(new Error(`Failed to parse response: ${data}`));
+            console.error(`[Lux] Parse error. Raw response:`, data.substring(0, 500));
+            reject(new Error(`Failed to parse response: ${data.substring(0, 200)}`));
           }
         });
       });
 
       req.on('error', (e) => {
+        console.error(`[Lux] Request error:`, e.message);
         reject(new Error(`Request failed: ${e.message}`));
       });
 
@@ -67,7 +75,7 @@ class LuxClient {
 
   async act(screenshotBase64, goal, context = null) {
     const body = {
-      model: 'lux-actor',
+      model: 'lux-actor-1',
       screenshot: screenshotBase64,
       goal: goal,
       context: context
@@ -79,7 +87,7 @@ class LuxClient {
 
   async think(screenshotBase64, goal, history = [], context = null) {
     const body = {
-      model: 'lux-thinker',
+      model: 'lux-thinker-1',
       screenshot: screenshotBase64,
       goal: goal,
       history: history,
@@ -92,7 +100,7 @@ class LuxClient {
 
   async task(screenshotBase64, instruction, context = null) {
     const body = {
-      model: 'lux-tasker',
+      model: 'lux-tasker-1',
       screenshot: screenshotBase64,
       instruction: instruction,
       context: context
