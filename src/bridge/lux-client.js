@@ -1,444 +1,501 @@
 /**
- * Lux Client for The Architect's Hand Bridge
- * Based on official oagi-python SDK v0.11.0
- * 
- * CORRECT Endpoints:
- * - GET  /v1/file/upload  → Get presigned S3 URL
- * - PUT  {presigned_url}  → Upload screenshot to S3
- * - POST /v2/message      → Main inference endpoint
- * 
- * CORRECT Auth Header: x-api-key (NOT Authorization: Bearer)
+ * Lux Client - OpenAGI Lux API Integration
+ * Handles communication with lux-actor-1 model for browser automation
  */
 
 const https = require('https');
+const http = require('http');
 
 class LuxClient {
-    constructor() {
-        this.apiKey = null;
-        this.baseUrl = 'api.agiopen.org';
-        this.model = 'lux-actor-1';
-        this.temperature = 0.5;
-        this.timeout = 60000;
-        
-        // Session state
-        this.taskId = null;
-        this.messagesHistory = [];
+  constructor() {
+    this.apiKey = null;
+    this.baseUrl = 'api.agiopen.org';
+    this.model = 'lux-actor-1';
+    this.taskId = null;
+    this.messagesHistory = [];
+  }
+
+  /**
+   * Set the API key
+   */
+  setApiKey(key) {
+    this.apiKey = key;
+    console.log(`[Lux] API key set (starts with: ${key?.substring(0, 8)}...)`);
+  }
+
+  /**
+   * Execute a step - send screenshot and instruction to Lux
+   * @param {string} screenshotBase64 - Base64 encoded screenshot
+   * @param {string} instruction - What to do
+   * @param {string} context - Additional context
+   * @returns {Object} - { status, actions, feedback, raw }
+   */
+  async executeStep(screenshotBase64, instruction, context = '') {
+    if (!this.apiKey) {
+      throw new Error('API key not set');
     }
 
-    setApiKey(key) {
-        this.apiKey = key;
-        console.log(`[Lux] API key set (starts with: ${key?.substring(0, 8)}...)`);
+    try {
+      // Step 1: Get presigned URL for upload
+      console.log('[Lux] Getting presigned URL...');
+      const uploadInfo = await this.getPresignedUrl();
+      
+      // Step 2: Upload screenshot to S3
+      console.log('[Lux] Uploading screenshot to S3...');
+      await this.uploadToS3(uploadInfo.upload_url, screenshotBase64);
+      
+      // Step 3: Call Lux API with the image URL
+      console.log('[Lux] Calling Lux API...');
+      const result = await this.callLuxApi(uploadInfo.download_url, instruction, context);
+      
+      return result;
+    } catch (error) {
+      console.error('[Lux] Error:', error.message);
+      return {
+        status: 'error',
+        actions: [],
+        feedback: error.message,
+        raw: null
+      };
     }
+  }
 
-    setModel(model) {
-        this.model = model;
-        console.log(`[Lux] Model set to: ${model}`);
-    }
+  /**
+   * Get presigned URL for S3 upload
+   */
+  async getPresignedUrl() {
+    return new Promise((resolve, reject) => {
+      const options = {
+        hostname: this.baseUrl,
+        port: 443,
+        path: '/v1/file/upload',
+        method: 'GET',
+        headers: {
+          'x-api-key': this.apiKey
+        }
+      };
 
-    /**
-     * Make HTTPS request
-     */
-    _request(method, path, options = {}) {
-        return new Promise((resolve, reject) => {
-            const reqOptions = {
-                hostname: this.baseUrl,
-                port: 443,
-                path: path,
-                method: method,
-                headers: {
-                    'x-api-key': this.apiKey,
-                    ...options.headers
-                },
-                timeout: this.timeout
-            };
-
-            const req = https.request(reqOptions, (res) => {
-                let data = '';
-                res.on('data', chunk => data += chunk);
-                res.on('end', () => {
-                    try {
-                        const json = data ? JSON.parse(data) : {};
-                        if (res.statusCode >= 400) {
-                            const errorMsg = json.error?.message || json.message || data;
-                            reject(new Error(`HTTP ${res.statusCode}: ${errorMsg}`));
-                        } else {
-                            resolve({ status: res.statusCode, data: json, headers: res.headers });
-                        }
-                    } catch (e) {
-                        // Non-JSON response (e.g., S3 upload returns empty)
-                        if (res.statusCode >= 200 && res.statusCode < 300) {
-                            resolve({ status: res.statusCode, data: null, headers: res.headers });
-                        } else {
-                            reject(new Error(`HTTP ${res.statusCode}: ${data}`));
-                        }
-                    }
-                });
-            });
-
-            req.on('error', reject);
-            req.on('timeout', () => {
-                req.destroy();
-                reject(new Error('Request timeout'));
-            });
-
-            if (options.body) {
-                req.write(options.body);
+      const req = https.request(options, (res) => {
+        let data = '';
+        res.on('data', chunk => data += chunk);
+        res.on('end', () => {
+          try {
+            if (res.statusCode !== 200) {
+              reject(new Error(`Failed to get presigned URL: ${res.statusCode} - ${data}`));
+              return;
             }
-            req.end();
+            const parsed = JSON.parse(data);
+            console.log('[Lux] Got presigned URL');
+            resolve(parsed);
+          } catch (e) {
+            reject(new Error(`Failed to parse presigned URL response: ${e.message}`));
+          }
         });
-    }
+      });
 
-    /**
-     * Upload to S3 using presigned URL
-     */
-    _uploadToS3(presignedUrl, imageBuffer) {
-        return new Promise((resolve, reject) => {
-            const url = new URL(presignedUrl);
-            
-            const reqOptions = {
-                hostname: url.hostname,
-                port: 443,
-                path: url.pathname + url.search,
-                method: 'PUT',
-                headers: {
-                    'Content-Type': 'image/png',
-                    'Content-Length': imageBuffer.length
-                },
-                timeout: this.timeout
-            };
+      req.on('error', reject);
+      req.end();
+    });
+  }
 
-            const req = https.request(reqOptions, (res) => {
-                let data = '';
-                res.on('data', chunk => data += chunk);
-                res.on('end', () => {
-                    if (res.statusCode >= 200 && res.statusCode < 300) {
-                        resolve({ status: res.statusCode });
-                    } else {
-                        reject(new Error(`S3 upload failed: ${res.statusCode} - ${data}`));
-                    }
-                });
-            });
+  /**
+   * Upload image to S3 using presigned URL
+   * The presigned URL already contains all authentication - just PUT the raw data
+   */
+  async uploadToS3(presignedUrl, base64Image) {
+    return new Promise((resolve, reject) => {
+      const imageBuffer = Buffer.from(base64Image, 'base64');
+      const url = new URL(presignedUrl);
+      
+      const options = {
+        hostname: url.hostname,
+        port: 443,
+        path: url.pathname + url.search, // Include query string (contains signature)
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'image/png',
+          'Content-Length': imageBuffer.length
+        }
+      };
 
-            req.on('error', reject);
-            req.on('timeout', () => {
-                req.destroy();
-                reject(new Error('S3 upload timeout'));
-            });
-
-            req.write(imageBuffer);
-            req.end();
+      const req = https.request(options, (res) => {
+        let data = '';
+        res.on('data', chunk => data += chunk);
+        res.on('end', () => {
+          if (res.statusCode >= 200 && res.statusCode < 300) {
+            console.log('[Lux] Screenshot uploaded successfully');
+            resolve();
+          } else {
+            reject(new Error(`S3 upload failed: ${res.statusCode} - ${data}`));
+          }
         });
-    }
+      });
 
-    /**
-     * Step 1: Get presigned S3 URL for screenshot upload
-     */
-    async getUploadUrl() {
-        console.log('[Lux] Getting presigned upload URL...');
-        
-        const response = await this._request('GET', '/v1/file/upload');
-        
-        console.log(`[Lux] Got upload URL, uuid: ${response.data.uuid}`);
-        
-        return {
-            uploadUrl: response.data.url,
-            downloadUrl: response.data.download_url,
-            uuid: response.data.uuid,
-            expiresAt: response.data.expires_at
-        };
-    }
+      req.on('error', reject);
+      req.write(imageBuffer);
+      req.end();
+    });
+  }
 
-    /**
-     * Step 2: Upload screenshot to S3
-     */
-    async uploadScreenshot(presignedUrl, screenshotBuffer) {
-        console.log(`[Lux] Uploading screenshot (${screenshotBuffer.length} bytes)...`);
-        
-        await this._uploadToS3(presignedUrl, screenshotBuffer);
-        
-        console.log('[Lux] Screenshot uploaded successfully');
-    }
+  /**
+   * Call Lux API with image and instruction
+   */
+  async callLuxApi(imageUrl, instruction, context) {
+    return new Promise((resolve, reject) => {
+      // Build the task description
+      const taskDescription = context 
+        ? `${context}\n\nCurrent instruction: ${instruction}`
+        : instruction;
 
-    /**
-     * Step 3: Call /v2/message endpoint
-     */
-    async createMessage(screenshotUrl, instruction = null, taskDescription = null) {
-        console.log('[Lux] Calling /v2/message...');
-        
-        // Build user message with screenshot
-        const userContent = [
+      // Build messages
+      const messages = [
+        {
+          role: 'user',
+          content: [
             {
-                type: 'image_url',
-                image_url: { url: screenshotUrl }
-            }
-        ];
-        
-        if (instruction) {
-            userContent.push({
-                type: 'text',
-                text: instruction
-            });
-        }
-        
-        const userMessage = {
-            role: 'user',
-            content: userContent
-        };
-        
-        // Append to history
-        this.messagesHistory.push(userMessage);
-        
-        // Build payload
-        const payload = {
-            model: this.model,
-            messages: this.messagesHistory,
-            temperature: this.temperature
-        };
-        
-        // Add task_description for new sessions
-        if (taskDescription && !this.taskId) {
-            payload.task_description = taskDescription;
-        }
-        
-        // Add task_id for continuing sessions
-        if (this.taskId) {
-            payload.task_id = this.taskId;
-        }
-        
-        const response = await this._request('POST', '/v2/message', {
-            headers: {
-                'Content-Type': 'application/json'
+              type: 'image_url',
+              image_url: { url: imageUrl }
             },
-            body: JSON.stringify(payload)
+            {
+              type: 'text',
+              text: instruction
+            }
+          ]
+        }
+      ];
+
+      const requestBody = JSON.stringify({
+        model: this.model,
+        messages: messages,
+        task_description: taskDescription,
+        max_tokens: 1024
+      });
+
+      const options = {
+        hostname: this.baseUrl,
+        port: 443,
+        path: '/v2/message',
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': this.apiKey,
+          'Content-Length': Buffer.byteLength(requestBody)
+        }
+      };
+
+      const req = https.request(options, (res) => {
+        let data = '';
+        res.on('data', chunk => data += chunk);
+        res.on('end', () => {
+          try {
+            if (res.statusCode !== 200) {
+              reject(new Error(`Lux API error: ${res.statusCode} - ${data}`));
+              return;
+            }
+
+            const response = JSON.parse(data);
+            const result = this.parseResponse(response);
+            resolve(result);
+          } catch (e) {
+            reject(new Error(`Failed to parse Lux response: ${e.message}`));
+          }
         });
+      });
+
+      req.on('error', reject);
+      req.write(requestBody);
+      req.end();
+    });
+  }
+
+  /**
+   * Parse Lux API response into actions
+   */
+  parseResponse(response) {
+    const actions = [];
+    let feedback = '';
+    
+    // Extract content from response
+    const content = response.content || [];
+    
+    for (const block of content) {
+      if (block.type === 'text') {
+        feedback = block.text || '';
         
-        const result = response.data;
-        
-        // Store task_id for session continuity
-        if (result.task_id) {
-            this.taskId = result.task_id;
+        // Try to parse actions from text
+        const parsedActions = this.parseActionsFromText(block.text);
+        actions.push(...parsedActions);
+      }
+      
+      // Handle tool_use blocks (Lux may return structured actions)
+      if (block.type === 'tool_use') {
+        const action = this.parseToolUse(block);
+        if (action) {
+          actions.push(action);
         }
-        
-        // Add assistant response to history
-        if (result.actions && result.actions.length > 0) {
-            this.messagesHistory.push({
-                role: 'assistant',
-                content: JSON.stringify(result.actions)
-            });
-        }
-        
-        console.log(`[Lux] Response - task_id: ${result.task_id}, complete: ${result.is_complete}, actions: ${result.actions?.length || 0}`);
-        
-        return result;
+      }
     }
 
-    /**
-     * Main method used by bridge: executeStep
-     * Takes base64 screenshot, instruction, and context
-     * Returns { status, feedback, actions, raw }
-     */
-    async executeStep(screenshotBase64, instruction, instructionContext = null) {
-        if (!this.apiKey) {
-            throw new Error('OpenAGI API key not set');
-        }
-
-        try {
-            // Convert base64 to buffer
-            const screenshotBuffer = Buffer.from(screenshotBase64, 'base64');
-            
-            // Step 1: Get presigned URL
-            const { uploadUrl, downloadUrl } = await this.getUploadUrl();
-            
-            // Step 2: Upload screenshot to S3
-            await this.uploadScreenshot(uploadUrl, screenshotBuffer);
-            
-            // Build full instruction with context
-            let fullInstruction = instruction;
-            if (instructionContext) {
-                fullInstruction = `Context: ${instructionContext}\n\nInstruction: ${instruction}`;
-            }
-            
-            // Step 3: Get actions from Lux
-            const result = await this.createMessage(downloadUrl, fullInstruction, instruction);
-            
-            // Convert to expected format
-            const actions = (result.actions || []).map(action => {
-                return this._convertAction(action);
-            });
-
-            // Determine status
-            let status = 'success';
-            if (result.is_complete) {
-                status = 'complete';
-            } else if (result.error) {
-                status = 'error';
-            }
-
-            return {
-                status: status,
-                feedback: result.reason || null,
-                actions: actions,
-                raw: result
-            };
-
-        } catch (error) {
-            console.error('[Lux] Error:', error.message);
-            return {
-                status: 'error',
-                feedback: error.message,
-                actions: [],
-                raw: null
-            };
-        }
+    // Check for computer_call in response (Lux specific format)
+    if (response.computer_call) {
+      const action = this.parseComputerCall(response.computer_call);
+      if (action) {
+        actions.push(action);
+      }
     }
 
-    /**
-     * Convert Lux action to browser-controller format
-     * Lux uses normalized 0-1000 coordinates
-     */
-    _convertAction(action) {
-        const type = action.type;
-        const arg = action.argument || '';
+    return {
+      status: actions.length > 0 ? 'success' : 'no_action',
+      actions,
+      feedback,
+      raw: response
+    };
+  }
 
-        switch (type) {
-            case 'click':
-            case 'left_double':
-            case 'left_triple':
-            case 'right_single': {
-                const coords = this._parseCoords(arg);
-                if (coords) {
-                    return {
-                        type: type === 'left_double' ? 'doubleClick' : 
-                              type === 'right_single' ? 'rightClick' : 'click',
-                        x: coords.x,
-                        y: coords.y,
-                        normalized: true  // Flag that coords are 0-1000 normalized
-                    };
-                }
-                break;
-            }
+  /**
+   * Parse actions from text response
+   * Lux returns actions in format: action(params)
+   */
+  parseActionsFromText(text) {
+    const actions = [];
+    if (!text) return actions;
 
-            case 'type': {
-                return {
-                    type: 'type',
-                    text: arg
-                };
-            }
+    // Pattern: action_name(params)
+    // Examples: click(500, 300), type("hello"), scroll(0, 100, down), key(Enter)
+    const actionPattern = /\b(click|type|scroll|key|drag|wait|done|complete)\s*\(([^)]*)\)/gi;
+    
+    let match;
+    while ((match = actionPattern.exec(text)) !== null) {
+      const actionType = match[1].toLowerCase();
+      const params = match[2].trim();
+      
+      let action = null;
+      
+      switch (actionType) {
+        case 'click':
+          action = this._parseClick(params);
+          break;
+        case 'type':
+          action = this._parseType(params);
+          break;
+        case 'scroll':
+          action = this._parseScroll(params);
+          break;
+        case 'key':
+          action = this._parseKey(params);
+          break;
+        case 'drag':
+          action = this._parseDrag(params);
+          break;
+        case 'wait':
+          action = { type: 'wait', duration: parseInt(params) || 1000 };
+          break;
+        case 'done':
+        case 'complete':
+          action = { type: 'done' };
+          break;
+      }
+      
+      if (action) {
+        actions.push(action);
+      }
+    }
 
-            case 'hotkey': {
-                return {
-                    type: 'hotkey',
-                    keys: arg.split('+').map(k => k.trim())
-                };
-            }
+    return actions;
+  }
 
-            case 'scroll': {
-                const scroll = this._parseScroll(arg);
-                if (scroll) {
-                    return {
-                        type: 'scroll',
-                        x: scroll.x,
-                        y: scroll.y,
-                        direction: scroll.direction,
-                        normalized: true
-                    };
-                }
-                break;
-            }
+  /**
+   * Parse tool_use block
+   */
+  parseToolUse(block) {
+    const name = block.name?.toLowerCase();
+    const input = block.input || {};
 
-            case 'drag': {
-                const drag = this._parseDrag(arg);
-                if (drag) {
-                    return {
-                        type: 'drag',
-                        startX: drag.x1,
-                        startY: drag.y1,
-                        endX: drag.x2,
-                        endY: drag.y2,
-                        normalized: true
-                    };
-                }
-                break;
-            }
-
-            case 'wait': {
-                return {
-                    type: 'wait',
-                    duration: parseInt(arg) || 1000
-                };
-            }
-
-            case 'finish':
-            case 'done':
-            case 'complete': {
-                return {
-                    type: 'done'
-                };
-            }
-
-            case 'call_user': {
-                return {
-                    type: 'call_user',
-                    message: arg
-                };
-            }
-        }
-
-        // Unknown action type
+    switch (name) {
+      case 'click':
+      case 'mouse_click':
         return {
-            type: type,
-            raw: arg
+          type: 'click',
+          x: input.x || input.coordinate?.[0],
+          y: input.y || input.coordinate?.[1],
+          button: input.button || 'left'
         };
-    }
-
-    /**
-     * Parse coordinates from "x, y" format
-     */
-    _parseCoords(arg) {
-        const match = arg.match(/(\d+),\s*(\d+)/);
-        if (!match) return null;
+      
+      case 'type':
+      case 'keyboard_type':
         return {
-            x: parseInt(match[1]),
-            y: parseInt(match[2])
+          type: 'type',
+          text: input.text || input.content
         };
-    }
-
-    /**
-     * Parse scroll from "x, y, direction" format
-     */
-    _parseScroll(arg) {
-        const match = arg.match(/(\d+),\s*(\d+),\s*(\w+)/);
-        if (!match) return null;
+      
+      case 'key':
+      case 'keyboard_key':
         return {
-            x: parseInt(match[1]),
-            y: parseInt(match[2]),
-            direction: match[3].toLowerCase()
+          type: 'key',
+          key: input.key || input.name
         };
-    }
-
-    /**
-     * Parse drag from "x1, y1, x2, y2" format
-     */
-    _parseDrag(arg) {
-        const match = arg.match(/(\d+),\s*(\d+),\s*(\d+),\s*(\d+)/);
-        if (!match) return null;
+      
+      case 'scroll':
         return {
-            x1: parseInt(match[1]),
-            y1: parseInt(match[2]),
-            x2: parseInt(match[3]),
-            y2: parseInt(match[4])
+          type: 'scroll',
+          x: input.x || 0,
+          y: input.y || 0,
+          direction: input.direction || 'down'
         };
+      
+      default:
+        console.log(`[Lux] Unknown tool: ${name}`);
+        return null;
     }
+  }
 
-    /**
-     * Reset session state
-     */
-    resetSession() {
-        this.taskId = null;
-        this.messagesHistory = [];
-        console.log('[Lux] Session reset');
+  /**
+   * Parse computer_call format (Lux specific)
+   */
+  parseComputerCall(call) {
+    const action = call.action?.toLowerCase();
+    
+    switch (action) {
+      case 'click':
+        return {
+          type: 'click',
+          x: call.coordinate?.[0],
+          y: call.coordinate?.[1],
+          button: call.button || 'left'
+        };
+      
+      case 'type':
+        return {
+          type: 'type',
+          text: call.text
+        };
+      
+      case 'key':
+        return {
+          type: 'key',
+          key: call.key
+        };
+      
+      case 'scroll':
+        return {
+          type: 'scroll',
+          x: call.coordinate?.[0] || 0,
+          y: call.coordinate?.[1] || 0,
+          direction: call.direction || 'down'
+        };
+      
+      case 'drag':
+        return {
+          type: 'drag',
+          x1: call.start_coordinate?.[0],
+          y1: call.start_coordinate?.[1],
+          x2: call.end_coordinate?.[0],
+          y2: call.end_coordinate?.[1]
+        };
+      
+      default:
+        console.log(`[Lux] Unknown computer_call action: ${action}`);
+        return null;
     }
+  }
+
+  /**
+   * Parse click from "x, y" format
+   */
+  _parseClick(arg) {
+    // Handle formats: "500, 300" or "500,300" or just coordinates
+    const coords = arg.split(',').map(s => parseInt(s.trim()));
+    if (coords.length >= 2 && !isNaN(coords[0]) && !isNaN(coords[1])) {
+      return {
+        type: 'click',
+        x: coords[0],
+        y: coords[1],
+        button: 'left'
+      };
+    }
+    return null;
+  }
+
+  /**
+   * Parse type from quoted string
+   */
+  _parseType(arg) {
+    // Remove quotes if present
+    const text = arg.replace(/^["']|["']$/g, '').trim();
+    if (text) {
+      return {
+        type: 'type',
+        text: text
+      };
+    }
+    return null;
+  }
+
+  /**
+   * Parse key press
+   */
+  _parseKey(arg) {
+    const key = arg.replace(/^["']|["']$/g, '').trim();
+    if (key) {
+      return {
+        type: 'key',
+        key: key
+      };
+    }
+    return null;
+  }
+
+  /**
+   * Parse scroll from "x, y, direction" format
+   */
+  _parseScroll(arg) {
+    const parts = arg.split(',').map(s => s.trim());
+    if (parts.length >= 3) {
+      return {
+        type: 'scroll',
+        x: parseInt(parts[0]) || 0,
+        y: parseInt(parts[1]) || 0,
+        direction: parts[2].toLowerCase()
+      };
+    }
+    // Simple format: just direction
+    if (parts.length === 1) {
+      return {
+        type: 'scroll',
+        x: 0,
+        y: 0,
+        direction: parts[0].toLowerCase()
+      };
+    }
+    return null;
+  }
+
+  /**
+   * Parse drag from "x1, y1, x2, y2" format
+   */
+  _parseDrag(arg) {
+    const coords = arg.split(',').map(s => parseInt(s.trim()));
+    if (coords.length >= 4) {
+      return {
+        type: 'drag',
+        x1: coords[0],
+        y1: coords[1],
+        x2: coords[2],
+        y2: coords[3]
+      };
+    }
+    return null;
+  }
+
+  /**
+   * Reset session state
+   */
+  resetSession() {
+    this.taskId = null;
+    this.messagesHistory = [];
+    console.log('[Lux] Session reset');
+  }
 }
 
-// Export singleton instance (same interface as before)
+// Export singleton instance
 module.exports = new LuxClient();
