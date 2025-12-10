@@ -36,7 +36,7 @@ class LuxClient {
       const uploadInfo = await this.getPresignedUrl();
       console.log('[Lux] Got presigned URL');
       
-      // Step 2: Upload screenshot to S3 using the "url" field (NOT upload_url)
+      // Step 2: Upload screenshot to S3 using the "url" field
       console.log('[Lux] Uploading screenshot to S3...');
       await this.uploadToS3(uploadInfo.url, screenshotBase64);
       console.log('[Lux] Screenshot uploaded successfully');
@@ -82,7 +82,6 @@ class LuxClient {
               return;
             }
             const parsed = JSON.parse(data);
-            // API returns: { url: "...", download_url: "...", ... }
             console.log('[Lux] Presigned URL fields:', Object.keys(parsed).join(', '));
             if (!parsed.url || !parsed.download_url) {
               reject(new Error(`Invalid presigned URL response - missing url or download_url`));
@@ -102,6 +101,7 @@ class LuxClient {
 
   /**
    * Upload image to S3 using presigned URL
+   * IMPORTANT: Do NOT include Content-Type header - the presigned URL is not signed with it
    */
   async uploadToS3(presignedUrl, base64Image) {
     return new Promise((resolve, reject) => {
@@ -121,7 +121,7 @@ class LuxClient {
         path: url.pathname + url.search,
         method: 'PUT',
         headers: {
-          'Content-Type': 'image/png',
+          // NO Content-Type header! The presigned URL is not signed with it
           'Content-Length': imageBuffer.length
         }
       };
