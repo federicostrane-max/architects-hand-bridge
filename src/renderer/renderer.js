@@ -85,8 +85,27 @@ async function init() {
   // Setup event listeners
   setupEventListeners();
   
-  // Setup IPC listeners
+  // Setup IPC listeners FIRST
   setupIPCListeners();
+  
+  // Check if bridge is already running (e.g., after page reload)
+  try {
+    const bridgeState = await window.electronAPI.getBridgeState();
+    if (bridgeState && bridgeState.isRunning) {
+      state.running = true;
+      state.paused = bridgeState.isPaused;
+      updateControlButtons();
+      updateStatus('connected');
+      if (bridgeState.currentTask) {
+        updateCurrentTask(bridgeState.currentTask);
+      }
+      if (bridgeState.currentStep) {
+        updateCurrentStep(bridgeState.currentStep);
+      }
+    }
+  } catch (e) {
+    // Bridge state not available, that's ok
+  }
   
   addLog('info', 'App initialized. Login and configure settings to start.');
 }
@@ -152,6 +171,7 @@ function setupIPCListeners() {
   });
   
   window.electronAPI.onStatusChange((data) => {
+    console.log('[Renderer] Received status change:', data.status);
     updateStatus(data.status);
   });
   
@@ -269,17 +289,23 @@ async function startBridge() {
   
   addLog('info', 'Starting bridge...');
   
+  // Disable start button immediately to prevent double-clicks
+  elements.btnStart.disabled = true;
+  
   try {
     const result = await window.electronAPI.startBridge();
     if (result.success) {
       state.running = true;
       updateControlButtons();
-      updateStatus('connecting');
+      // DON'T manually set status here - let the bridge events handle it
+      // The bridge will send 'connecting' then 'connected' via IPC
     } else {
       addLog('error', `Failed to start: ${result.error}`);
+      elements.btnStart.disabled = !state.isLoggedIn;
     }
   } catch (error) {
     addLog('error', `Failed to start: ${error.message}`);
+    elements.btnStart.disabled = !state.isLoggedIn;
   }
 }
 
@@ -307,7 +333,7 @@ async function stopBridge() {
     state.running = false;
     state.paused = false;
     updateControlButtons();
-    updateStatus('disconnected');
+    // DON'T manually set status here - let the bridge events handle it
   } catch (error) {
     addLog('error', `Failed to stop: ${error.message}`);
   }
@@ -322,6 +348,8 @@ function updateControlButtons() {
 
 // Update status
 function updateStatus(status) {
+  console.log('[Renderer] Updating status to:', status);
+  
   elements.statusDot.classList.remove('connected', 'connecting');
   
   switch (status) {
