@@ -7,6 +7,9 @@ const { createClient } = require('@supabase/supabase-js');
 let mainWindow = null;
 let browserWindow = null;
 
+// Supabase client
+let supabase = null;
+
 // Store config
 let config = {
   supabaseUrl: '',
@@ -40,11 +43,27 @@ function saveConfig(newConfig) {
     config = { ...config, ...newConfig };
     fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
     console.log('Config saved to:', configPath);
+    
+    // Reinitialize Supabase if URL/key changed
+    if (newConfig.supabaseUrl && newConfig.supabaseAnonKey) {
+      initSupabase();
+    }
+    
     return true;
   } catch (error) {
     console.error('Error saving config:', error);
     return false;
   }
+}
+
+// Initialize Supabase client
+function initSupabase() {
+  if (config.supabaseUrl && config.supabaseAnonKey) {
+    supabase = createClient(config.supabaseUrl, config.supabaseAnonKey);
+    console.log('Supabase client initialized');
+    return true;
+  }
+  return false;
 }
 
 // Create main window
@@ -82,6 +101,7 @@ function createMainWindow() {
 // App ready
 app.whenReady().then(() => {
   loadConfig();
+  initSupabase();
   createMainWindow();
 
   app.on('activate', () => {
@@ -109,17 +129,17 @@ function setupBridgeCallbacks() {
     },
     sendStatus: (status) => {
       if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('status-change', { status });
+        mainWindow.webContents.send('status:changed', { status });
       }
     },
     sendTaskUpdate: (task) => {
       if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('task-update', task);
+        mainWindow.webContents.send('task:updated', task);
       }
     },
     sendStepUpdate: (step) => {
       if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('step-update', step);
+        mainWindow.webContents.send('step:updated', step);
       }
     },
     sendScreenshot: (url) => {
@@ -132,18 +152,85 @@ function setupBridgeCallbacks() {
 
 // IPC Handlers
 
-// Get config
-ipcMain.handle('get-config', () => {
+// Config handlers
+ipcMain.handle('config:get', () => {
   return loadConfig();
 });
 
-// Save config
-ipcMain.handle('save-config', (event, newConfig) => {
+ipcMain.handle('config:save', (event, newConfig) => {
   return saveConfig(newConfig);
 });
 
-// Select folder dialog
-ipcMain.handle('select-folder', async (event, options) => {
+// Auth handlers
+ipcMain.handle('auth:login', async (event, email, password) => {
+  try {
+    if (!supabase) {
+      // Try to initialize
+      if (!initSupabase()) {
+        return { success: false, error: 'Supabase not configured. Please add Supabase URL and Key in Settings.' };
+      }
+    }
+    
+    const { data, error } = await supabase.auth.signInWithPassword({
+      email,
+      password
+    });
+    
+    if (error) {
+      return { success: false, error: error.message };
+    }
+    
+    // Notify renderer of auth change
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('auth:changed', { event: 'SIGNED_IN', session: data.session });
+    }
+    
+    return { success: true, user: data.user, session: data.session };
+  } catch (error) {
+    console.error('Login error:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('auth:logout', async () => {
+  try {
+    if (!supabase) {
+      return { success: true };
+    }
+    
+    const { error } = await supabase.auth.signOut();
+    
+    if (error) {
+      return { success: false, error: error.message };
+    }
+    
+    // Notify renderer of auth change
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('auth:changed', { event: 'SIGNED_OUT', session: null });
+    }
+    
+    return { success: true };
+  } catch (error) {
+    console.error('Logout error:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('auth:getSession', async () => {
+  try {
+    if (!supabase) {
+      return null;
+    }
+    const { data: { session } } = await supabase.auth.getSession();
+    return session;
+  } catch (error) {
+    console.error('Get session error:', error);
+    return null;
+  }
+});
+
+// Dialog handlers
+ipcMain.handle('dialog:selectFolder', async (event, options) => {
   const result = await dialog.showOpenDialog(mainWindow, {
     properties: ['openDirectory'],
     title: options?.title || 'Select Folder'
@@ -155,8 +242,7 @@ ipcMain.handle('select-folder', async (event, options) => {
   return result.filePaths[0];
 });
 
-// Select files dialog
-ipcMain.handle('select-files', async (event, options) => {
+ipcMain.handle('dialog:selectFiles', async (event, options) => {
   const result = await dialog.showOpenDialog(mainWindow, {
     properties: ['openFile', 'multiSelections'],
     title: options?.title || 'Select Files',
@@ -177,20 +263,17 @@ function sendLog(level, message, data = null) {
 }
 
 // Bridge IPC Handlers
-
-// Start bridge
-ipcMain.handle('start-bridge', async () => {
+ipcMain.handle('bridge:start', async () => {
   try {
     setupBridgeCallbacks();
-    await bridge.start(config);
+    await bridge.start(config, supabase);
     return { success: true };
   } catch (error) {
     return { success: false, error: error.message };
   }
 });
 
-// Stop bridge
-ipcMain.handle('stop-bridge', async () => {
+ipcMain.handle('bridge:stop', async () => {
   try {
     await bridge.stop();
     return { success: true };
@@ -199,20 +282,18 @@ ipcMain.handle('stop-bridge', async () => {
   }
 });
 
-// Pause bridge
-ipcMain.handle('pause-bridge', async () => {
+ipcMain.handle('bridge:pause', async () => {
   bridge.pause();
   return { success: true };
 });
 
-// Resume bridge
-ipcMain.handle('resume-bridge', async () => {
+ipcMain.handle('bridge:resume', async () => {
   bridge.resume();
   return { success: true };
 });
 
 // Cancel task
-ipcMain.handle('cancel-task', async (event, taskId) => {
+ipcMain.handle('task:cancel', async (event, taskId) => {
   try {
     await bridge.cancelTask(taskId);
     return { success: true };
@@ -222,7 +303,7 @@ ipcMain.handle('cancel-task', async (event, taskId) => {
 });
 
 // Retry step
-ipcMain.handle('retry-step', async (event, stepId) => {
+ipcMain.handle('step:retry', async (event, stepId) => {
   try {
     const step = await bridge.retryStep(stepId);
     return { success: true, step };
@@ -232,7 +313,7 @@ ipcMain.handle('retry-step', async (event, stepId) => {
 });
 
 // Get bridge state
-ipcMain.handle('get-bridge-state', () => {
+ipcMain.handle('bridge:getState', () => {
   return bridge.getState();
 });
 
@@ -242,5 +323,6 @@ module.exports = {
   getBrowserWindow: () => browserWindow,
   setBrowserWindow: (win) => { browserWindow = win; },
   getConfig: () => config,
+  getSupabase: () => supabase,
   sendLog
 };
