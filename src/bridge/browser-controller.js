@@ -7,6 +7,24 @@ class BrowserController {
     this.context = null;
     this.page = null;
     this.isRunning = false;
+    
+    // Viewport dimensions (Lux coordinates are normalized 0-1000)
+    this.viewportWidth = 1280;
+    this.viewportHeight = 800;
+  }
+
+  /**
+   * Convert normalized coordinates (0-1000) to actual pixels
+   * Lux uses 0-1000 range, we need to convert to viewport pixels
+   */
+  convertCoords(x, y, normalized = false) {
+    if (normalized) {
+      return {
+        x: Math.round((x / 1000) * this.viewportWidth),
+        y: Math.round((y / 1000) * this.viewportHeight)
+      };
+    }
+    return { x, y };
   }
 
   // Launch browser
@@ -25,7 +43,7 @@ class BrowserController {
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
-        '--window-size=1280,800'
+        `--window-size=${this.viewportWidth},${this.viewportHeight}`
       ],
       ...options
     };
@@ -34,7 +52,7 @@ class BrowserController {
 
     // Create context with viewport
     this.context = await this.browser.newContext({
-      viewport: { width: 1280, height: 800 },
+      viewport: { width: this.viewportWidth, height: this.viewportHeight },
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
       ...options.context
     });
@@ -43,13 +61,21 @@ class BrowserController {
     this.page = await this.context.newPage();
     this.isRunning = true;
 
-    console.log('[Browser] Launched successfully');
+    console.log(`[Browser] Launched successfully (viewport: ${this.viewportWidth}x${this.viewportHeight})`);
     return this.page;
   }
 
   // Get current page
   getPage() {
     return this.page;
+  }
+
+  // Get viewport size
+  getViewportSize() {
+    return {
+      width: this.viewportWidth,
+      height: this.viewportHeight
+    };
   }
 
   // Navigate to URL
@@ -95,34 +121,59 @@ class BrowserController {
 
     console.log(`[Browser] Executing action: ${action.type}`, action);
 
+    // Check if coordinates need conversion (Lux sends normalized 0-1000)
+    const normalized = action.normalized === true;
+
     switch (action.type) {
-      case 'click':
-        await this.click(action.x, action.y);
+      case 'click': {
+        const { x, y } = this.convertCoords(action.x, action.y, normalized);
+        await this.click(x, y);
         break;
+      }
 
       case 'double_click':
-      case 'doubleclick':
-        await this.doubleClick(action.x, action.y);
+      case 'doubleClick':
+      case 'doubleclick': {
+        const { x, y } = this.convertCoords(action.x, action.y, normalized);
+        await this.doubleClick(x, y);
         break;
+      }
 
       case 'right_click':
-      case 'rightclick':
-        await this.rightClick(action.x, action.y);
+      case 'rightClick':
+      case 'rightclick': {
+        const { x, y } = this.convertCoords(action.x, action.y, normalized);
+        await this.rightClick(x, y);
         break;
+      }
 
       case 'type':
       case 'input':
         await this.type(action.text);
         break;
 
+      case 'hotkey': {
+        // Handle hotkey combinations like ['ctrl', 'c'] or 'ctrl+c'
+        const keys = action.keys || action.combo?.split('+') || [];
+        await this.hotkey(keys);
+        break;
+      }
+
       case 'press':
       case 'key':
         await this.press(action.key);
         break;
 
-      case 'scroll':
-        await this.scroll(action.direction || 'down', action.amount || 300);
+      case 'scroll': {
+        // Lux sends x, y, direction for scroll
+        if (action.x !== undefined && action.y !== undefined) {
+          const { x, y } = this.convertCoords(action.x, action.y, normalized);
+          await this.scrollAt(x, y, action.direction || 'down', action.count || 1);
+        } else {
+          await this.scroll(action.direction || 'down', action.amount || 300);
+        }
         break;
+      }
 
       case 'wait':
         await this.wait(action.duration || 1000);
@@ -133,13 +184,18 @@ class BrowserController {
         await this.goto(action.url);
         break;
 
-      case 'hover':
-        await this.hover(action.x, action.y);
+      case 'hover': {
+        const { x, y } = this.convertCoords(action.x, action.y, normalized);
+        await this.hover(x, y);
         break;
+      }
 
-      case 'drag':
-        await this.drag(action.startX, action.startY, action.endX, action.endY);
+      case 'drag': {
+        const start = this.convertCoords(action.startX, action.startY, normalized);
+        const end = this.convertCoords(action.endX, action.endY, normalized);
+        await this.drag(start.x, start.y, end.x, end.y);
         break;
+      }
 
       case 'select':
         await this.selectOption(action.selector, action.value);
@@ -152,6 +208,12 @@ class BrowserController {
       case 'done':
       case 'complete':
         // No action needed, step is complete
+        console.log('[Browser] Step marked as complete');
+        break;
+
+      case 'call_user':
+        // Lux is asking for user intervention
+        console.log('[Browser] Lux requests user intervention:', action.message);
         break;
 
       default:
@@ -204,7 +266,70 @@ class BrowserController {
     await this.page.keyboard.press(key);
   }
 
-  // Scroll
+  // Press hotkey combination (e.g., ['ctrl', 'c'] or ['Control', 'Shift', 'T'])
+  async hotkey(keys) {
+    if (!this.page) throw new Error('Browser not launched');
+    
+    // Normalize key names for Playwright
+    const normalizedKeys = keys.map(key => {
+      const lower = key.toLowerCase();
+      switch (lower) {
+        case 'ctrl': return 'Control';
+        case 'cmd': return 'Meta';
+        case 'command': return 'Meta';
+        case 'alt': return 'Alt';
+        case 'shift': return 'Shift';
+        case 'enter': return 'Enter';
+        case 'tab': return 'Tab';
+        case 'escape': return 'Escape';
+        case 'esc': return 'Escape';
+        case 'backspace': return 'Backspace';
+        case 'delete': return 'Delete';
+        case 'space': return 'Space';
+        case 'up': return 'ArrowUp';
+        case 'down': return 'ArrowDown';
+        case 'left': return 'ArrowLeft';
+        case 'right': return 'ArrowRight';
+        default: return key;
+      }
+    });
+
+    console.log(`[Browser] Pressing hotkey: ${normalizedKeys.join('+')}`);
+    
+    // Press modifier keys down
+    for (const key of normalizedKeys.slice(0, -1)) {
+      await this.page.keyboard.down(key);
+    }
+    
+    // Press the final key
+    const finalKey = normalizedKeys[normalizedKeys.length - 1];
+    await this.page.keyboard.press(finalKey);
+    
+    // Release modifier keys
+    for (const key of normalizedKeys.slice(0, -1).reverse()) {
+      await this.page.keyboard.up(key);
+    }
+  }
+
+  // Scroll at specific position
+  async scrollAt(x, y, direction = 'down', count = 1) {
+    if (!this.page) throw new Error('Browser not launched');
+    console.log(`[Browser] Scrolling ${direction} at (${x}, ${y}) x${count}`);
+    
+    // Move mouse to position first
+    await this.page.mouse.move(x, y);
+    
+    // Scroll amount per step
+    const scrollAmount = 100;
+    const deltaY = direction === 'up' ? -scrollAmount : scrollAmount;
+    
+    for (let i = 0; i < count; i++) {
+      await this.page.mouse.wheel(0, deltaY);
+      await this.wait(100);
+    }
+  }
+
+  // Scroll (simple version)
   async scroll(direction = 'down', amount = 300) {
     if (!this.page) throw new Error('Browser not launched');
     console.log(`[Browser] Scrolling ${direction} by ${amount}`);
