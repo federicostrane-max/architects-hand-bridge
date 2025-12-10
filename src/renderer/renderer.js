@@ -30,11 +30,20 @@ const elements = {
   settingsForm: document.getElementById('settings-form'),
   supabaseUrl: document.getElementById('supabase-url'),
   supabaseKey: document.getElementById('supabase-key'),
-  taskSecret: document.getElementById('task-secret'),
   openagiKey: document.getElementById('openagi-key'),
   outputFolder: document.getElementById('output-folder'),
   btnSelectOutput: document.getElementById('btn-select-output'),
   saveStatus: document.getElementById('save-status'),
+  
+  // Auth elements
+  loginForm: document.getElementById('login-form'),
+  loginEmail: document.getElementById('login-email'),
+  loginPassword: document.getElementById('login-password'),
+  loginError: document.getElementById('login-error'),
+  loginSection: document.getElementById('login-section'),
+  userSection: document.getElementById('user-section'),
+  userEmail: document.getElementById('user-email'),
+  btnLogout: document.getElementById('btn-logout'),
   
   // Tabs
   navTabs: document.querySelectorAll('.nav-tab'),
@@ -48,7 +57,9 @@ let state = {
   paused: false,
   currentTask: null,
   currentStep: null,
-  tasks: []
+  tasks: [],
+  isLoggedIn: false,
+  user: null
 };
 
 // Initialize
@@ -56,14 +67,20 @@ async function init() {
   // Load config
   const config = await window.electronAPI.getConfig();
   if (config) {
-    elements.supabaseUrl.value = config.supabaseUrl || '';
-    elements.supabaseKey.value = config.supabaseAnonKey || '';
-    elements.taskSecret.value = config.taskSecret || '';
-    elements.openagiKey.value = config.openAgiApiKey || '';
-    elements.outputFolder.value = config.outputFolder || '';
-    
-    updateConnectionInfo(config);
+    if (elements.supabaseUrl) elements.supabaseUrl.value = config.supabaseUrl || '';
+    if (elements.supabaseKey) elements.supabaseKey.value = config.supabaseAnonKey || '';
+    if (elements.openagiKey) elements.openagiKey.value = config.openAgiApiKey || '';
+    if (elements.outputFolder) elements.outputFolder.value = config.outputFolder || '';
   }
+  
+  // Check current session
+  const session = await window.electronAPI.getSession();
+  if (session) {
+    updateAuthUI(true, session.user);
+  }
+  
+  // Update connection info
+  updateConnectionInfo(config || {});
   
   // Setup event listeners
   setupEventListeners();
@@ -71,23 +88,24 @@ async function init() {
   // Setup IPC listeners
   setupIPCListeners();
   
-  addLog('info', 'App initialized. Configure your settings and click Start.');
+  addLog('info', 'App initialized. Login and configure settings to start.');
 }
 
 // Update connection info display
 function updateConnectionInfo(config) {
   const hasSupabase = config.supabaseUrl && config.supabaseAnonKey;
-  const hasTaskSecret = config.taskSecret;
   const hasOpenAgi = config.openAgiApiKey;
   
   let html = '<ul style="list-style: none; padding: 0; margin: 0;">';
   html += `<li>${hasSupabase ? '✅' : '❌'} Supabase configured</li>`;
-  html += `<li>${hasTaskSecret ? '✅' : '⚠️'} Task Secret ${hasTaskSecret ? 'configured' : '(optional until task assigned)'}</li>`;
+  html += `<li>${state.isLoggedIn ? '✅' : '❌'} User logged in</li>`;
   html += `<li>${hasOpenAgi ? '✅' : '❌'} OpenAGI (Lux) configured</li>`;
   html += '</ul>';
   
-  if (hasSupabase && hasOpenAgi) {
+  if (hasSupabase && hasOpenAgi && state.isLoggedIn) {
     html += '<p style="margin-top: 0.5rem; color: #22c55e;">Ready to start!</p>';
+  } else if (!state.isLoggedIn) {
+    html += '<p style="margin-top: 0.5rem; color: #f59e0b;">Login required to start</p>';
   }
   
   elements.connectionInfo.innerHTML = html;
@@ -121,6 +139,10 @@ function setupEventListeners() {
       elements.outputFolder.value = folder;
     }
   });
+  
+  // Auth
+  elements.loginForm.addEventListener('submit', handleLogin);
+  elements.btnLogout.addEventListener('click', handleLogout);
 }
 
 // Setup IPC listeners
@@ -144,6 +166,89 @@ function setupIPCListeners() {
   window.electronAPI.onScreenshot((data) => {
     updateScreenshot(data.url);
   });
+  
+  window.electronAPI.onAuthChange((data) => {
+    if (data.event === 'SIGNED_IN') {
+      updateAuthUI(true, data.session.user);
+    } else if (data.event === 'SIGNED_OUT') {
+      updateAuthUI(false, null);
+    }
+  });
+}
+
+// Handle login
+async function handleLogin(e) {
+  e.preventDefault();
+  
+  const email = elements.loginEmail.value.trim();
+  const password = elements.loginPassword.value;
+  
+  elements.loginError.textContent = '';
+  elements.loginForm.querySelector('button[type="submit"]').disabled = true;
+  elements.loginForm.querySelector('button[type="submit"]').textContent = '🔄 Logging in...';
+  
+  try {
+    const result = await window.electronAPI.login(email, password);
+    
+    if (result.success) {
+      updateAuthUI(true, result.user);
+      addLog('success', `Logged in as ${result.user.email}`);
+      elements.loginPassword.value = ''; // Clear password
+    } else {
+      elements.loginError.textContent = result.error;
+      addLog('error', `Login failed: ${result.error}`);
+    }
+  } catch (error) {
+    elements.loginError.textContent = error.message;
+    addLog('error', `Login error: ${error.message}`);
+  } finally {
+    elements.loginForm.querySelector('button[type="submit"]').disabled = false;
+    elements.loginForm.querySelector('button[type="submit"]').textContent = '🔓 Login';
+  }
+}
+
+// Handle logout
+async function handleLogout() {
+  try {
+    // Stop bridge if running
+    if (state.running) {
+      await stopBridge();
+    }
+    
+    const result = await window.electronAPI.logout();
+    
+    if (result.success) {
+      updateAuthUI(false, null);
+      addLog('info', 'Logged out');
+    } else {
+      addLog('error', `Logout failed: ${result.error}`);
+    }
+  } catch (error) {
+    addLog('error', `Logout error: ${error.message}`);
+  }
+}
+
+// Update auth UI
+function updateAuthUI(isLoggedIn, user) {
+  state.isLoggedIn = isLoggedIn;
+  state.user = user;
+  
+  if (isLoggedIn && user) {
+    elements.loginSection.style.display = 'none';
+    elements.userSection.style.display = 'block';
+    elements.userEmail.textContent = user.email;
+    elements.btnStart.disabled = false;
+  } else {
+    elements.loginSection.style.display = 'block';
+    elements.userSection.style.display = 'none';
+    elements.userEmail.textContent = '-';
+    elements.btnStart.disabled = true;
+  }
+  
+  // Update connection info
+  window.electronAPI.getConfig().then(config => {
+    updateConnectionInfo(config || {});
+  });
 }
 
 // Switch tab
@@ -157,13 +262,22 @@ function switchTab(tabId) {
 
 // Start bridge
 async function startBridge() {
+  if (!state.isLoggedIn) {
+    addLog('error', 'Please login first');
+    return;
+  }
+  
   addLog('info', 'Starting bridge...');
   
   try {
-    await window.electronAPI.startBridge();
-    state.running = true;
-    updateControlButtons();
-    updateStatus('connecting');
+    const result = await window.electronAPI.startBridge();
+    if (result.success) {
+      state.running = true;
+      updateControlButtons();
+      updateStatus('connecting');
+    } else {
+      addLog('error', `Failed to start: ${result.error}`);
+    }
   } catch (error) {
     addLog('error', `Failed to start: ${error.message}`);
   }
@@ -201,7 +315,7 @@ async function stopBridge() {
 
 // Update control buttons
 function updateControlButtons() {
-  elements.btnStart.disabled = state.running;
+  elements.btnStart.disabled = state.running || !state.isLoggedIn;
   elements.btnPause.disabled = !state.running;
   elements.btnStop.disabled = !state.running;
 }
@@ -215,7 +329,7 @@ function updateStatus(status) {
       elements.statusDot.classList.add('connected');
       elements.statusText.textContent = 'Connected';
       state.connected = true;
-      addLog('success', 'Connected to Supabase');
+      addLog('success', 'Connected to Supabase - listening for tasks');
       break;
     case 'connecting':
       elements.statusDot.classList.add('connecting');
@@ -308,7 +422,6 @@ async function saveSettings(e) {
   const config = {
     supabaseUrl: elements.supabaseUrl.value.trim(),
     supabaseAnonKey: elements.supabaseKey.value.trim(),
-    taskSecret: elements.taskSecret.value.trim(),
     openAgiApiKey: elements.openagiKey.value.trim(),
     outputFolder: elements.outputFolder.value.trim()
   };
@@ -317,6 +430,7 @@ async function saveSettings(e) {
   
   if (success) {
     elements.saveStatus.textContent = '✓ Saved!';
+    elements.saveStatus.style.color = '#22c55e';
     updateConnectionInfo(config);
     addLog('success', 'Settings saved');
     
