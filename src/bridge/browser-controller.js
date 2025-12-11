@@ -78,6 +78,11 @@ class BrowserController {
     };
   }
 
+  // Navigate to URL (alias for goto)
+  async navigate(url, options = {}) {
+    return this.goto(url, options);
+  }
+
   // Navigate to URL
   async goto(url, options = {}) {
     if (!this.page) {
