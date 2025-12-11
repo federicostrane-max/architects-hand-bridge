@@ -1,411 +1,442 @@
-const supabase = require('./supabase-client');
-const lux = require('./lux-client');
-const browser = require('./browser-controller');
+/**
+ * Lux Client - OpenAGI Lux API Integration
+ * Handles communication with lux-actor-1 model for browser automation
+ */
 
-class Bridge {
+const https = require('https');
+const crypto = require('crypto');
+
+class LuxClient {
   constructor() {
-    this.isRunning = false;
-    this.isPaused = false;
-    this.currentTask = null;
-    this.currentStep = null;
-    this.pollInterval = null;
-    this.sendLog = null;
-    this.sendStatus = null;
-    this.sendTaskUpdate = null;
-    this.sendStepUpdate = null;
-    this.sendScreenshot = null;
+    this.apiKey = null;
+    this.baseUrl = 'api.agiopen.org';
+    this.model = 'lux-actor-1';
+    this.taskId = null;
+    this.messagesHistory = [];
   }
 
-  // Set callbacks for UI updates
-  setCallbacks({ sendLog, sendStatus, sendTaskUpdate, sendStepUpdate, sendScreenshot }) {
-    this.sendLog = sendLog || console.log;
-    this.sendStatus = sendStatus || (() => {});
-    this.sendTaskUpdate = sendTaskUpdate || (() => {});
-    this.sendStepUpdate = sendStepUpdate || (() => {});
-    this.sendScreenshot = sendScreenshot || (() => {});
+  /**
+   * Set the API key
+   */
+  setApiKey(key) {
+    this.apiKey = key;
+    console.log(`[Lux] API key set (starts with: ${key?.substring(0, 8)}...)`);
   }
 
-  // Log helper
-  log(level, message) {
-    console.log(`[Bridge] [${level.toUpperCase()}] ${message}`);
-    if (this.sendLog) {
-      this.sendLog(level, message);
-    }
+  /**
+   * Generate a new task ID (UUID v4)
+   */
+  generateTaskId() {
+    return crypto.randomUUID();
   }
 
-  // Start the bridge
-  async start(config) {
-    if (this.isRunning) {
-      this.log('warn', 'Bridge is already running');
-      return;
+  /**
+   * Execute a step - send screenshot and instruction to Lux
+   */
+  async executeStep(screenshotBase64, instruction, context = '') {
+    if (!this.apiKey) {
+      throw new Error('API key not set');
     }
 
-    this.log('info', 'Starting bridge...');
-    this.sendStatus('connecting');
+    // Generate task_id if not already set
+    if (!this.taskId) {
+      this.taskId = this.generateTaskId();
+      console.log(`[Lux] New task_id generated: ${this.taskId}`);
+    }
 
     try {
-      // Validate config
-      if (!config.supabaseUrl || !config.supabaseAnonKey) {
-        throw new Error('Supabase configuration is missing');
-      }
-      if (!config.openAgiApiKey) {
-        throw new Error('OpenAGI API key is missing');
-      }
-
-      // Connect to Supabase (with optional task secret for RLS)
-      this.log('info', 'Connecting to Supabase...');
-      supabase.connect(config.supabaseUrl, config.supabaseAnonKey, config.taskSecret);
+      // Step 1: Get presigned URL for upload
+      console.log('[Lux] Getting presigned URL...');
+      const uploadInfo = await this.getPresignedUrl();
+      console.log('[Lux] Got presigned URL');
       
-      if (config.taskSecret) {
-        this.log('info', 'Task secret configured for RLS authentication');
-      } else {
-        this.log('warn', 'No task secret configured - will have limited access until task is assigned');
-      }
+      // Step 2: Upload screenshot to S3
+      console.log('[Lux] Uploading screenshot to S3...');
+      await this.uploadToS3(uploadInfo.url, screenshotBase64);
+      console.log('[Lux] Screenshot uploaded successfully');
       
-      // Test connection (might fail if no task secret - that's ok)
-      try {
-        await supabase.testConnection();
-        this.log('success', 'Connected to Supabase');
-      } catch (connError) {
-        this.log('warn', `Supabase connection test: ${connError.message} - This is OK if no task is assigned yet`);
-      }
-
-      // Set Lux API key
-      lux.setApiKey(config.openAgiApiKey);
-      this.log('info', 'Lux API configured');
-
-      // Launch browser
-      this.log('info', 'Launching browser...');
-      await browser.launch();
-      this.log('success', 'Browser launched');
-
-      // Mark as running BEFORE setting up subscriptions
-      // This ensures the UI shows "connected" even if Realtime fails
-      this.isRunning = true;
-      this.sendStatus('connected');
-      this.log('success', 'Bridge started successfully');
-
-      // Setup realtime subscriptions (non-blocking, failures are OK)
-      this.setupRealtimeSubscriptions();
-
-      // Start polling for tasks (this is the reliable method)
-      this.startPolling();
-
+      // Step 3: Call Lux API with the download_url
+      console.log('[Lux] Calling Lux API...');
+      const result = await this.callLuxApi(uploadInfo.download_url, instruction, context);
+      
+      return result;
     } catch (error) {
-      this.log('error', `Failed to start: ${error.message}`);
-      this.sendStatus('disconnected');
-      await this.cleanup();
-      throw error;
+      console.error('[Lux] Error:', error.message);
+      return {
+        status: 'error',
+        actions: [],
+        feedback: error.message,
+        raw: null
+      };
     }
   }
 
-  // Setup realtime subscriptions (best-effort, polling is fallback)
-  setupRealtimeSubscriptions() {
-    try {
-      // Subscribe to new steps
-      supabase.subscribeToSteps((step) => {
-        this.log('info', `New step received via Realtime: ${step.instruction?.substring(0, 50)}...`);
-        if (!this.isPaused) {
-          this.processStep(step);
+  /**
+   * Get presigned URL for S3 upload
+   */
+  async getPresignedUrl() {
+    return new Promise((resolve, reject) => {
+      const options = {
+        hostname: this.baseUrl,
+        port: 443,
+        path: '/v1/file/upload',
+        method: 'GET',
+        headers: {
+          'x-api-key': this.apiKey
         }
+      };
+
+      const req = https.request(options, (res) => {
+        let data = '';
+        res.on('data', chunk => data += chunk);
+        res.on('end', () => {
+          try {
+            if (res.statusCode !== 200) {
+              reject(new Error(`Failed to get presigned URL: ${res.statusCode} - ${data}`));
+              return;
+            }
+            const parsed = JSON.parse(data);
+            console.log('[Lux] Presigned URL fields:', Object.keys(parsed).join(', '));
+            if (!parsed.url || !parsed.download_url) {
+              reject(new Error(`Invalid presigned URL response - missing url or download_url`));
+              return;
+            }
+            resolve(parsed);
+          } catch (e) {
+            reject(new Error(`Failed to parse presigned URL response: ${e.message}`));
+          }
+        });
       });
 
-      // Subscribe to task updates
-      supabase.subscribeToTasks((task, eventType) => {
-        this.log('info', `Task ${eventType} via Realtime: ${task.task_description?.substring(0, 50)}...`);
-        this.sendTaskUpdate(task);
-      });
-
-      this.log('info', 'Realtime subscriptions setup (polling active as fallback)');
-    } catch (error) {
-      // Realtime is optional - polling will handle everything
-      this.log('warn', `Realtime setup failed (using polling only): ${error.message}`);
-    }
+      req.on('error', reject);
+      req.end();
+    });
   }
 
-  // Start polling for pending steps
-  startPolling() {
-    this.log('info', 'Starting task polling (every 2 seconds)...');
-    
-    this.pollInterval = setInterval(async () => {
-      if (this.isPaused || this.currentStep) {
-        return; // Skip if paused or already processing a step
-      }
-
-      try {
-        const step = await supabase.getNextPendingStep();
-        if (step) {
-          this.log('info', `Found pending step via polling: ${step.instruction?.substring(0, 50)}...`);
-          await this.processStep(step);
-        }
-      } catch (error) {
-        // Don't spam logs for expected errors (no tasks)
-        if (!error.message.includes('no rows') && !error.message.includes('not found')) {
-          this.log('error', `Polling error: ${error.message}`);
-        }
-      }
-    }, 2000); // Poll every 2 seconds
-  }
-
-  // Process a step
-  async processStep(step) {
-    if (this.currentStep) {
-      this.log('warn', 'Already processing a step, queueing...');
-      return;
-    }
-
-    this.currentStep = step;
-    this.sendStepUpdate(step);
-
-    try {
-      // Load task info if not already loaded
-      const isNewTask = !this.currentTask || this.currentTask.id !== step.task_id;
+  /**
+   * Upload image to S3 using presigned URL
+   */
+  async uploadToS3(presignedUrl, base64Image) {
+    return new Promise((resolve, reject) => {
+      const imageBuffer = Buffer.from(base64Image, 'base64');
       
-      if (isNewTask) {
-        this.currentTask = await supabase.getTask(step.task_id);
-        this.sendTaskUpdate(this.currentTask);
-        
-        // Reset Lux session for new task
-        lux.resetSession();
-        
-        // Navigate to start_url if provided
-        if (this.currentTask.start_url) {
-          this.log('info', `Navigating to start URL: ${this.currentTask.start_url}`);
-          await browser.navigate(this.currentTask.start_url);
-          await browser.wait(2000); // Wait for page to load
-          this.log('success', 'Navigation complete');
-          
-          // Take screenshot after navigation
-          const navScreenshot = await browser.screenshotBase64();
-          this.sendScreenshot(`data:image/png;base64,${navScreenshot}`);
-        } else {
-          this.log('warn', 'No start_url provided for task - browser may be on blank page');
-        }
-      }
-
-      this.log('info', `Processing step ${step.step_number}: ${step.instruction.substring(0, 100)}...`);
-
-      // Mark step as running
-      await supabase.markStepRunning(step.id);
-      step.status = 'running';
-      this.sendStepUpdate(step);
-
-      // Take screenshot before action
-      const screenshotBefore = await browser.screenshotBase64();
-      
-      // Update UI with current screenshot
-      this.sendScreenshot(`data:image/png;base64,${screenshotBefore}`);
-
-      // Save screenshot before
-      const beforeUrl = await supabase.uploadScreenshot(
-        step.task_id, 
-        step.step_number, 
-        Buffer.from(screenshotBefore, 'base64'), 
-        'before'
-      );
-      await supabase.updateStep(step.id, { screenshot_before: beforeUrl });
-
-      // Send to Lux for action
-      this.log('info', 'Sending to Lux for analysis...');
-      const luxResult = await lux.executeStep(screenshotBefore, step.instruction, step.instruction_context);
-
-      this.log('info', `Lux response: ${luxResult.status} - ${luxResult.feedback || 'No feedback'}`);
-
-      // Execute actions in browser
-      if (luxResult.actions && luxResult.actions.length > 0) {
-        this.log('info', `Executing ${luxResult.actions.length} actions...`);
-        
-        for (const action of luxResult.actions) {
-          if (this.isPaused) {
-            this.log('warn', 'Paused during action execution');
-            break;
-          }
-
-          if (action.type === 'done' || action.type === 'complete') {
-            this.log('info', 'Step marked as done by Lux');
-            break;
-          }
-
-          this.log('info', `Executing: ${action.type}`);
-          await browser.executeAction(action);
-        }
-      } else {
-        this.log('warn', 'No actions received from Lux');
-      }
-
-      // Take screenshot after actions
-      await browser.wait(500); // Wait for page to settle
-      const screenshotAfter = await browser.screenshotBase64();
-      this.sendScreenshot(`data:image/png;base64,${screenshotAfter}`);
-
-      // Upload screenshot after
-      const afterUrl = await supabase.uploadScreenshot(
-        step.task_id, 
-        step.step_number, 
-        Buffer.from(screenshotAfter, 'base64'), 
-        'after'
-      );
-
-      // Mark step as completed
-      await supabase.markStepCompleted(
-        step.id,
-        afterUrl,
-        luxResult.raw,
-        luxResult.actions
-      );
-
-      this.log('success', `Step ${step.step_number} completed`);
-
-      // Update UI
-      step.status = 'completed';
-      step.screenshot_after = afterUrl;
-      this.sendStepUpdate(step);
-
-      // Refresh task to get updated progress
-      this.currentTask = await supabase.getTask(step.task_id);
-      this.sendTaskUpdate(this.currentTask);
-
-    } catch (error) {
-      this.log('error', `Step failed: ${error.message}`);
-
-      // Take error screenshot
-      let errorScreenshot = null;
+      let url;
       try {
-        const screenshot = await browser.screenshotBase64();
-        errorScreenshot = await supabase.uploadScreenshot(
-          step.task_id, 
-          step.step_number, 
-          Buffer.from(screenshot, 'base64'), 
-          'error'
-        );
-        this.sendScreenshot(`data:image/png;base64,${screenshot}`);
+        url = new URL(presignedUrl);
       } catch (e) {
-        console.error('Failed to capture error screenshot:', e);
+        reject(new Error(`Invalid S3 URL format`));
+        return;
       }
+      
+      const options = {
+        hostname: url.hostname,
+        port: 443,
+        path: url.pathname + url.search,
+        method: 'PUT',
+        headers: {
+          'Content-Length': imageBuffer.length
+        }
+      };
 
-      // Mark step as failed
-      await supabase.markStepFailed(step.id, error.message, errorScreenshot);
-
-      // Check if we should retry
-      const retried = await supabase.incrementRetryCount(step.id);
-      if (retried) {
-        this.log('info', `Retrying step (attempt ${retried.retry_count + 1}/${retried.max_retries})`);
-      } else {
-        this.log('error', 'Max retries reached, marking task as failed');
-        await supabase.markTaskFailed(step.task_id, `Step ${step.step_number} failed: ${error.message}`);
-      }
-
-      step.status = 'failed';
-      step.error_message = error.message;
-      this.sendStepUpdate(step);
-
-    } finally {
-      this.currentStep = null;
-    }
-  }
-
-  // Pause the bridge
-  pause() {
-    this.isPaused = true;
-    this.log('info', 'Bridge paused');
-  }
-
-  // Resume the bridge
-  resume() {
-    this.isPaused = false;
-    this.log('info', 'Bridge resumed');
-  }
-
-  // Stop the bridge
-  async stop() {
-    this.log('info', 'Stopping bridge...');
-    
-    this.isRunning = false;
-    this.isPaused = false;
-    
-    if (this.pollInterval) {
-      clearInterval(this.pollInterval);
-      this.pollInterval = null;
-    }
-
-    await this.cleanup();
-    
-    this.sendStatus('disconnected');
-    this.log('info', 'Bridge stopped');
-  }
-
-  // Cleanup resources
-  async cleanup() {
-    try {
-      await browser.close();
-    } catch (e) {
-      console.error('Error closing browser:', e);
-    }
-
-    try {
-      supabase.disconnect();
-    } catch (e) {
-      console.error('Error disconnecting Supabase:', e);
-    }
-
-    this.currentTask = null;
-    this.currentStep = null;
-  }
-
-  // Cancel current task
-  async cancelTask(taskId) {
-    this.log('info', `Cancelling task: ${taskId}`);
-    
-    try {
-      await supabase.updateTask(taskId, { 
-        status: 'cancelled',
-        completed_at: new Date().toISOString()
+      const req = https.request(options, (res) => {
+        let data = '';
+        res.on('data', chunk => data += chunk);
+        res.on('end', () => {
+          if (res.statusCode >= 200 && res.statusCode < 300) {
+            resolve();
+          } else {
+            reject(new Error(`S3 upload failed: ${res.statusCode}`));
+          }
+        });
       });
-      
-      if (this.currentTask?.id === taskId) {
-        this.currentTask = null;
-        this.currentStep = null;
-        this.sendTaskUpdate(null);
-        this.sendStepUpdate(null);
-      }
-      
-      this.log('success', 'Task cancelled');
-    } catch (error) {
-      this.log('error', `Failed to cancel task: ${error.message}`);
-      throw error;
-    }
+
+      req.on('error', reject);
+      req.write(imageBuffer);
+      req.end();
+    });
   }
 
-  // Retry a failed step
-  async retryStep(stepId) {
-    this.log('info', `Retrying step: ${stepId}`);
-    
-    try {
-      const step = await supabase.updateStep(stepId, {
-        status: 'pending',
-        error_message: null,
-        started_at: null,
-        completed_at: null
+  /**
+   * Call Lux API with image and instruction
+   */
+  async callLuxApi(imageUrl, instruction, context) {
+    return new Promise((resolve, reject) => {
+      const taskDescription = context 
+        ? `${context}\n\nCurrent instruction: ${instruction}`
+        : instruction;
+
+      const messages = [
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'image_url',
+              image_url: { url: imageUrl }
+            },
+            {
+              type: 'text',
+              text: instruction
+            }
+          ]
+        }
+      ];
+
+      const requestBody = JSON.stringify({
+        model: this.model,
+        task_id: this.taskId,
+        messages: messages,
+        task_description: taskDescription,
+        max_tokens: 1024
       });
-      
-      this.log('success', 'Step queued for retry');
-      return step;
-    } catch (error) {
-      this.log('error', `Failed to retry step: ${error.message}`);
-      throw error;
-    }
+
+      console.log('[Lux] Request body (truncated):', requestBody.substring(0, 200) + '...');
+
+      const options = {
+        hostname: this.baseUrl,
+        port: 443,
+        path: '/v2/message',
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': this.apiKey,
+          'Content-Length': Buffer.byteLength(requestBody)
+        }
+      };
+
+      const req = https.request(options, (res) => {
+        let data = '';
+        res.on('data', chunk => data += chunk);
+        res.on('end', () => {
+          try {
+            if (res.statusCode !== 200) {
+              reject(new Error(`Lux API error: ${res.statusCode} - ${data.substring(0, 300)}`));
+              return;
+            }
+
+            const response = JSON.parse(data);
+            console.log('[Lux] Raw response:', JSON.stringify(response).substring(0, 500));
+            const result = this.parseResponse(response);
+            console.log('[Lux] Parsed actions:', JSON.stringify(result.actions));
+            resolve(result);
+          } catch (e) {
+            reject(new Error(`Failed to parse Lux response: ${e.message}`));
+          }
+        });
+      });
+
+      req.on('error', reject);
+      req.write(requestBody);
+      req.end();
+    });
   }
 
-  // Get current state
-  getState() {
+  /**
+   * Parse Lux API response into actions
+   * Lux returns: { actions: [{type, argument, coordinates, ...}], reason: "..." }
+   */
+  parseResponse(response) {
+    const actions = [];
+    let feedback = response.reason || '';
+    
+    // Lux returns actions directly in response.actions array
+    if (response.actions && Array.isArray(response.actions)) {
+      for (const luxAction of response.actions) {
+        const action = this.convertLuxAction(luxAction);
+        if (action) {
+          actions.push(action);
+        }
+      }
+    }
+    
+    // Also check for content array (Claude-style format, just in case)
+    if (response.content && Array.isArray(response.content)) {
+      for (const block of response.content) {
+        if (block.type === 'text') {
+          feedback = block.text || feedback;
+        }
+        if (block.type === 'tool_use') {
+          const action = this.parseToolUse(block);
+          if (action) {
+            actions.push(action);
+          }
+        }
+      }
+    }
+
     return {
-      isRunning: this.isRunning,
-      isPaused: this.isPaused,
-      currentTask: this.currentTask,
-      currentStep: this.currentStep,
-      browserActive: browser.isActive()
+      status: actions.length > 0 ? 'success' : 'no_action',
+      actions,
+      feedback,
+      raw: response
     };
+  }
+
+  /**
+   * Convert Lux action format to our internal format
+   * Lux uses: {type: "click", coordinates: [x,y]} or {type: "hotkey", argument: "enter"}
+   * We use: {type: "click", x, y} or {type: "key", key: "Enter"}
+   */
+  convertLuxAction(luxAction) {
+    const type = luxAction.type?.toLowerCase();
+    
+    switch (type) {
+      case 'click':
+      case 'left_click':
+      case 'right_click':
+      case 'double_click':
+        // Lux uses coordinates array [x, y]
+        const coords = luxAction.coordinates || luxAction.coordinate || [];
+        if (coords.length >= 2) {
+          return {
+            type: 'click',
+            x: coords[0],
+            y: coords[1],
+            button: type === 'right_click' ? 'right' : 'left',
+            double: type === 'double_click'
+          };
+        }
+        return null;
+      
+      case 'type':
+      case 'input':
+        return {
+          type: 'type',
+          text: luxAction.argument || luxAction.text || ''
+        };
+      
+      case 'hotkey':
+      case 'key':
+      case 'keypress':
+        // Lux uses argument for key name
+        const key = luxAction.argument || luxAction.key || '';
+        return {
+          type: 'key',
+          key: this.normalizeKeyName(key)
+        };
+      
+      case 'scroll':
+        return {
+          type: 'scroll',
+          x: luxAction.coordinates?.[0] || 0,
+          y: luxAction.coordinates?.[1] || 0,
+          direction: luxAction.direction || luxAction.argument || 'down'
+        };
+      
+      case 'drag':
+        const start = luxAction.start_coordinates || luxAction.coordinates || [];
+        const end = luxAction.end_coordinates || [];
+        if (start.length >= 2 && end.length >= 2) {
+          return {
+            type: 'drag',
+            x1: start[0],
+            y1: start[1],
+            x2: end[0],
+            y2: end[1]
+          };
+        }
+        return null;
+      
+      case 'wait':
+        return {
+          type: 'wait',
+          duration: luxAction.argument || luxAction.duration || 1000
+        };
+      
+      case 'done':
+      case 'complete':
+      case 'finished':
+        return { type: 'done' };
+      
+      default:
+        console.log(`[Lux] Unknown action type: ${type}`, luxAction);
+        return null;
+    }
+  }
+
+  /**
+   * Normalize key names to match Playwright expectations
+   */
+  normalizeKeyName(key) {
+    const keyMap = {
+      'enter': 'Enter',
+      'return': 'Enter',
+      'tab': 'Tab',
+      'escape': 'Escape',
+      'esc': 'Escape',
+      'backspace': 'Backspace',
+      'delete': 'Delete',
+      'space': 'Space',
+      'up': 'ArrowUp',
+      'down': 'ArrowDown',
+      'left': 'ArrowLeft',
+      'right': 'ArrowRight',
+      'home': 'Home',
+      'end': 'End',
+      'pageup': 'PageUp',
+      'pagedown': 'PageDown',
+      'ctrl': 'Control',
+      'control': 'Control',
+      'alt': 'Alt',
+      'shift': 'Shift',
+      'meta': 'Meta',
+      'cmd': 'Meta',
+      'command': 'Meta'
+    };
+    
+    const normalized = keyMap[key.toLowerCase()] || key;
+    return normalized;
+  }
+
+  /**
+   * Parse tool_use block (Claude-style format)
+   */
+  parseToolUse(block) {
+    const name = block.name?.toLowerCase();
+    const input = block.input || {};
+
+    switch (name) {
+      case 'click':
+      case 'mouse_click':
+        return {
+          type: 'click',
+          x: input.x || input.coordinate?.[0],
+          y: input.y || input.coordinate?.[1],
+          button: input.button || 'left'
+        };
+      
+      case 'type':
+      case 'keyboard_type':
+        return {
+          type: 'type',
+          text: input.text || input.content
+        };
+      
+      case 'key':
+      case 'keyboard_key':
+        return {
+          type: 'key',
+          key: this.normalizeKeyName(input.key || input.name || '')
+        };
+      
+      case 'scroll':
+        return {
+          type: 'scroll',
+          x: input.x || 0,
+          y: input.y || 0,
+          direction: input.direction || 'down'
+        };
+      
+      default:
+        console.log(`[Lux] Unknown tool: ${name}`);
+        return null;
+    }
+  }
+
+  resetSession() {
+    this.taskId = null;
+    this.messagesHistory = [];
+    console.log('[Lux] Session reset');
   }
 }
 
-module.exports = new Bridge();
+module.exports = new LuxClient();
