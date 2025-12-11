@@ -159,9 +159,28 @@ class Bridge {
 
     try {
       // Load task info if not already loaded
-      if (!this.currentTask || this.currentTask.id !== step.task_id) {
+      const isNewTask = !this.currentTask || this.currentTask.id !== step.task_id;
+      
+      if (isNewTask) {
         this.currentTask = await supabase.getTask(step.task_id);
         this.sendTaskUpdate(this.currentTask);
+        
+        // Reset Lux session for new task
+        lux.resetSession();
+        
+        // Navigate to start_url if provided
+        if (this.currentTask.start_url) {
+          this.log('info', `Navigating to start URL: ${this.currentTask.start_url}`);
+          await browser.navigate(this.currentTask.start_url);
+          await browser.wait(2000); // Wait for page to load
+          this.log('success', 'Navigation complete');
+          
+          // Take screenshot after navigation
+          const navScreenshot = await browser.screenshotBase64();
+          this.sendScreenshot(`data:image/png;base64,${navScreenshot}`);
+        } else {
+          this.log('warn', 'No start_url provided for task - browser may be on blank page');
+        }
       }
 
       this.log('info', `Processing step ${step.step_number}: ${step.instruction.substring(0, 100)}...`);
