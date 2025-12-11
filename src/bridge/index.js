@@ -168,10 +168,12 @@ class Bridge {
         // Reset Lux session for new task
         lux.resetSession();
         
-        // Navigate to start_url if provided
-        if (this.currentTask.start_url) {
-          this.log('info', `Navigating to start URL: ${this.currentTask.start_url}`);
-          await browser.navigate(this.currentTask.start_url);
+        // Navigate to start_url if provided (check column first, then task_data for backwards compat)
+        const startUrl = this.currentTask.start_url || this.currentTask.task_data?.start_url;
+        
+        if (startUrl) {
+          this.log('info', `Navigating to start URL: ${startUrl}`);
+          await browser.navigate(startUrl);
           await browser.wait(2000); // Wait for page to load
           this.log('success', 'Navigation complete');
           
