@@ -21,7 +21,6 @@ class SupabaseClient {
       }
     };
 
-    // Add task_secret header if provided (for RLS policy authentication)
     if (taskSecret) {
       options.global = {
         headers: {
@@ -36,7 +35,6 @@ class SupabaseClient {
     return this.client;
   }
 
-  // Allow updating task secret without full reconnect
   setTaskSecret(taskSecret) {
     this.taskSecret = taskSecret;
   }
@@ -115,6 +113,73 @@ class SupabaseClient {
       .subscribe();
   }
 
+  /**
+   * Get next pending TASK (TaskerAgent mode)
+   * Returns a complete task to be executed with all todos
+   */
+  async getNextPendingTask() {
+    if (!this.client) {
+      throw new Error('Client not initialized');
+    }
+
+    // First check for running tasks
+    const { data: runningTasks, error: runningError } = await this.client
+      .from('browser_tasks')
+      .select('*')
+      .eq('status', 'running')
+      .order('created_at', { ascending: true })
+      .limit(1);
+
+    if (runningError) {
+      throw new Error(`Failed to get running tasks: ${runningError.message}`);
+    }
+
+    if (runningTasks && runningTasks.length > 0) {
+      return runningTasks[0];
+    }
+
+    // Then check for pending tasks
+    const { data: pendingTasks, error: pendingError } = await this.client
+      .from('browser_tasks')
+      .select('*')
+      .eq('status', 'pending')
+      .order('created_at', { ascending: true })
+      .limit(1);
+
+    if (pendingError) {
+      throw new Error(`Failed to get pending tasks: ${pendingError.message}`);
+    }
+
+    if (!pendingTasks || pendingTasks.length === 0) {
+      return null;
+    }
+
+    return pendingTasks[0];
+  }
+
+  /**
+   * Get all steps for a task (for building todos array)
+   */
+  async getStepsForTask(taskId) {
+    if (!this.client) {
+      throw new Error('Client not initialized');
+    }
+
+    const { data, error } = await this.client
+      .from('browser_steps')
+      .select('*')
+      .eq('task_id', taskId)
+      .order('step_number', { ascending: true });
+
+    if (error) {
+      console.error('[Supabase] Error fetching steps:', error);
+      return [];
+    }
+
+    return data || [];
+  }
+
+  // Keep for backwards compatibility
   async getNextPendingStep() {
     if (!this.client) {
       throw new Error('Client not initialized');
