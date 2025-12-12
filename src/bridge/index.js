@@ -293,34 +293,12 @@ class Bridge {
   }
 
   /**
-   * Build context string for Lux
+   * Build context string for Lux Actor mode
+   * Keep it simple - Actor works best with direct instructions
    */
   buildLuxContext(task, todos, currentIndex) {
-    const completedTodos = todos.slice(0, currentIndex);
-    const remainingTodos = todos.slice(currentIndex + 1);
-    const currentTodo = todos[currentIndex];
-
-    let context = `TASK: ${task.task_description}\n\n`;
-    
-    if (completedTodos.length > 0) {
-      context += `COMPLETED STEPS:\n`;
-      completedTodos.forEach((todo, i) => {
-        context += `✓ ${i + 1}. ${todo}\n`;
-      });
-      context += '\n';
-    }
-
-    context += `CURRENT STEP (${currentIndex + 1}/${todos.length}):\n`;
-    context += `→ ${currentTodo}\n\n`;
-
-    if (remainingTodos.length > 0) {
-      context += `REMAINING STEPS:\n`;
-      remainingTodos.forEach((todo, i) => {
-        context += `${currentIndex + 2 + i}. ${todo}\n`;
-      });
-    }
-
-    return context;
+    // For Actor mode, just provide the overall goal - keep it simple
+    return task.task_description;
   }
 
   /**
