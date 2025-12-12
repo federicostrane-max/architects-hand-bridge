@@ -7,7 +7,6 @@ class Bridge {
     this.isRunning = false;
     this.isPaused = false;
     this.currentTask = null;
-    this.currentStep = null;
     this.pollInterval = null;
     this.sendLog = null;
     this.sendStatus = null;
@@ -16,7 +15,6 @@ class Bridge {
     this.sendScreenshot = null;
   }
 
-  // Set callbacks for UI updates
   setCallbacks({ sendLog, sendStatus, sendTaskUpdate, sendStepUpdate, sendScreenshot }) {
     this.sendLog = sendLog || console.log;
     this.sendStatus = sendStatus || (() => {});
@@ -25,7 +23,6 @@ class Bridge {
     this.sendScreenshot = sendScreenshot || (() => {});
   }
 
-  // Log helper
   log(level, message) {
     console.log(`[Bridge] [${level.toUpperCase()}] ${message}`);
     if (this.sendLog) {
@@ -33,7 +30,6 @@ class Bridge {
     }
   }
 
-  // Start the bridge
   async start(config) {
     if (this.isRunning) {
       this.log('warn', 'Bridge is already running');
@@ -44,7 +40,6 @@ class Bridge {
     this.sendStatus('connecting');
 
     try {
-      // Validate config
       if (!config.supabaseUrl || !config.supabaseAnonKey) {
         throw new Error('Supabase configuration is missing');
       }
@@ -52,7 +47,6 @@ class Bridge {
         throw new Error('OpenAGI API key is missing');
       }
 
-      // Connect to Supabase (with optional task secret for RLS)
       this.log('info', 'Connecting to Supabase...');
       supabase.connect(config.supabaseUrl, config.supabaseAnonKey, config.taskSecret);
       
@@ -62,33 +56,24 @@ class Bridge {
         this.log('warn', 'No task secret configured - will have limited access until task is assigned');
       }
       
-      // Test connection (might fail if no task secret - that's ok)
       try {
         await supabase.testConnection();
         this.log('success', 'Connected to Supabase');
       } catch (connError) {
-        this.log('warn', `Supabase connection test: ${connError.message} - This is OK if no task is assigned yet`);
+        this.log('warn', `Supabase connection test: ${connError.message}`);
       }
 
-      // Set Lux API key
       lux.setApiKey(config.openAgiApiKey);
       this.log('info', 'Lux API configured');
 
-      // Launch browser
       this.log('info', 'Launching browser...');
       await browser.launch();
       this.log('success', 'Browser launched');
 
-      // Mark as running BEFORE setting up subscriptions
-      // This ensures the UI shows "connected" even if Realtime fails
       this.isRunning = true;
       this.sendStatus('connected');
-      this.log('success', 'Bridge started successfully');
+      this.log('success', 'Bridge started successfully (TaskerAgent mode)');
 
-      // Setup realtime subscriptions (non-blocking, failures are OK)
-      this.setupRealtimeSubscriptions();
-
-      // Start polling for tasks (this is the reliable method)
       this.startPolling();
 
     } catch (error) {
@@ -99,226 +84,276 @@ class Bridge {
     }
   }
 
-  // Setup realtime subscriptions (best-effort, polling is fallback)
-  setupRealtimeSubscriptions() {
-    try {
-      // Subscribe to new steps
-      supabase.subscribeToSteps((step) => {
-        this.log('info', `New step received via Realtime: ${step.instruction?.substring(0, 50)}...`);
-        if (!this.isPaused) {
-          this.processStep(step);
-        }
-      });
-
-      // Subscribe to task updates
-      supabase.subscribeToTasks((task, eventType) => {
-        this.log('info', `Task ${eventType} via Realtime: ${task.task_description?.substring(0, 50)}...`);
-        this.sendTaskUpdate(task);
-      });
-
-      this.log('info', 'Realtime subscriptions setup (polling active as fallback)');
-    } catch (error) {
-      // Realtime is optional - polling will handle everything
-      this.log('warn', `Realtime setup failed (using polling only): ${error.message}`);
-    }
-  }
-
-  // Start polling for pending steps
   startPolling() {
     this.log('info', 'Starting task polling (every 2 seconds)...');
     
     this.pollInterval = setInterval(async () => {
-      if (this.isPaused || this.currentStep) {
-        return; // Skip if paused or already processing a step
+      if (this.isPaused || this.currentTask) {
+        return;
       }
 
       try {
-        const step = await supabase.getNextPendingStep();
-        if (step) {
-          this.log('info', `Found pending step via polling: ${step.instruction?.substring(0, 50)}...`);
-          await this.processStep(step);
+        const task = await supabase.getNextPendingTask();
+        if (task) {
+          this.log('info', `Found pending task: ${task.task_description?.substring(0, 50)}...`);
+          await this.executeTask(task);
         }
       } catch (error) {
-        // Don't spam logs for expected errors (no tasks)
         if (!error.message.includes('no rows') && !error.message.includes('not found')) {
           this.log('error', `Polling error: ${error.message}`);
         }
       }
-    }, 2000); // Poll every 2 seconds
+    }, 2000);
   }
 
-  // Process a step
-  async processStep(step) {
-    if (this.currentStep) {
-      this.log('warn', 'Already processing a step, queueing...');
-      return;
-    }
-
-    this.currentStep = step;
-    this.sendStepUpdate(step);
+  /**
+   * Execute a complete task using TaskerAgent strategy
+   */
+  async executeTask(task) {
+    this.currentTask = task;
+    this.sendTaskUpdate(task);
 
     try {
-      // Load task info if not already loaded
-      const isNewTask = !this.currentTask || this.currentTask.id !== step.task_id;
+      lux.resetSession();
+
+      await supabase.updateTask(task.id, { 
+        status: 'running',
+        started_at: new Date().toISOString()
+      });
+      task.status = 'running';
+      this.sendTaskUpdate(task);
+
+      // Get todos from task
+      const todos = await this.getTodos(task);
       
-      if (isNewTask) {
-        this.currentTask = await supabase.getTask(step.task_id);
-        this.sendTaskUpdate(this.currentTask);
-        
-        // Reset Lux session for new task
-        lux.resetSession();
-        
-        // Navigate to start_url if provided (check column first, then task_data for backwards compat)
-        const startUrl = this.currentTask.start_url || this.currentTask.task_data?.start_url;
-        
-        if (startUrl) {
-          this.log('info', `Navigating to start URL: ${startUrl}`);
-          await browser.navigate(startUrl);
-          await browser.wait(2000); // Wait for page to load
-          this.log('success', 'Navigation complete');
-          
-          // Take screenshot after navigation
-          const navScreenshot = await browser.screenshotBase64();
-          this.sendScreenshot(`data:image/png;base64,${navScreenshot}`);
-        } else {
-          this.log('warn', 'No start_url provided for task - browser may be on blank page');
-        }
+      if (!todos || todos.length === 0) {
+        throw new Error('No todos found for task');
       }
 
-      this.log('info', `Processing step ${step.step_number}: ${step.instruction.substring(0, 100)}...`);
+      this.log('info', `Task has ${todos.length} todos to execute`);
 
-      // Mark step as running
-      await supabase.markStepRunning(step.id);
-      step.status = 'running';
-      this.sendStepUpdate(step);
-
-      // Take screenshot before action
-      const screenshotBefore = await browser.screenshotBase64();
-      
-      // Update UI with current screenshot
-      this.sendScreenshot(`data:image/png;base64,${screenshotBefore}`);
-
-      // Save screenshot before
-      const beforeUrl = await supabase.uploadScreenshot(
-        step.task_id, 
-        step.step_number, 
-        Buffer.from(screenshotBefore, 'base64'), 
-        'before'
-      );
-      await supabase.updateStep(step.id, { screenshot_before: beforeUrl });
-
-      // Send to Lux for action
-      this.log('info', 'Sending to Lux for analysis...');
-      const luxResult = await lux.executeStep(screenshotBefore, step.instruction, step.instruction_context);
-
-      this.log('info', `Lux response: ${luxResult.status} - ${luxResult.feedback || 'No feedback'}`);
-
-      // Execute actions in browser
-      if (luxResult.actions && luxResult.actions.length > 0) {
-        this.log('info', `Executing ${luxResult.actions.length} actions...`);
+      // Navigate to start_url
+      const startUrl = task.start_url || task.task_data?.start_url;
+      if (startUrl) {
+        this.log('info', `Navigating to: ${startUrl}`);
+        await browser.navigate(startUrl);
+        await browser.wait(2000);
         
-        for (const action of luxResult.actions) {
-          if (this.isPaused) {
-            this.log('warn', 'Paused during action execution');
-            break;
-          }
+        const navScreenshot = await browser.screenshotBase64();
+        this.sendScreenshot(`data:image/png;base64,${navScreenshot}`);
+        this.log('success', 'Navigation complete');
+      } else {
+        this.log('warn', 'No start_url provided for task');
+      }
 
+      // Execute todos with Lux
+      await this.executeTodosWithLux(task, todos);
+
+      // Mark task as completed
+      await supabase.updateTask(task.id, {
+        status: 'completed',
+        completed_at: new Date().toISOString()
+      });
+      task.status = 'completed';
+      this.sendTaskUpdate(task);
+      this.log('success', `Task completed successfully`);
+
+    } catch (error) {
+      this.log('error', `Task failed: ${error.message}`);
+
+      try {
+        const screenshot = await browser.screenshotBase64();
+        this.sendScreenshot(`data:image/png;base64,${screenshot}`);
+      } catch (e) {}
+
+      await supabase.updateTask(task.id, {
+        status: 'failed',
+        error_message: error.message,
+        completed_at: new Date().toISOString()
+      });
+      task.status = 'failed';
+      this.sendTaskUpdate(task);
+
+    } finally {
+      this.currentTask = null;
+    }
+  }
+
+  /**
+   * Get todos from task - supports multiple sources for backwards compatibility
+   */
+  async getTodos(task) {
+    // 1. Try direct todos column (new format)
+    if (task.todos && Array.isArray(task.todos) && task.todos.length > 0) {
+      this.log('info', 'Using todos from task.todos column');
+      return task.todos;
+    }
+
+    // 2. Try task_data.todos (alternative format)
+    if (task.task_data?.todos && Array.isArray(task.task_data.todos)) {
+      this.log('info', 'Using todos from task_data.todos');
+      return task.task_data.todos;
+    }
+
+    // 3. Fallback: build from browser_task_steps (current format)
+    this.log('info', 'Building todos from browser_task_steps table');
+    const steps = await supabase.getStepsForTask(task.id);
+    if (steps && steps.length > 0) {
+      return steps.map(step => step.instruction);
+    }
+
+    return [];
+  }
+
+  /**
+   * Execute all todos with Lux - TaskerAgent strategy
+   */
+  async executeTodosWithLux(task, todos) {
+    const maxIterations = task.max_steps || 50;
+    let iteration = 0;
+    let currentTodoIndex = 0;
+
+    while (currentTodoIndex < todos.length && iteration < maxIterations) {
+      iteration++;
+      
+      if (this.isPaused) {
+        this.log('warn', 'Task paused');
+        break;
+      }
+
+      const currentTodo = todos[currentTodoIndex];
+      this.log('info', `[${currentTodoIndex + 1}/${todos.length}] ${currentTodo}`);
+
+      // Update UI
+      this.sendStepUpdate({
+        step_number: currentTodoIndex + 1,
+        instruction: currentTodo,
+        status: 'running',
+        total_steps: todos.length
+      });
+
+      // Take screenshot
+      const screenshot = await browser.screenshotBase64();
+      this.sendScreenshot(`data:image/png;base64,${screenshot}`);
+
+      // Build full context for Lux
+      const context = this.buildLuxContext(task, todos, currentTodoIndex);
+
+      // Send to Lux
+      this.log('info', 'Sending to Lux for analysis...');
+      const luxResult = await lux.executeStep(screenshot, currentTodo, context);
+
+      this.log('info', `Lux response: ${luxResult.status} - ${luxResult.feedback?.substring(0, 100) || 'No feedback'}`);
+
+      // Check if Lux says task is complete
+      if (luxResult.raw?.is_complete) {
+        this.log('success', 'Lux indicates task is complete');
+        break;
+      }
+
+      // Execute actions
+      if (luxResult.actions && luxResult.actions.length > 0) {
+        for (const action of luxResult.actions) {
           if (action.type === 'done' || action.type === 'complete') {
-            this.log('info', 'Step marked as done by Lux');
+            this.log('info', 'Action indicates step complete');
             break;
           }
 
           this.log('info', `Executing: ${action.type}`);
           await browser.executeAction(action);
         }
+
+        // Move to next todo
+        currentTodoIndex++;
+        
+        // Update step as completed
+        this.sendStepUpdate({
+          step_number: currentTodoIndex,
+          instruction: currentTodo,
+          status: 'completed',
+          total_steps: todos.length
+        });
+
+        // Update step in database
+        await this.updateStepStatus(task.id, currentTodoIndex, 'completed', luxResult);
+
       } else {
-        this.log('warn', 'No actions received from Lux');
+        this.log('warn', 'No actions received from Lux, retrying...');
+        await browser.wait(1000);
       }
 
-      // Take screenshot after actions
-      await browser.wait(500); // Wait for page to settle
-      const screenshotAfter = await browser.screenshotBase64();
-      this.sendScreenshot(`data:image/png;base64,${screenshotAfter}`);
+      await browser.wait(500);
+    }
 
-      // Upload screenshot after
-      const afterUrl = await supabase.uploadScreenshot(
-        step.task_id, 
-        step.step_number, 
-        Buffer.from(screenshotAfter, 'base64'), 
-        'after'
-      );
+    if (iteration >= maxIterations) {
+      throw new Error(`Max iterations (${maxIterations}) reached`);
+    }
 
-      // Mark step as completed
-      await supabase.markStepCompleted(
-        step.id,
-        afterUrl,
-        luxResult.raw,
-        luxResult.actions
-      );
+    this.log('success', `Completed ${currentTodoIndex} of ${todos.length} todos`);
+  }
 
-      this.log('success', `Step ${step.step_number} completed`);
+  /**
+   * Build context string for Lux
+   */
+  buildLuxContext(task, todos, currentIndex) {
+    const completedTodos = todos.slice(0, currentIndex);
+    const remainingTodos = todos.slice(currentIndex + 1);
+    const currentTodo = todos[currentIndex];
 
-      // Update UI
-      step.status = 'completed';
-      step.screenshot_after = afterUrl;
-      this.sendStepUpdate(step);
+    let context = `TASK: ${task.task_description}\n\n`;
+    
+    if (completedTodos.length > 0) {
+      context += `COMPLETED STEPS:\n`;
+      completedTodos.forEach((todo, i) => {
+        context += `✓ ${i + 1}. ${todo}\n`;
+      });
+      context += '\n';
+    }
 
-      // Refresh task to get updated progress
-      this.currentTask = await supabase.getTask(step.task_id);
-      this.sendTaskUpdate(this.currentTask);
+    context += `CURRENT STEP (${currentIndex + 1}/${todos.length}):\n`;
+    context += `→ ${currentTodo}\n\n`;
 
-    } catch (error) {
-      this.log('error', `Step failed: ${error.message}`);
+    if (remainingTodos.length > 0) {
+      context += `REMAINING STEPS:\n`;
+      remainingTodos.forEach((todo, i) => {
+        context += `${currentIndex + 2 + i}. ${todo}\n`;
+      });
+    }
 
-      // Take error screenshot
-      let errorScreenshot = null;
-      try {
-        const screenshot = await browser.screenshotBase64();
-        errorScreenshot = await supabase.uploadScreenshot(
-          step.task_id, 
-          step.step_number, 
-          Buffer.from(screenshot, 'base64'), 
-          'error'
-        );
-        this.sendScreenshot(`data:image/png;base64,${screenshot}`);
-      } catch (e) {
-        console.error('Failed to capture error screenshot:', e);
+    return context;
+  }
+
+  /**
+   * Update step status in database
+   */
+  async updateStepStatus(taskId, stepNumber, status, luxResult = null) {
+    try {
+      const steps = await supabase.getStepsForTask(taskId);
+      const step = steps.find(s => s.step_number === stepNumber);
+      
+      if (step) {
+        await supabase.updateStep(step.id, {
+          status: status,
+          completed_at: status === 'completed' ? new Date().toISOString() : null,
+          lux_feedback: luxResult?.raw || null,
+          lux_actions: luxResult?.actions || null
+        });
       }
-
-      // Mark step as failed
-      await supabase.markStepFailed(step.id, error.message, errorScreenshot);
-
-      // Check if we should retry
-      const retried = await supabase.incrementRetryCount(step.id);
-      if (retried) {
-        this.log('info', `Retrying step (attempt ${retried.retry_count + 1}/${retried.max_retries})`);
-      } else {
-        this.log('error', 'Max retries reached, marking task as failed');
-        await supabase.markTaskFailed(step.task_id, `Step ${step.step_number} failed: ${error.message}`);
-      }
-
-      step.status = 'failed';
-      step.error_message = error.message;
-      this.sendStepUpdate(step);
-
-    } finally {
-      this.currentStep = null;
+    } catch (e) {
+      console.log('[Bridge] Failed to update step status:', e.message);
     }
   }
 
-  // Pause the bridge
   pause() {
     this.isPaused = true;
     this.log('info', 'Bridge paused');
   }
 
-  // Resume the bridge
   resume() {
     this.isPaused = false;
     this.log('info', 'Bridge resumed');
   }
 
-  // Stop the bridge
   async stop() {
     this.log('info', 'Stopping bridge...');
     
@@ -336,25 +371,18 @@ class Bridge {
     this.log('info', 'Bridge stopped');
   }
 
-  // Cleanup resources
   async cleanup() {
     try {
       await browser.close();
-    } catch (e) {
-      console.error('Error closing browser:', e);
-    }
+    } catch (e) {}
 
     try {
       supabase.disconnect();
-    } catch (e) {
-      console.error('Error disconnecting Supabase:', e);
-    }
+    } catch (e) {}
 
     this.currentTask = null;
-    this.currentStep = null;
   }
 
-  // Cancel current task
   async cancelTask(taskId) {
     this.log('info', `Cancelling task: ${taskId}`);
     
@@ -366,7 +394,6 @@ class Bridge {
       
       if (this.currentTask?.id === taskId) {
         this.currentTask = null;
-        this.currentStep = null;
         this.sendTaskUpdate(null);
         this.sendStepUpdate(null);
       }
@@ -378,33 +405,11 @@ class Bridge {
     }
   }
 
-  // Retry a failed step
-  async retryStep(stepId) {
-    this.log('info', `Retrying step: ${stepId}`);
-    
-    try {
-      const step = await supabase.updateStep(stepId, {
-        status: 'pending',
-        error_message: null,
-        started_at: null,
-        completed_at: null
-      });
-      
-      this.log('success', 'Step queued for retry');
-      return step;
-    } catch (error) {
-      this.log('error', `Failed to retry step: ${error.message}`);
-      throw error;
-    }
-  }
-
-  // Get current state
   getState() {
     return {
       isRunning: this.isRunning,
       isPaused: this.isPaused,
       currentTask: this.currentTask,
-      currentStep: this.currentStep,
       browserActive: browser.isActive()
     };
   }
