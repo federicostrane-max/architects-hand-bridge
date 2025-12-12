@@ -15,47 +15,34 @@ class LuxClient {
     this.messagesHistory = [];
   }
 
-  /**
-   * Set the API key
-   */
   setApiKey(key) {
     this.apiKey = key;
     console.log(`[Lux] API key set (starts with: ${key?.substring(0, 8)}...)`);
   }
 
-  /**
-   * Generate a new task ID (UUID v4)
-   */
   generateTaskId() {
     return crypto.randomUUID();
   }
 
-  /**
-   * Execute a step - send screenshot and instruction to Lux
-   */
   async executeStep(screenshotBase64, instruction, context = '') {
     if (!this.apiKey) {
       throw new Error('API key not set');
     }
 
-    // Generate task_id if not already set
     if (!this.taskId) {
       this.taskId = this.generateTaskId();
       console.log(`[Lux] New task_id generated: ${this.taskId}`);
     }
 
     try {
-      // Step 1: Get presigned URL for upload
       console.log('[Lux] Getting presigned URL...');
       const uploadInfo = await this.getPresignedUrl();
       console.log('[Lux] Got presigned URL');
       
-      // Step 2: Upload screenshot to S3
       console.log('[Lux] Uploading screenshot to S3...');
       await this.uploadToS3(uploadInfo.url, screenshotBase64);
       console.log('[Lux] Screenshot uploaded successfully');
       
-      // Step 3: Call Lux API with the download_url
       console.log('[Lux] Calling Lux API...');
       const result = await this.callLuxApi(uploadInfo.download_url, instruction, context);
       
@@ -71,9 +58,6 @@ class LuxClient {
     }
   }
 
-  /**
-   * Get presigned URL for S3 upload
-   */
   async getPresignedUrl() {
     return new Promise((resolve, reject) => {
       const options = {
@@ -113,9 +97,6 @@ class LuxClient {
     });
   }
 
-  /**
-   * Upload image to S3 using presigned URL
-   */
   async uploadToS3(presignedUrl, base64Image) {
     return new Promise((resolve, reject) => {
       const imageBuffer = Buffer.from(base64Image, 'base64');
@@ -156,14 +137,10 @@ class LuxClient {
     });
   }
 
-  /**
-   * Call Lux API with image and instruction
-   */
   async callLuxApi(imageUrl, instruction, context) {
     return new Promise((resolve, reject) => {
-      const taskDescription = context 
-        ? `${context}\n\nCurrent instruction: ${instruction}`
-        : instruction;
+      // Keep task_description simple for Actor mode
+      const taskDescription = context || instruction;
 
       const messages = [
         {
@@ -230,17 +207,15 @@ class LuxClient {
     });
   }
 
-  /**
-   * Parse Lux API response into actions
-   * Lux returns: { actions: [{type, argument, coordinates, ...}], reason: "..." }
-   */
   parseResponse(response) {
     const actions = [];
     let feedback = response.reason || '';
     
-    // Lux returns actions directly in response.actions array
+    // Lux returns actions in response.actions array
     if (response.actions && Array.isArray(response.actions)) {
+      console.log('[Lux] Found', response.actions.length, 'actions in response');
       for (const luxAction of response.actions) {
+        console.log('[Lux] Processing action:', JSON.stringify(luxAction));
         const action = this.convertLuxAction(luxAction);
         if (action) {
           actions.push(action);
@@ -248,7 +223,7 @@ class LuxClient {
       }
     }
     
-    // Also check for content array (Claude-style format, just in case)
+    // Check content array (Claude-style format)
     if (response.content && Array.isArray(response.content)) {
       for (const block of response.content) {
         if (block.type === 'text') {
@@ -273,8 +248,12 @@ class LuxClient {
 
   /**
    * Convert Lux action format to our internal format
-   * Lux uses: {type: "click", coordinates: [x,y]} or {type: "hotkey", argument: "enter"}
-   * We use: {type: "click", x, y} or {type: "key", key: "Enter"}
+   * 
+   * Lux returns actions like:
+   * - {type: "click", argument: "510, 510"}
+   * - {type: "click", coordinates: [510, 510]}
+   * - {type: "type", argument: "search text"}
+   * - {type: "hotkey", argument: "enter"}
    */
   convertLuxAction(luxAction) {
     const type = luxAction.type?.toLowerCase();
@@ -283,10 +262,21 @@ class LuxClient {
       case 'click':
       case 'left_click':
       case 'right_click':
-      case 'double_click':
-        // Lux uses coordinates array [x, y]
-        const coords = luxAction.coordinates || luxAction.coordinate || [];
-        if (coords.length >= 2) {
+      case 'double_click': {
+        // Try multiple coordinate formats
+        let coords = luxAction.coordinates || luxAction.coordinate || [];
+        
+        // IMPORTANT: Parse from argument string "510, 510"
+        if ((!coords || coords.length < 2) && luxAction.argument) {
+          const argStr = String(luxAction.argument);
+          const parts = argStr.split(',').map(s => parseInt(s.trim()));
+          if (parts.length >= 2 && !isNaN(parts[0]) && !isNaN(parts[1])) {
+            coords = parts;
+            console.log('[Lux] Parsed coordinates from argument:', coords);
+          }
+        }
+        
+        if (coords && coords.length >= 2) {
           return {
             type: 'click',
             x: coords[0],
@@ -295,36 +285,65 @@ class LuxClient {
             double: type === 'double_click'
           };
         }
+        console.log('[Lux] Could not parse click coordinates from:', JSON.stringify(luxAction));
         return null;
+      }
       
       case 'type':
-      case 'input':
-        return {
-          type: 'type',
-          text: luxAction.argument || luxAction.text || ''
-        };
+      case 'input': {
+        const text = luxAction.argument || luxAction.text || '';
+        if (text) {
+          return {
+            type: 'type',
+            text: text
+          };
+        }
+        return null;
+      }
       
       case 'hotkey':
       case 'key':
-      case 'keypress':
-        // Lux uses argument for key name
+      case 'keypress': {
         const key = luxAction.argument || luxAction.key || '';
-        return {
-          type: 'key',
-          key: this.normalizeKeyName(key)
-        };
+        if (key) {
+          return {
+            type: 'key',
+            key: this.normalizeKeyName(key)
+          };
+        }
+        return null;
+      }
       
-      case 'scroll':
+      case 'scroll': {
+        let coords = luxAction.coordinates || [];
+        // Parse coordinates from argument if needed
+        if ((!coords || coords.length < 2) && luxAction.argument) {
+          const parts = String(luxAction.argument).split(',').map(s => s.trim());
+          if (parts.length >= 2 && !isNaN(parseInt(parts[0]))) {
+            coords = parts.map(p => parseInt(p));
+          }
+        }
         return {
           type: 'scroll',
-          x: luxAction.coordinates?.[0] || 0,
-          y: luxAction.coordinates?.[1] || 0,
-          direction: luxAction.direction || luxAction.argument || 'down'
+          x: coords[0] || 0,
+          y: coords[1] || 0,
+          direction: luxAction.direction || (typeof luxAction.argument === 'string' && isNaN(parseInt(luxAction.argument)) ? luxAction.argument : 'down')
         };
+      }
       
-      case 'drag':
-        const start = luxAction.start_coordinates || luxAction.coordinates || [];
-        const end = luxAction.end_coordinates || [];
+      case 'drag': {
+        let start = luxAction.start_coordinates || luxAction.coordinates || [];
+        let end = luxAction.end_coordinates || [];
+        
+        // Parse from argument: "x1, y1, x2, y2"
+        if ((!start.length || !end.length) && luxAction.argument) {
+          const parts = String(luxAction.argument).split(',').map(s => parseInt(s.trim()));
+          if (parts.length >= 4) {
+            start = [parts[0], parts[1]];
+            end = [parts[2], parts[3]];
+          }
+        }
+        
         if (start.length >= 2 && end.length >= 2) {
           return {
             type: 'drag',
@@ -335,11 +354,12 @@ class LuxClient {
           };
         }
         return null;
+      }
       
       case 'wait':
         return {
           type: 'wait',
-          duration: luxAction.argument || luxAction.duration || 1000
+          duration: parseInt(luxAction.argument) || luxAction.duration || 1000
         };
       
       case 'done':
@@ -353,9 +373,6 @@ class LuxClient {
     }
   }
 
-  /**
-   * Normalize key names to match Playwright expectations
-   */
   normalizeKeyName(key) {
     const keyMap = {
       'enter': 'Enter',
@@ -383,13 +400,9 @@ class LuxClient {
       'command': 'Meta'
     };
     
-    const normalized = keyMap[key.toLowerCase()] || key;
-    return normalized;
+    return keyMap[key.toLowerCase()] || key;
   }
 
-  /**
-   * Parse tool_use block (Claude-style format)
-   */
   parseToolUse(block) {
     const name = block.name?.toLowerCase();
     const input = block.input || {};
