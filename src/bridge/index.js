@@ -13,6 +13,7 @@ class Bridge {
     this.sendTaskUpdate = null;
     this.sendStepUpdate = null;
     this.sendScreenshot = null;
+    this.taskerServiceAvailable = false;
   }
 
   setCallbacks({ sendLog, sendStatus, sendTaskUpdate, sendStepUpdate, sendScreenshot }) {
@@ -50,12 +51,6 @@ class Bridge {
       this.log('info', 'Connecting to Supabase...');
       supabase.connect(config.supabaseUrl, config.supabaseAnonKey, config.taskSecret);
       
-      if (config.taskSecret) {
-        this.log('info', 'Task secret configured for RLS authentication');
-      } else {
-        this.log('warn', 'No task secret configured - will have limited access until task is assigned');
-      }
-      
       try {
         await supabase.testConnection();
         this.log('success', 'Connected to Supabase');
@@ -63,16 +58,27 @@ class Bridge {
         this.log('warn', `Supabase connection test: ${connError.message}`);
       }
 
+      // Set Lux API key
       lux.setApiKey(config.openAgiApiKey);
       this.log('info', 'Lux API configured');
 
-      this.log('info', 'Launching browser...');
-      await browser.launch();
-      this.log('success', 'Browser launched');
+      // Check if Python Tasker Service is available
+      this.log('info', 'Checking Tasker Service...');
+      this.taskerServiceAvailable = await lux.checkService();
+      
+      if (this.taskerServiceAvailable) {
+        this.log('success', 'Tasker Service connected - using TaskerAgent mode');
+      } else {
+        this.log('warn', 'Tasker Service not available - please start it with start-tasker-service.bat');
+        this.log('warn', 'Tasks will wait until Tasker Service is running');
+      }
+
+      // Don't launch browser - TaskerAgent uses its own pyautogui
+      this.log('info', 'Browser control delegated to Tasker Service');
 
       this.isRunning = true;
       this.sendStatus('connected');
-      this.log('success', 'Bridge started successfully (TaskerAgent mode)');
+      this.log('success', 'Bridge started successfully');
 
       this.startPolling();
 
@@ -85,17 +91,31 @@ class Bridge {
   }
 
   startPolling() {
-    this.log('info', 'Starting task polling (every 2 seconds)...');
+    this.log('info', 'Starting task polling (every 3 seconds)...');
     
     this.pollInterval = setInterval(async () => {
       if (this.isPaused || this.currentTask) {
         return;
       }
 
+      // Re-check Tasker Service availability periodically
+      if (!this.taskerServiceAvailable) {
+        this.taskerServiceAvailable = await lux.checkService();
+        if (this.taskerServiceAvailable) {
+          this.log('success', 'Tasker Service now available');
+        }
+      }
+
       try {
         const task = await supabase.getNextPendingTask();
         if (task) {
           this.log('info', `Found pending task: ${task.task_description?.substring(0, 50)}...`);
+          
+          if (!this.taskerServiceAvailable) {
+            this.log('warn', 'Tasker Service not running - waiting...');
+            return;
+          }
+          
           await this.executeTask(task);
         }
       } catch (error) {
@@ -103,26 +123,17 @@ class Bridge {
           this.log('error', `Polling error: ${error.message}`);
         }
       }
-    }, 2000);
+    }, 3000);
   }
 
   /**
-   * Execute a complete task using TaskerAgent strategy
+   * Execute a complete task using Python TaskerAgent
    */
   async executeTask(task) {
     this.currentTask = task;
     this.sendTaskUpdate(task);
 
     try {
-      lux.resetSession();
-
-      await supabase.updateTask(task.id, { 
-        status: 'running',
-        started_at: new Date().toISOString()
-      });
-      task.status = 'running';
-      this.sendTaskUpdate(task);
-
       // Get todos from task
       const todos = await this.getTodos(task);
       
@@ -130,41 +141,74 @@ class Bridge {
         throw new Error('No todos found for task');
       }
 
-      this.log('info', `Task has ${todos.length} todos to execute`);
+      this.log('info', `Task has ${todos.length} todos`);
+      todos.forEach((todo, i) => this.log('info', `  ${i+1}. ${todo}`));
 
-      // Navigate to start_url
+      // Update task status
+      await supabase.updateTask(task.id, { 
+        status: 'running',
+        started_at: new Date().toISOString()
+      });
+      task.status = 'running';
+      this.sendTaskUpdate(task);
+
+      // Get start URL
       const startUrl = task.start_url || task.task_data?.start_url;
-      if (startUrl) {
-        this.log('info', `Navigating to: ${startUrl}`);
-        await browser.navigate(startUrl);
-        await browser.wait(2000);
-        
-        const navScreenshot = await browser.screenshotBase64();
-        this.sendScreenshot(`data:image/png;base64,${navScreenshot}`);
-        this.log('success', 'Navigation complete');
+
+      // Update UI with todos
+      todos.forEach((todo, i) => {
+        this.sendStepUpdate({
+          step_number: i + 1,
+          instruction: todo,
+          status: 'pending',
+          total_steps: todos.length
+        });
+      });
+
+      // Delegate to Python Tasker Service
+      this.log('info', 'Delegating to Tasker Service (TaskerAgent)...');
+      
+      const result = await lux.executeTaskWithTasker(
+        task.task_description,
+        todos,
+        startUrl
+      );
+
+      this.log('info', `Tasker Service result: ${result.success ? 'SUCCESS' : 'FAILED'}`);
+      this.log('info', `Completed ${result.completedTodos}/${result.totalTodos} todos`);
+
+      // Update task status based on result
+      if (result.success) {
+        await supabase.updateTask(task.id, {
+          status: 'completed',
+          completed_at: new Date().toISOString()
+        });
+        task.status = 'completed';
+        this.log('success', 'Task completed successfully');
       } else {
-        this.log('warn', 'No start_url provided for task');
+        await supabase.updateTask(task.id, {
+          status: 'failed',
+          error_message: result.error || result.message,
+          completed_at: new Date().toISOString()
+        });
+        task.status = 'failed';
+        this.log('error', `Task failed: ${result.error || result.message}`);
       }
 
-      // Execute todos with Lux
-      await this.executeTodosWithLux(task, todos);
-
-      // Mark task as completed
-      await supabase.updateTask(task.id, {
-        status: 'completed',
-        completed_at: new Date().toISOString()
-      });
-      task.status = 'completed';
       this.sendTaskUpdate(task);
-      this.log('success', `Task completed successfully`);
+
+      // Update step statuses
+      for (let i = 0; i < todos.length; i++) {
+        this.sendStepUpdate({
+          step_number: i + 1,
+          instruction: todos[i],
+          status: i < result.completedTodos ? 'completed' : 'pending',
+          total_steps: todos.length
+        });
+      }
 
     } catch (error) {
-      this.log('error', `Task failed: ${error.message}`);
-
-      try {
-        const screenshot = await browser.screenshotBase64();
-        this.sendScreenshot(`data:image/png;base64,${screenshot}`);
-      } catch (e) {}
+      this.log('error', `Task execution failed: ${error.message}`);
 
       await supabase.updateTask(task.id, {
         status: 'failed',
@@ -180,22 +224,19 @@ class Bridge {
   }
 
   /**
-   * Get todos from task - supports multiple sources for backwards compatibility
+   * Get todos from task
    */
   async getTodos(task) {
-    // 1. Try direct todos column (new format)
     if (task.todos && Array.isArray(task.todos) && task.todos.length > 0) {
       this.log('info', 'Using todos from task.todos column');
       return task.todos;
     }
 
-    // 2. Try task_data.todos (alternative format)
     if (task.task_data?.todos && Array.isArray(task.task_data.todos)) {
       this.log('info', 'Using todos from task_data.todos');
       return task.task_data.todos;
     }
 
-    // 3. Fallback: build from browser_task_steps (current format)
     this.log('info', 'Building todos from browser_task_steps table');
     const steps = await supabase.getStepsForTask(task.id);
     if (steps && steps.length > 0) {
@@ -203,123 +244,6 @@ class Bridge {
     }
 
     return [];
-  }
-
-  /**
-   * Execute all todos with Lux - TaskerAgent strategy
-   */
-  async executeTodosWithLux(task, todos) {
-    const maxIterations = task.max_steps || 50;
-    let iteration = 0;
-    let currentTodoIndex = 0;
-
-    while (currentTodoIndex < todos.length && iteration < maxIterations) {
-      iteration++;
-      
-      if (this.isPaused) {
-        this.log('warn', 'Task paused');
-        break;
-      }
-
-      const currentTodo = todos[currentTodoIndex];
-      this.log('info', `[${currentTodoIndex + 1}/${todos.length}] ${currentTodo}`);
-
-      // Update UI
-      this.sendStepUpdate({
-        step_number: currentTodoIndex + 1,
-        instruction: currentTodo,
-        status: 'running',
-        total_steps: todos.length
-      });
-
-      // Take screenshot
-      const screenshot = await browser.screenshotBase64();
-      this.sendScreenshot(`data:image/png;base64,${screenshot}`);
-
-      // Build full context for Lux
-      const context = this.buildLuxContext(task, todos, currentTodoIndex);
-
-      // Send to Lux
-      this.log('info', 'Sending to Lux for analysis...');
-      const luxResult = await lux.executeStep(screenshot, currentTodo, context);
-
-      this.log('info', `Lux response: ${luxResult.status} - ${luxResult.feedback?.substring(0, 100) || 'No feedback'}`);
-
-      // Check if Lux says task is complete
-      if (luxResult.raw?.is_complete) {
-        this.log('success', 'Lux indicates task is complete');
-        break;
-      }
-
-      // Execute actions
-      if (luxResult.actions && luxResult.actions.length > 0) {
-        for (const action of luxResult.actions) {
-          if (action.type === 'done' || action.type === 'complete') {
-            this.log('info', 'Action indicates step complete');
-            break;
-          }
-
-          this.log('info', `Executing: ${action.type}`);
-          await browser.executeAction(action);
-        }
-
-        // Move to next todo
-        currentTodoIndex++;
-        
-        // Update step as completed
-        this.sendStepUpdate({
-          step_number: currentTodoIndex,
-          instruction: currentTodo,
-          status: 'completed',
-          total_steps: todos.length
-        });
-
-        // Update step in database
-        await this.updateStepStatus(task.id, currentTodoIndex, 'completed', luxResult);
-
-      } else {
-        this.log('warn', 'No actions received from Lux, retrying...');
-        await browser.wait(1000);
-      }
-
-      await browser.wait(500);
-    }
-
-    if (iteration >= maxIterations) {
-      throw new Error(`Max iterations (${maxIterations}) reached`);
-    }
-
-    this.log('success', `Completed ${currentTodoIndex} of ${todos.length} todos`);
-  }
-
-  /**
-   * Build context string for Lux Actor mode
-   * Keep it simple - Actor works best with direct instructions
-   */
-  buildLuxContext(task, todos, currentIndex) {
-    // For Actor mode, just provide the overall goal - keep it simple
-    return task.task_description;
-  }
-
-  /**
-   * Update step status in database
-   */
-  async updateStepStatus(taskId, stepNumber, status, luxResult = null) {
-    try {
-      const steps = await supabase.getStepsForTask(taskId);
-      const step = steps.find(s => s.step_number === stepNumber);
-      
-      if (step) {
-        await supabase.updateStep(step.id, {
-          status: status,
-          completed_at: status === 'completed' ? new Date().toISOString() : null,
-          lux_feedback: luxResult?.raw || null,
-          lux_actions: luxResult?.actions || null
-        });
-      }
-    } catch (e) {
-      console.log('[Bridge] Failed to update step status:', e.message);
-    }
   }
 
   pause() {
@@ -343,6 +267,11 @@ class Bridge {
       this.pollInterval = null;
     }
 
+    // Stop any running task in Tasker Service
+    try {
+      await lux.stopTask();
+    } catch (e) {}
+
     await this.cleanup();
     
     this.sendStatus('disconnected');
@@ -351,7 +280,8 @@ class Bridge {
 
   async cleanup() {
     try {
-      await browser.close();
+      // Browser is managed by Tasker Service now
+      // await browser.close();
     } catch (e) {}
 
     try {
@@ -365,6 +295,9 @@ class Bridge {
     this.log('info', `Cancelling task: ${taskId}`);
     
     try {
+      // Stop task in Tasker Service
+      await lux.stopTask();
+      
       await supabase.updateTask(taskId, { 
         status: 'cancelled',
         completed_at: new Date().toISOString()
@@ -388,7 +321,7 @@ class Bridge {
       isRunning: this.isRunning,
       isPaused: this.isPaused,
       currentTask: this.currentTask,
-      browserActive: browser.isActive()
+      taskerServiceAvailable: this.taskerServiceAvailable
     };
   }
 }
