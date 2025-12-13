@@ -1,135 +1,131 @@
-# Architect's Hand - Local Bridge
+# Architect's Hand - Python Tasker Service Setup
 
-Desktop application that bridges your cloud-based AI agents (running on Lovable/Supabase) with local browser automation using Lux + Playwright.
+## Overview
 
----
+The Python Tasker Service wraps the official OAGI TaskerAgent to enable proper step-by-step browser automation with reflection and error recovery.
 
-## 🇮🇹 ISTRUZIONI RAPIDE (per Fede)
-
-### Come Ottenere il File .exe
-
-**Passo 1: Crea Repository GitHub**
-1. Vai su https://github.com/new
-2. Nome: `architects-hand-bridge`
-3. Lascia "Public" selezionato
-4. Clicca "Create repository"
-
-**Passo 2: Carica i File**
-1. Nella pagina del nuovo repo, clicca il link "uploading an existing file"
-2. Trascina TUTTA questa cartella (tutti i file e sottocartelle)
-3. Scrivi un messaggio tipo "Initial upload"
-4. Clicca "Commit changes"
-
-**Passo 3: Aspetta la Compilazione (5-10 min)**
-1. Clicca sulla tab "Actions" in alto
-2. Vedrai "Build Windows App" con un pallino giallo 🟡
-3. Aspetta che diventi verde ✅
-
-**Passo 4: Scarica l'App**
-1. Clicca sul workflow verde completato
-2. Scorri in basso fino a "Artifacts"
-3. Clicca "architects-hand-bridge-windows"
-4. Si scarica un .zip → estrailo
-5. Dentro c'è il .exe → installalo!
-
----
-
-## Features
-
-- 🔗 **Real-time connection** to Supabase for receiving tasks and steps
-- 🤖 **Lux integration** for intelligent browser automation
-- 🌐 **Playwright browser** control with visual feedback
-- 📁 **Local file access** for uploads and downloads
-- 📸 **Screenshot capture** for verification
-- 📊 **Live dashboard** showing tasks, steps, and logs
-
-## Installation
-
-### Option 1: Download from GitHub Actions (Recommended)
-
-1. Go to the "Actions" tab in this repository
-2. Click on the latest successful "Build Windows App" workflow
-3. Download the artifact "architects-hand-bridge-windows"
-4. Extract the zip and run the installer
-
-### Option 2: Build from Source
-
-```bash
-npm install
-npx playwright install chromium
-npm run build
-```
-
-## Configuration
-
-On first launch, go to **Settings** and configure:
-
-1. **Supabase URL**: Your Supabase project URL
-2. **Supabase Service Role Key**: Found in Supabase Dashboard → Settings → API
-3. **OpenAGI (Lux) API Key**: Your Lux API key from developer.agiopen.org
-4. **Output Folder**: Where to save downloaded files
-
-⚠️ **Security Note**: All API keys are stored locally on your PC in encrypted config. They are never sent anywhere except to their respective APIs.
-
-## How It Works
+## Architecture
 
 ```
-Cloud (Lovable/Supabase)                    Local (This App)
-┌────────────────────────┐                  ┌────────────────────────┐
-│                        │                  │                        │
-│  Architetto Agent      │                  │  Bridge App            │
-│        ↓               │                  │        ↓               │
-│  Interface Expert      │   Supabase       │  Lux API               │
-│        ↓               │   Realtime       │        ↓               │
-│  browser_steps table ──┼──────────────────┼→ Playwright Browser    │
-│        ↑               │                  │        ↓               │
-│  Results + Screenshots ←┼──────────────────┼─ Execute Actions       │
-│                        │                  │                        │
-└────────────────────────┘                  └────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│                    Lovable Web App                       │
+│                   (Cloud - Supabase)                     │
+└─────────────────────────┬───────────────────────────────┘
+                          │
+                          │ Creates tasks with todos
+                          ▼
+┌─────────────────────────────────────────────────────────┐
+│              Architect's Hand Bridge                     │
+│                  (Electron App)                          │
+│                                                          │
+│  1. Polls Supabase for pending tasks                     │
+│  2. Extracts todos from task                             │
+│  3. Delegates to Python Tasker Service                   │
+└─────────────────────────┬───────────────────────────────┘
+                          │
+                          │ HTTP POST /execute
+                          ▼
+┌─────────────────────────────────────────────────────────┐
+│             Python Tasker Service                        │
+│               (FastAPI + OAGI)                           │
+│                                                          │
+│  1. Receives task description + todos                    │
+│  2. Creates TaskerAgent with OAGI SDK                    │
+│  3. Executes todos sequentially with reflection          │
+│  4. Uses pyautogui for browser control                   │
+│  5. Returns success/failure status                       │
+└─────────────────────────────────────────────────────────┘
 ```
 
-1. Your Interface Expert creates steps in `browser_steps` table
-2. This app receives steps via Supabase Realtime
-3. App sends screenshot + instruction to Lux API
-4. Lux returns actions (click, type, scroll, etc.)
-5. App executes actions using Playwright
-6. App captures screenshot and updates step status
-7. Interface Expert verifies completion and sends next step
+## Setup Instructions
 
-## Database Tables Required
+### 1. Create Python Service Directory
 
-The app expects two tables in your Supabase:
+```cmd
+mkdir "D:\downloads\Lux\app lux 1\architects-hand-bridge\python-service"
+```
 
-- `browser_tasks` - Main task records
-- `browser_steps` - Individual steps for each task
+### 2. Copy Files
 
-See the Lovable prompt in the project documentation for the complete schema.
+Copy these files to `python-service` folder:
+- `tasker_service.py`
+- `start-tasker-service.bat`
+
+Copy these files to `src/bridge` folder (replace existing):
+- `index.js`
+- `lux-client.js`
+
+### 3. File Locations
+
+```
+architects-hand-bridge/
+├── python-service/
+│   ├── tasker_service.py       # Python FastAPI service
+│   └── start-tasker-service.bat # Start script
+├── src/
+│   └── bridge/
+│       ├── index.js            # Updated bridge (delegates to Python)
+│       ├── lux-client.js       # Updated client (calls Python service)
+│       └── supabase-client.js  # Keep existing
+├── start-all.bat               # Starts everything
+```
+
+## Running
+
+### Option 1: Start Separately (Recommended for debugging)
+
+**Terminal 1 - Start Tasker Service:**
+```cmd
+cd "D:\downloads\Lux\app lux 1\architects-hand-bridge\python-service"
+python tasker_service.py
+```
+
+**Terminal 2 - Start Electron App:**
+```cmd
+cd "D:\downloads\Lux\app lux 1\architects-hand-bridge"
+npm start -- --dev
+```
+
+### Option 2: Start Together
+
+```cmd
+cd "D:\downloads\Lux\app lux 1\architects-hand-bridge"
+start-all.bat
+```
+
+## Verifying Setup
+
+1. Start Tasker Service - should show:
+   ```
+   ================================================
+     TASKER SERVICE
+     Local OAGI TaskerAgent Wrapper
+   ================================================
+   INFO:     Uvicorn running on http://127.0.0.1:8765
+   ```
+
+2. Start Electron App - should show:
+   ```
+   [Bridge] [SUCCESS] Tasker Service connected - using TaskerAgent mode
+   ```
+
+3. Test in browser:
+   ```
+   http://127.0.0.1:8765/status
+   ```
+   Should return: `{"status":"running","oagi_available":true,"version":"1.0.0"}`
 
 ## Troubleshooting
 
-### "Connection failed"
-- Check your Supabase URL and Service Role Key
-- Ensure your IP isn't blocked by Supabase
+### "Tasker Service not available"
+- Make sure Python service is running
+- Check if port 8765 is free: `netstat -an | findstr 8765`
 
-### "Lux API error"
-- Verify your OpenAGI API key is valid
-- Check your API usage limits
+### "OAGI not available"
+- Reinstall: `pip install oagi --upgrade`
+- Check: `python -c "from oagi import Actor; print('OK')"`
 
-### Browser doesn't open
-- The app uses Chromium via Playwright
-- On first run, it may take time to download the browser
-
-### Steps not being received
-- Ensure Realtime is enabled on your Supabase tables
-- Check that RLS policies allow the service role to read
-
-## License
-
-MIT
-
-## Support
-
-For issues with:
-- **This app**: Open a GitHub issue
-- **Lux API**: Contact OpenAGI support
-- **Supabase**: Check Supabase documentation
+### Task not executing
+- Check Tasker Service terminal for errors
+- Verify API key is correct
+- Make sure no other automation is running (pyautogui conflicts)
