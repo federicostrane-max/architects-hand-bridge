@@ -14,12 +14,9 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# OAGI imports
+# OAGI imports - all from main module
 try:
-    from oagi import Actor
-    from oagi.agent.tasker import TaskerAgent
-    from oagi.handlers.pyautogui_action_handler import AsyncPyautoguiActionHandler
-    from oagi.image_providers.screenshot import AsyncScreenshotMaker
+    from oagi import Actor, TaskerAgent, AsyncPyautoguiActionHandler, AsyncScreenshotMaker
     OAGI_AVAILABLE = True
 except ImportError as e:
     print(f"Warning: OAGI import failed: {e}")
