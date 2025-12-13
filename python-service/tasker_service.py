@@ -130,9 +130,9 @@ async def execute_task(request: TaskRequest):
             temperature=0.1
         )
         
-        # Set task with todos
+        # Set task with todos (parameter is 'task', not 'instruction')
         tasker.set_task(
-            instruction=request.task_description,
+            task=request.task_description,
             todos=request.todos
         )
         
