@@ -1,13 +1,12 @@
 """
-Tasker Service - FastAPI wrapper for OAGI TaskerAgent
+Tasker Service - FastAPI wrapper for OAGI
+Supports all three Lux modes: Actor, Thinker, and Tasker
 Runs locally and receives requests from Architect's Hand Bridge
 """
 
 import asyncio
-import base64
 import os
-import sys
-from typing import Optional
+from typing import Optional, List
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
@@ -27,10 +26,13 @@ except ImportError as e:
 class TaskRequest(BaseModel):
     api_key: str
     task_description: str
-    todos: list[str]
+    todos: List[str]
     start_url: Optional[str] = None
     max_steps: int = 60
     reflection_interval: int = 20
+    model: str = "lux-actor-1"
+    temperature: float = 0.1
+    mode: str = "tasker"  # 'direct', 'tasker', 'actor', 'thinker'
 
 
 class TaskResponse(BaseModel):
@@ -39,12 +41,13 @@ class TaskResponse(BaseModel):
     completed_todos: int
     total_todos: int
     error: Optional[str] = None
+    execution_summary: Optional[dict] = None
 
 
 class StatusResponse(BaseModel):
     status: str
     oagi_available: bool
-    version: str = "1.0.0"
+    version: str = "2.0.0"
 
 
 # Global state
@@ -58,6 +61,7 @@ async def lifespan(app: FastAPI):
     print("=" * 50)
     print("Tasker Service Starting...")
     print(f"OAGI Available: {OAGI_AVAILABLE}")
+    print("Supported modes: actor, thinker, tasker, direct")
     print("=" * 50)
     yield
     print("Tasker Service Shutting Down...")
@@ -66,8 +70,8 @@ async def lifespan(app: FastAPI):
 # Create FastAPI app
 app = FastAPI(
     title="Tasker Service",
-    description="Local service for OAGI TaskerAgent execution",
-    version="1.0.0",
+    description="Local service for OAGI execution (Actor/Thinker/Tasker modes)",
+    version="2.0.0",
     lifespan=lifespan
 )
 
@@ -92,7 +96,7 @@ async def get_status():
 
 @app.post("/execute", response_model=TaskResponse)
 async def execute_task(request: TaskRequest):
-    """Execute a task using TaskerAgent"""
+    """Execute a task using the appropriate OAGI agent based on mode"""
     global is_running, current_task
     
     if not OAGI_AVAILABLE:
@@ -111,26 +115,117 @@ async def execute_task(request: TaskRequest):
     current_task = request.task_description
     
     try:
-        print(f"\n{'='*50}")
-        print(f"Executing Task: {request.task_description}")
-        print(f"Todos: {len(request.todos)}")
-        for i, todo in enumerate(request.todos):
-            print(f"  {i+1}. {todo}")
-        print(f"{'='*50}\n")
-        
         # Set API key
         os.environ["OAGI_API_KEY"] = request.api_key
         
+        # Route based on mode
+        mode = request.mode.lower()
+        
+        if mode in ['direct', 'actor', 'thinker']:
+            # Direct execution - use Actor without TaskerAgent
+            return await execute_direct_mode(request)
+        else:
+            # Tasker mode - use TaskerAgent with todos
+            return await execute_tasker_mode(request)
+        
+    except Exception as e:
+        print(f"Error executing task: {e}")
+        import traceback
+        traceback.print_exc()
+        return TaskResponse(
+            success=False,
+            message="Task failed with error",
+            completed_todos=0,
+            total_todos=len(request.todos),
+            error=str(e)
+        )
+        
+    finally:
+        is_running = False
+        current_task = None
+
+
+async def execute_direct_mode(request: TaskRequest) -> TaskResponse:
+    """Execute using Actor directly (for Actor/Thinker modes)"""
+    
+    print(f"\n{'='*50}")
+    print(f"[Direct Mode] Executing: {request.task_description}")
+    print(f"Model: {request.model}")
+    print(f"Max Steps: {request.max_steps}")
+    print(f"{'='*50}\n")
+    
+    try:
+        # Determine model based on mode
+        model = request.model
+        if request.mode == 'thinker' and 'thinker' not in model:
+            model = 'lux-thinker-1'
+        elif request.mode == 'actor' and 'actor' not in model:
+            model = 'lux-actor-1'
+        
+        # Create Actor
+        actor = Actor(
+            api_key=request.api_key,
+            model=model,
+            max_steps=min(request.max_steps, 100),  # Cap at 100
+            temperature=request.temperature
+        )
+        
+        # Initialize task
+        actor.init_task(
+            task_desc=request.task_description,
+            max_steps=request.max_steps
+        )
+        
+        # Create handlers
+        action_handler = AsyncPyautoguiActionHandler()
+        image_provider = AsyncScreenshotMaker()
+        
+        # Execute
+        print("Starting Actor execution...")
+        success = await actor.execute(
+            request.task_description,
+            action_handler,
+            image_provider
+        )
+        
+        print(f"\nDirect task {'completed successfully' if success else 'failed'}\n")
+        
+        return TaskResponse(
+            success=success,
+            message="Task completed successfully" if success else "Task failed",
+            completed_todos=1 if success else 0,
+            total_todos=1
+        )
+        
+    except Exception as e:
+        print(f"Direct mode error: {e}")
+        raise
+
+
+async def execute_tasker_mode(request: TaskRequest) -> TaskResponse:
+    """Execute using TaskerAgent with todos (for Tasker mode)"""
+    
+    print(f"\n{'='*50}")
+    print(f"[Tasker Mode] Executing: {request.task_description}")
+    print(f"Todos: {len(request.todos)}")
+    for i, todo in enumerate(request.todos):
+        print(f"  {i+1}. {todo}")
+    print(f"Model: {request.model}")
+    print(f"Max Steps: {request.max_steps}")
+    print(f"Reflection Interval: {request.reflection_interval}")
+    print(f"{'='*50}\n")
+    
+    try:
         # Create TaskerAgent
         tasker = TaskerAgent(
             api_key=request.api_key,
-            model="lux-actor-1",
+            model=request.model,
             max_steps=request.max_steps,
             reflection_interval=request.reflection_interval,
-            temperature=0.1
+            temperature=request.temperature
         )
         
-        # Set task with todos (parameter is 'task', not 'instruction')
+        # Set task with todos
         tasker.set_task(
             task=request.task_description,
             todos=request.todos
@@ -150,7 +245,12 @@ async def execute_task(request: TaskRequest):
         
         # Get results
         memory = tasker.get_memory() if hasattr(tasker, 'get_memory') else None
-        completed = sum(1 for t in (memory.todos if memory else []) if getattr(t, 'status', '') == 'completed')
+        completed = 0
+        
+        if memory and hasattr(memory, 'todos'):
+            completed = sum(1 for t in memory.todos if getattr(t, 'status', '').lower() == 'completed')
+        elif success:
+            completed = len(request.todos)
         
         print(f"\nTask {'completed successfully' if success else 'failed'}")
         print(f"Completed {completed}/{len(request.todos)} todos\n")
@@ -163,20 +263,8 @@ async def execute_task(request: TaskRequest):
         )
         
     except Exception as e:
-        print(f"Error executing task: {e}")
-        import traceback
-        traceback.print_exc()
-        return TaskResponse(
-            success=False,
-            message="Task failed with error",
-            completed_todos=0,
-            total_todos=len(request.todos),
-            error=str(e)
-        )
-        
-    finally:
-        is_running = False
-        current_task = None
+        print(f"Tasker mode error: {e}")
+        raise
 
 
 @app.post("/stop")
@@ -199,11 +287,12 @@ async def root():
     """Root endpoint with service info"""
     return {
         "service": "Tasker Service",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "oagi_available": OAGI_AVAILABLE,
+        "supported_modes": ["actor", "thinker", "tasker", "direct"],
         "endpoints": [
             "GET /status - Check service status",
-            "POST /execute - Execute a task with TaskerAgent",
+            "POST /execute - Execute a task",
             "POST /stop - Stop current task"
         ]
     }
@@ -213,8 +302,8 @@ if __name__ == "__main__":
     import uvicorn
     
     print("\n" + "=" * 50)
-    print("  TASKER SERVICE")
-    print("  Local OAGI TaskerAgent Wrapper")
+    print("  TASKER SERVICE v2.0")
+    print("  Supports: Actor | Thinker | Tasker modes")
     print("=" * 50 + "\n")
     
     uvicorn.run(
