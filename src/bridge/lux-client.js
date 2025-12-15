@@ -1,161 +1,241 @@
 /**
- * Lux Client - Delegates to Python Tasker Service
- * The Python service handles TaskerAgent execution with OAGI SDK
+ * Lux Client for Architect's Hand Bridge
+ * Handles communication with Lux API and local Tasker Service
  */
 
-const http = require('http');
+const fetch = require('node-fetch');
 
 class LuxClient {
   constructor() {
     this.apiKey = null;
-    this.serviceUrl = 'http://127.0.0.1:8765';
-    this.serviceAvailable = false;
-  }
-
-  setApiKey(key) {
-    this.apiKey = key;
-    console.log(`[Lux] API key set (starts with: ${key?.substring(0, 8)}...)`);
+    this.baseUrl = 'https://api.agiopen.org';
+    this.taskerServiceUrl = 'http://127.0.0.1:8765';
+    this.taskId = null;
   }
 
   /**
-   * Check if Python Tasker Service is running
+   * Initialize the client
    */
-  async checkService() {
-    return new Promise((resolve) => {
-      const req = http.request(
-        `${this.serviceUrl}/status`,
-        { method: 'GET', timeout: 2000 },
-        (res) => {
-          let data = '';
-          res.on('data', chunk => data += chunk);
-          res.on('end', () => {
-            try {
-              const status = JSON.parse(data);
-              this.serviceAvailable = status.oagi_available;
-              console.log(`[Lux] Tasker Service status: ${status.status}, OAGI: ${status.oagi_available}`);
-              resolve(this.serviceAvailable);
-            } catch (e) {
-              resolve(false);
-            }
-          });
-        }
-      );
-      req.on('error', () => {
-        console.log('[Lux] Tasker Service not available');
-        this.serviceAvailable = false;
-        resolve(false);
-      });
-      req.on('timeout', () => {
-        req.destroy();
-        resolve(false);
-      });
-      req.end();
-    });
+  initialize(apiKey) {
+    this.apiKey = apiKey;
+    console.log('[Lux] API configured');
   }
 
   /**
-   * Execute a complete task using Python TaskerAgent
-   * This delegates all execution to the Python service
+   * Check if Tasker Service is available
    */
-  async executeTaskWithTasker(taskDescription, todos, startUrl = null) {
-    if (!this.apiKey) {
-      throw new Error('API key not set');
+  async checkTaskerService() {
+    try {
+      const response = await fetch(`${this.taskerServiceUrl}/status`, {
+        method: 'GET',
+        timeout: 2000
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        console.log(`[Lux] Tasker Service status: ${data.status}, OAGI: ${data.oagi_available}`);
+        return {
+          available: true,
+          status: data.status,
+          oagiAvailable: data.oagi_available
+        };
+      }
+    } catch (error) {
+      console.log('[Lux] Tasker Service not available');
     }
+
+    return {
+      available: false,
+      status: 'offline',
+      oagiAvailable: false
+    };
+  }
+
+  /**
+   * Execute a direct task (Actor or Thinker mode)
+   * Uses the Python Tasker Service which wraps OAGI
+   */
+  async executeDirectTask(params) {
+    const {
+      instruction,
+      model = 'lux-actor-1',
+      maxSteps = 30,
+      temperature = 0.1,
+      startUrl = null
+    } = params;
+
+    console.log(`[Lux] Executing direct task with model: ${model}`);
+    console.log(`[Lux] Instruction: ${instruction}`);
+
+    try {
+      // For direct tasks, we send a single todo with the full instruction
+      const response = await fetch(`${this.taskerServiceUrl}/execute`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          api_key: this.apiKey,
+          task_description: instruction,
+          todos: [instruction], // Single todo with full instruction
+          start_url: startUrl,
+          max_steps: maxSteps,
+          reflection_interval: maxSteps + 10, // Disable reflection for direct tasks
+          model: model,
+          temperature: temperature,
+          mode: 'direct' // Flag for direct execution
+        }),
+        timeout: 600000 // 10 minutes timeout
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Tasker Service error: ${response.status} - ${errorText}`);
+      }
+
+      const result = await response.json();
+
+      return {
+        success: result.success,
+        message: result.message,
+        summary: result.execution_summary,
+        error: result.error
+      };
+
+    } catch (error) {
+      console.error('[Lux] Direct task error:', error.message);
+      return {
+        success: false,
+        message: 'Task failed with error',
+        error: error.message
+      };
+    }
+  }
+
+  /**
+   * Execute a Tasker task with todos
+   */
+  async executeTaskerTask(params) {
+    const {
+      taskDescription,
+      todos,
+      todoRecords = [],
+      model = 'lux-actor-1',
+      maxSteps = 60,
+      reflectionInterval = 20,
+      temperature = 0.1,
+      startUrl = null,
+      onTodoStart = null,
+      onTodoComplete = null
+    } = params;
 
     console.log('[Lux] Delegating task to Python Tasker Service...');
     console.log(`[Lux] Task: ${taskDescription}`);
     console.log(`[Lux] Todos: ${todos.length}`);
 
-    return new Promise((resolve, reject) => {
-      const requestBody = JSON.stringify({
-        api_key: this.apiKey,
-        task_description: taskDescription,
-        todos: todos,
-        start_url: startUrl,
-        max_steps: 60,
-        reflection_interval: 20
-      });
-
-      const url = new URL(`${this.serviceUrl}/execute`);
-      
-      const options = {
-        hostname: url.hostname,
-        port: url.port,
-        path: url.pathname,
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Content-Length': Buffer.byteLength(requestBody)
-        },
-        timeout: 600000  // 10 minutes timeout for long tasks
-      };
+    try {
+      // Notify start of first todo
+      if (onTodoStart && todos.length > 0) {
+        await onTodoStart(0, todos[0]);
+      }
 
       console.log('[Lux] Sending request to Tasker Service...');
 
-      const req = http.request(options, (res) => {
-        let data = '';
-        res.on('data', chunk => data += chunk);
-        res.on('end', () => {
-          try {
-            const response = JSON.parse(data);
-            console.log(`[Lux] Tasker Service response:`, response);
-            
-            resolve({
-              success: response.success,
-              message: response.message,
-              completedTodos: response.completed_todos,
-              totalTodos: response.total_todos,
-              error: response.error
-            });
-          } catch (e) {
-            reject(new Error(`Failed to parse response: ${e.message}`));
-          }
-        });
+      const response = await fetch(`${this.taskerServiceUrl}/execute`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          api_key: this.apiKey,
+          task_description: taskDescription,
+          todos: todos,
+          start_url: startUrl,
+          max_steps: maxSteps,
+          reflection_interval: reflectionInterval,
+          model: model,
+          temperature: temperature,
+          mode: 'tasker'
+        }),
+        timeout: 600000 // 10 minutes timeout
       });
 
-      req.on('error', (e) => {
-        console.error('[Lux] Request error:', e.message);
-        reject(new Error(`Tasker Service request failed: ${e.message}`));
-      });
+      console.log('[Lux] Tasker Service response received');
 
-      req.on('timeout', () => {
-        req.destroy();
-        reject(new Error('Request timed out'));
-      });
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Tasker Service error: ${response.status} - ${errorText}`);
+      }
 
-      req.write(requestBody);
-      req.end();
-    });
+      const result = await response.json();
+
+      console.log('[Lux] Tasker Service response:', JSON.stringify(result, null, 2));
+
+      // Notify completion of all todos based on result
+      if (onTodoComplete) {
+        for (let i = 0; i < todos.length; i++) {
+          const success = i < result.completed_todos;
+          await onTodoComplete(i, success, { message: result.message });
+        }
+      }
+
+      return {
+        success: result.success,
+        message: result.message,
+        completedTodos: result.completed_todos,
+        totalTodos: result.total_todos,
+        error: result.error
+      };
+
+    } catch (error) {
+      console.error('[Lux] Request error:', error.message);
+
+      // Mark all todos as failed
+      if (onTodoComplete) {
+        for (let i = 0; i < todos.length; i++) {
+          await onTodoComplete(i, false, { message: error.message });
+        }
+      }
+
+      return {
+        success: false,
+        message: `Tasker Service request failed: ${error.message}`,
+        completedTodos: 0,
+        totalTodos: todos.length,
+        error: error.message
+      };
+    }
   }
 
   /**
-   * Stop the currently running task
+   * Stop the current task
    */
   async stopTask() {
-    return new Promise((resolve) => {
-      const req = http.request(
-        `${this.serviceUrl}/stop`,
-        { method: 'POST', timeout: 5000 },
-        (res) => {
-          let data = '';
-          res.on('data', chunk => data += chunk);
-          res.on('end', () => {
-            try {
-              resolve(JSON.parse(data));
-            } catch (e) {
-              resolve({ message: 'Stop requested' });
-            }
-          });
+    try {
+      const response = await fetch(`${this.taskerServiceUrl}/stop`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
         }
-      );
-      req.on('error', () => resolve({ message: 'Stop request failed' }));
-      req.end();
-    });
+      });
+
+      if (response.ok) {
+        console.log('[Lux] Task stop requested');
+        return true;
+      }
+    } catch (error) {
+      console.error('[Lux] Error stopping task:', error.message);
+    }
+    return false;
   }
 
-  resetSession() {
-    console.log('[Lux] Session reset');
+  /**
+   * Check if API key is configured
+   */
+  isConfigured() {
+    return this.apiKey !== null;
   }
 }
 
+// Export singleton
 module.exports = new LuxClient();
