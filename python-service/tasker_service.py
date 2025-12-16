@@ -6,12 +6,16 @@ Runs locally and receives requests from Architect's Hand Bridge
 
 import asyncio
 import os
+import io
 from typing import Optional, List
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+# PyAutoGUI for screenshots and actions
+import pyautogui
 
 # OAGI imports - all from main module
 try:
@@ -47,7 +51,7 @@ class TaskResponse(BaseModel):
 class StatusResponse(BaseModel):
     status: str
     oagi_available: bool
-    version: str = "2.2.0"
+    version: str = "2.3.0"
 
 
 # Global state
@@ -71,7 +75,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Tasker Service",
     description="Local service for OAGI execution (Actor/Thinker/Tasker modes)",
-    version="2.2.0",
+    version="2.3.0",
     lifespan=lifespan
 )
 
@@ -83,6 +87,57 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def take_screenshot_bytes():
+    """Take screenshot and return as bytes"""
+    screenshot = pyautogui.screenshot()
+    img_bytes = io.BytesIO()
+    screenshot.save(img_bytes, format='PNG')
+    return img_bytes.getvalue()
+
+
+def execute_action(action):
+    """Execute a single action using pyautogui"""
+    action_type = getattr(action, 'type', None) or action.get('type', None) if isinstance(action, dict) else None
+    
+    if action_type is None and hasattr(action, 'action_type'):
+        action_type = action.action_type
+    
+    print(f"  Action type: {action_type}")
+    
+    if action_type == 'click':
+        x = getattr(action, 'x', None) or (action.get('x') if isinstance(action, dict) else None)
+        y = getattr(action, 'y', None) or (action.get('y') if isinstance(action, dict) else None)
+        if x is not None and y is not None:
+            print(f"  Clicking at ({x}, {y})")
+            pyautogui.click(x, y)
+    
+    elif action_type == 'type':
+        text = getattr(action, 'text', None) or (action.get('text') if isinstance(action, dict) else None)
+        if text:
+            print(f"  Typing: {text}")
+            pyautogui.typewrite(text, interval=0.05)
+    
+    elif action_type == 'key' or action_type == 'press':
+        key = getattr(action, 'key', None) or (action.get('key') if isinstance(action, dict) else None)
+        if key:
+            print(f"  Pressing key: {key}")
+            pyautogui.press(key)
+    
+    elif action_type == 'scroll':
+        amount = getattr(action, 'amount', None) or (action.get('amount') if isinstance(action, dict) else 0)
+        print(f"  Scrolling: {amount}")
+        pyautogui.scroll(amount)
+    
+    elif action_type == 'hotkey':
+        keys = getattr(action, 'keys', None) or (action.get('keys') if isinstance(action, dict) else [])
+        if keys:
+            print(f"  Hotkey: {keys}")
+            pyautogui.hotkey(*keys)
+    
+    else:
+        print(f"  Unknown action type: {action_type}, action: {action}")
 
 
 @app.get("/status", response_model=StatusResponse)
@@ -125,7 +180,7 @@ async def execute_task(request: TaskRequest):
             # Direct execution - use Actor with step loop
             return await execute_direct_mode(request)
         else:
-            # Tasker mode - use TaskerAgent with todos
+            # Tasker mode - use TaskerAgent.execute()
             return await execute_tasker_mode(request)
         
     except Exception as e:
@@ -174,21 +229,17 @@ async def execute_direct_mode(request: TaskRequest) -> TaskResponse:
             max_steps=request.max_steps
         )
         
-        # Create handlers
-        action_handler = AsyncPyautoguiActionHandler()
-        image_provider = AsyncScreenshotMaker()
-        
-        # Execute using step loop
+        # Execute using step loop with pyautogui
         print("Starting Actor step loop...")
         steps_executed = 0
         success = False
         
         for step_num in range(request.max_steps):
-            # Take screenshot
-            screenshot = await image_provider.take_screenshot()
+            # Take screenshot using pyautogui
+            screenshot_bytes = take_screenshot_bytes()
             
             # Get next step from Actor
-            step_result = actor.step(screenshot)
+            step_result = actor.step(screenshot_bytes)
             
             print(f"Step {step_num + 1}: {step_result}")
             
@@ -207,8 +258,7 @@ async def execute_direct_mode(request: TaskRequest) -> TaskResponse:
             # Execute actions if present
             if hasattr(step_result, 'actions') and step_result.actions:
                 for action in step_result.actions:
-                    print(f"  Executing action: {action}")
-                    await action_handler.handle(action)
+                    execute_action(action)
             
             steps_executed += 1
             
@@ -235,7 +285,7 @@ async def execute_direct_mode(request: TaskRequest) -> TaskResponse:
 
 
 async def execute_tasker_mode(request: TaskRequest) -> TaskResponse:
-    """Execute using TaskerAgent with todos (for Tasker mode)"""
+    """Execute using TaskerAgent.execute() with todos"""
     
     print(f"\n{'='*50}")
     print(f"[Tasker Mode] Executing: {request.task_description}")
@@ -262,49 +312,28 @@ async def execute_tasker_mode(request: TaskRequest) -> TaskResponse:
             todos=request.todos
         )
         
-        # Create handlers
+        # Create handlers (these are used internally by execute())
         action_handler = AsyncPyautoguiActionHandler()
         image_provider = AsyncScreenshotMaker()
         
-        # Execute using step loop
-        print("Starting TaskerAgent step loop...")
-        steps_executed = 0
-        success = False
-        
-        for step_num in range(request.max_steps):
-            # Take screenshot
-            screenshot = await image_provider.take_screenshot()
-            
-            # Get next step from TaskerAgent
-            step_result = tasker.step(screenshot)
-            
-            print(f"Step {step_num + 1}: {step_result}")
-            
-            # Check if done
-            if step_result is None:
-                print("TaskerAgent returned None - task complete")
-                success = True
-                break
-            
-            # Check for done flag
-            if hasattr(step_result, 'done') and step_result.done:
-                print("TaskerAgent signaled done")
-                success = True
-                break
-            
-            # Execute actions if present
-            if hasattr(step_result, 'actions') and step_result.actions:
-                for action in step_result.actions:
-                    print(f"  Executing action: {action}")
-                    await action_handler.handle(action)
-            
-            steps_executed += 1
-            
-            # Small delay between steps
-            await asyncio.sleep(0.5)
+        # Execute using TaskerAgent's built-in execute method
+        print("Starting TaskerAgent execution...")
+        success = await tasker.execute(
+            instruction=request.task_description,
+            action_handler=action_handler,
+            image_provider=image_provider
+        )
         
         # Get results
         completed = len(request.todos) if success else 0
+        
+        # Try to get actual completion from memory
+        try:
+            memory = tasker.get_memory()
+            if memory and hasattr(memory, 'todos'):
+                completed = sum(1 for t in memory.todos if getattr(t, 'status', '').lower() == 'completed')
+        except:
+            pass
         
         print(f"\nTask {'completed successfully' if success else 'failed'}")
         print(f"Completed {completed}/{len(request.todos)} todos\n")
@@ -313,8 +342,7 @@ async def execute_tasker_mode(request: TaskRequest) -> TaskResponse:
             success=success,
             message="Task completed successfully" if success else "Task failed",
             completed_todos=completed,
-            total_todos=len(request.todos),
-            execution_summary={"steps_executed": steps_executed}
+            total_todos=len(request.todos)
         )
         
     except Exception as e:
@@ -342,7 +370,7 @@ async def root():
     """Root endpoint with service info"""
     return {
         "service": "Tasker Service",
-        "version": "2.2.0",
+        "version": "2.3.0",
         "oagi_available": OAGI_AVAILABLE,
         "supported_modes": ["actor", "thinker", "tasker", "direct"],
         "endpoints": [
@@ -357,7 +385,7 @@ if __name__ == "__main__":
     import uvicorn
     
     print("\n" + "=" * 50)
-    print("  TASKER SERVICE v2.2")
+    print("  TASKER SERVICE v2.3")
     print("  Supports: Actor | Thinker | Tasker modes")
     print("=" * 50 + "\n")
     
@@ -366,4 +394,4 @@ if __name__ == "__main__":
         host="127.0.0.1", 
         port=8765,
         log_level="info"
-    )
+        )
