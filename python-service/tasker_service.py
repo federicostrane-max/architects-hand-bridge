@@ -51,7 +51,7 @@ class TaskResponse(BaseModel):
 class StatusResponse(BaseModel):
     status: str
     oagi_available: bool
-    version: str = "2.3.0"
+    version: str = "2.4.0"
 
 
 # Global state
@@ -75,7 +75,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Tasker Service",
     description="Local service for OAGI execution (Actor/Thinker/Tasker modes)",
-    version="2.3.0",
+    version="2.4.0",
     lifespan=lifespan
 )
 
@@ -99,45 +99,66 @@ def take_screenshot_bytes():
 
 def execute_action(action):
     """Execute a single action using pyautogui"""
-    action_type = getattr(action, 'type', None) or action.get('type', None) if isinstance(action, dict) else None
+    # Get action type - handle both enum and string
+    action_type = None
+    if hasattr(action, 'type'):
+        if hasattr(action.type, 'value'):
+            action_type = action.type.value  # Enum like ActionType.CLICK
+        else:
+            action_type = str(action.type)
     
-    if action_type is None and hasattr(action, 'action_type'):
-        action_type = action.action_type
+    # Get argument
+    argument = getattr(action, 'argument', '') or ''
     
-    print(f"  Action type: {action_type}")
+    print(f"  Executing: {action_type} | Argument: {argument}")
     
     if action_type == 'click':
-        x = getattr(action, 'x', None) or (action.get('x') if isinstance(action, dict) else None)
-        y = getattr(action, 'y', None) or (action.get('y') if isinstance(action, dict) else None)
-        if x is not None and y is not None:
-            print(f"  Clicking at ({x}, {y})")
+        # Parse coordinates from argument like "516, 977"
+        try:
+            coords = argument.replace(' ', '').split(',')
+            x = int(coords[0])
+            y = int(coords[1])
+            print(f"  -> Clicking at ({x}, {y})")
             pyautogui.click(x, y)
+        except Exception as e:
+            print(f"  -> Click parse error: {e}")
     
     elif action_type == 'type':
-        text = getattr(action, 'text', None) or (action.get('text') if isinstance(action, dict) else None)
-        if text:
-            print(f"  Typing: {text}")
-            pyautogui.typewrite(text, interval=0.05)
+        # Argument is the text to type
+        if argument:
+            print(f"  -> Typing: {argument}")
+            pyautogui.write(argument, interval=0.02)
     
     elif action_type == 'key' or action_type == 'press':
-        key = getattr(action, 'key', None) or (action.get('key') if isinstance(action, dict) else None)
-        if key:
-            print(f"  Pressing key: {key}")
-            pyautogui.press(key)
+        # Argument is the key to press
+        if argument:
+            print(f"  -> Pressing key: {argument}")
+            pyautogui.press(argument.lower())
     
     elif action_type == 'scroll':
-        amount = getattr(action, 'amount', None) or (action.get('amount') if isinstance(action, dict) else 0)
-        print(f"  Scrolling: {amount}")
-        pyautogui.scroll(amount)
+        # Argument is scroll amount
+        try:
+            amount = int(argument) if argument else 0
+            print(f"  -> Scrolling: {amount}")
+            pyautogui.scroll(amount)
+        except:
+            print(f"  -> Scroll error")
     
     elif action_type == 'hotkey':
-        keys = getattr(action, 'keys', None) or (action.get('keys') if isinstance(action, dict) else [])
-        if keys:
-            print(f"  Hotkey: {keys}")
+        # Argument is keys separated by +
+        if argument:
+            keys = [k.strip().lower() for k in argument.split('+')]
+            print(f"  -> Hotkey: {keys}")
             pyautogui.hotkey(*keys)
     
+    elif action_type == 'finish':
+        print(f"  -> Finish action received")
+        return 'finish'
+    
     else:
-        print(f"  Unknown action type: {action_type}, action: {action}")
+        print(f"  -> Unknown action type: {action_type}")
+    
+    return None
 
 
 @app.get("/status", response_model=StatusResponse)
@@ -241,35 +262,41 @@ async def execute_direct_mode(request: TaskRequest) -> TaskResponse:
             # Get next step from Actor
             step_result = actor.step(screenshot_bytes)
             
-            print(f"Step {step_num + 1}: {step_result}")
+            print(f"\nStep {step_num + 1}:")
+            if hasattr(step_result, 'reason'):
+                # Print first 100 chars of reason
+                reason_short = step_result.reason[:100] + "..." if len(step_result.reason) > 100 else step_result.reason
+                print(f"  Reason: {reason_short}")
             
-            # Check if done
-            if step_result is None:
-                print("Actor returned None - task complete")
-                success = True
-                break
-            
-            # Check for done flag
-            if hasattr(step_result, 'done') and step_result.done:
-                print("Actor signaled done")
+            # Check if done via stop flag
+            if hasattr(step_result, 'stop') and step_result.stop:
+                print("  -> Task signaled STOP")
                 success = True
                 break
             
             # Execute actions if present
             if hasattr(step_result, 'actions') and step_result.actions:
                 for action in step_result.actions:
-                    execute_action(action)
+                    result = execute_action(action)
+                    if result == 'finish':
+                        success = True
+                        break
+                
+                if success:
+                    break
             
             steps_executed += 1
             
             # Small delay between steps
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.3)
         
         # Cleanup
         actor.close()
         
-        print(f"\nDirect task {'completed successfully' if success else 'reached max steps'}")
-        print(f"Steps executed: {steps_executed}\n")
+        print(f"\n{'='*50}")
+        print(f"Direct task {'COMPLETED' if success else 'reached max steps'}")
+        print(f"Steps executed: {steps_executed}")
+        print(f"{'='*50}\n")
         
         return TaskResponse(
             success=success,
@@ -335,8 +362,10 @@ async def execute_tasker_mode(request: TaskRequest) -> TaskResponse:
         except:
             pass
         
-        print(f"\nTask {'completed successfully' if success else 'failed'}")
-        print(f"Completed {completed}/{len(request.todos)} todos\n")
+        print(f"\n{'='*50}")
+        print(f"Task {'COMPLETED' if success else 'FAILED'}")
+        print(f"Completed {completed}/{len(request.todos)} todos")
+        print(f"{'='*50}\n")
         
         return TaskResponse(
             success=success,
@@ -370,7 +399,7 @@ async def root():
     """Root endpoint with service info"""
     return {
         "service": "Tasker Service",
-        "version": "2.3.0",
+        "version": "2.4.0",
         "oagi_available": OAGI_AVAILABLE,
         "supported_modes": ["actor", "thinker", "tasker", "direct"],
         "endpoints": [
@@ -385,7 +414,7 @@ if __name__ == "__main__":
     import uvicorn
     
     print("\n" + "=" * 50)
-    print("  TASKER SERVICE v2.3")
+    print("  TASKER SERVICE v2.4")
     print("  Supports: Actor | Thinker | Tasker modes")
     print("=" * 50 + "\n")
     
@@ -394,4 +423,4 @@ if __name__ == "__main__":
         host="127.0.0.1", 
         port=8765,
         log_level="info"
-        )
+    )
