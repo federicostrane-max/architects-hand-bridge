@@ -47,7 +47,7 @@ class TaskResponse(BaseModel):
 class StatusResponse(BaseModel):
     status: str
     oagi_available: bool
-    version: str = "2.1.0"
+    version: str = "2.2.0"
 
 
 # Global state
@@ -71,7 +71,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Tasker Service",
     description="Local service for OAGI execution (Actor/Thinker/Tasker modes)",
-    version="2.1.0",
+    version="2.2.0",
     lifespan=lifespan
 )
 
@@ -122,7 +122,7 @@ async def execute_task(request: TaskRequest):
         mode = request.mode.lower()
         
         if mode in ['direct', 'actor', 'thinker']:
-            # Direct execution - use Actor without TaskerAgent
+            # Direct execution - use Actor with step loop
             return await execute_direct_mode(request)
         else:
             # Tasker mode - use TaskerAgent with todos
@@ -146,7 +146,7 @@ async def execute_task(request: TaskRequest):
 
 
 async def execute_direct_mode(request: TaskRequest) -> TaskResponse:
-    """Execute using Actor directly (for Actor/Thinker modes)"""
+    """Execute using Actor with step loop (for Actor/Thinker modes)"""
     
     print(f"\n{'='*50}")
     print(f"[Direct Mode] Executing: {request.task_description}")
@@ -162,7 +162,7 @@ async def execute_direct_mode(request: TaskRequest) -> TaskResponse:
         elif request.mode == 'actor' and 'actor' not in model:
             model = 'lux-actor-1'
         
-        # Create Actor - only pass supported parameters
+        # Create Actor
         actor = Actor(
             api_key=request.api_key,
             model=model
@@ -178,21 +178,55 @@ async def execute_direct_mode(request: TaskRequest) -> TaskResponse:
         action_handler = AsyncPyautoguiActionHandler()
         image_provider = AsyncScreenshotMaker()
         
-        # Execute
-        print("Starting Actor execution...")
-        success = await actor.execute(
-            request.task_description,
-            action_handler,
-            image_provider
-        )
+        # Execute using step loop
+        print("Starting Actor step loop...")
+        steps_executed = 0
+        success = False
         
-        print(f"\nDirect task {'completed successfully' if success else 'failed'}\n")
+        for step_num in range(request.max_steps):
+            # Take screenshot
+            screenshot = await image_provider.take_screenshot()
+            
+            # Get next step from Actor
+            step_result = actor.step(screenshot)
+            
+            print(f"Step {step_num + 1}: {step_result}")
+            
+            # Check if done
+            if step_result is None:
+                print("Actor returned None - task complete")
+                success = True
+                break
+            
+            # Check for done flag
+            if hasattr(step_result, 'done') and step_result.done:
+                print("Actor signaled done")
+                success = True
+                break
+            
+            # Execute actions if present
+            if hasattr(step_result, 'actions') and step_result.actions:
+                for action in step_result.actions:
+                    print(f"  Executing action: {action}")
+                    await action_handler.handle(action)
+            
+            steps_executed += 1
+            
+            # Small delay between steps
+            await asyncio.sleep(0.5)
+        
+        # Cleanup
+        actor.close()
+        
+        print(f"\nDirect task {'completed successfully' if success else 'reached max steps'}")
+        print(f"Steps executed: {steps_executed}\n")
         
         return TaskResponse(
             success=success,
-            message="Task completed successfully" if success else "Task failed",
+            message=f"Task {'completed' if success else 'reached max steps'} after {steps_executed} steps",
             completed_todos=1 if success else 0,
-            total_todos=1
+            total_todos=1,
+            execution_summary={"steps_executed": steps_executed}
         )
         
     except Exception as e:
@@ -232,22 +266,45 @@ async def execute_tasker_mode(request: TaskRequest) -> TaskResponse:
         action_handler = AsyncPyautoguiActionHandler()
         image_provider = AsyncScreenshotMaker()
         
-        # Execute
-        print("Starting TaskerAgent execution...")
-        success = await tasker.execute(
-            request.task_description,
-            action_handler,
-            image_provider
-        )
+        # Execute using step loop
+        print("Starting TaskerAgent step loop...")
+        steps_executed = 0
+        success = False
+        
+        for step_num in range(request.max_steps):
+            # Take screenshot
+            screenshot = await image_provider.take_screenshot()
+            
+            # Get next step from TaskerAgent
+            step_result = tasker.step(screenshot)
+            
+            print(f"Step {step_num + 1}: {step_result}")
+            
+            # Check if done
+            if step_result is None:
+                print("TaskerAgent returned None - task complete")
+                success = True
+                break
+            
+            # Check for done flag
+            if hasattr(step_result, 'done') and step_result.done:
+                print("TaskerAgent signaled done")
+                success = True
+                break
+            
+            # Execute actions if present
+            if hasattr(step_result, 'actions') and step_result.actions:
+                for action in step_result.actions:
+                    print(f"  Executing action: {action}")
+                    await action_handler.handle(action)
+            
+            steps_executed += 1
+            
+            # Small delay between steps
+            await asyncio.sleep(0.5)
         
         # Get results
-        memory = tasker.get_memory() if hasattr(tasker, 'get_memory') else None
-        completed = 0
-        
-        if memory and hasattr(memory, 'todos'):
-            completed = sum(1 for t in memory.todos if getattr(t, 'status', '').lower() == 'completed')
-        elif success:
-            completed = len(request.todos)
+        completed = len(request.todos) if success else 0
         
         print(f"\nTask {'completed successfully' if success else 'failed'}")
         print(f"Completed {completed}/{len(request.todos)} todos\n")
@@ -256,7 +313,8 @@ async def execute_tasker_mode(request: TaskRequest) -> TaskResponse:
             success=success,
             message="Task completed successfully" if success else "Task failed",
             completed_todos=completed,
-            total_todos=len(request.todos)
+            total_todos=len(request.todos),
+            execution_summary={"steps_executed": steps_executed}
         )
         
     except Exception as e:
@@ -284,7 +342,7 @@ async def root():
     """Root endpoint with service info"""
     return {
         "service": "Tasker Service",
-        "version": "2.1.0",
+        "version": "2.2.0",
         "oagi_available": OAGI_AVAILABLE,
         "supported_modes": ["actor", "thinker", "tasker", "direct"],
         "endpoints": [
@@ -299,7 +357,7 @@ if __name__ == "__main__":
     import uvicorn
     
     print("\n" + "=" * 50)
-    print("  TASKER SERVICE v2.1")
+    print("  TASKER SERVICE v2.2")
     print("  Supports: Actor | Thinker | Tasker modes")
     print("=" * 50 + "\n")
     
