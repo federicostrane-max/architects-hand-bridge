@@ -390,6 +390,13 @@ class Bridge {
       currentTask: this.currentTask
     };
   }
+
+  /**
+   * Get bridge state (alias for getStatus)
+   */
+  getState() {
+    return this.getStatus();
+  }
 }
 
 // Export singleton
