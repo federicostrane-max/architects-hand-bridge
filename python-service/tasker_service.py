@@ -47,7 +47,7 @@ class TaskResponse(BaseModel):
 class StatusResponse(BaseModel):
     status: str
     oagi_available: bool
-    version: str = "2.0.0"
+    version: str = "2.1.0"
 
 
 # Global state
@@ -71,7 +71,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Tasker Service",
     description="Local service for OAGI execution (Actor/Thinker/Tasker modes)",
-    version="2.0.0",
+    version="2.1.0",
     lifespan=lifespan
 )
 
@@ -162,15 +162,13 @@ async def execute_direct_mode(request: TaskRequest) -> TaskResponse:
         elif request.mode == 'actor' and 'actor' not in model:
             model = 'lux-actor-1'
         
-        # Create Actor
+        # Create Actor - only pass supported parameters
         actor = Actor(
             api_key=request.api_key,
-            model=model,
-            max_steps=min(request.max_steps, 100),  # Cap at 100
-            temperature=request.temperature
+            model=model
         )
         
-        # Initialize task
+        # Initialize task with max_steps
         actor.init_task(
             task_desc=request.task_description,
             max_steps=request.max_steps
@@ -221,8 +219,7 @@ async def execute_tasker_mode(request: TaskRequest) -> TaskResponse:
             api_key=request.api_key,
             model=request.model,
             max_steps=request.max_steps,
-            reflection_interval=request.reflection_interval,
-            temperature=request.temperature
+            reflection_interval=request.reflection_interval
         )
         
         # Set task with todos
@@ -287,7 +284,7 @@ async def root():
     """Root endpoint with service info"""
     return {
         "service": "Tasker Service",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "oagi_available": OAGI_AVAILABLE,
         "supported_modes": ["actor", "thinker", "tasker", "direct"],
         "endpoints": [
@@ -302,7 +299,7 @@ if __name__ == "__main__":
     import uvicorn
     
     print("\n" + "=" * 50)
-    print("  TASKER SERVICE v2.0")
+    print("  TASKER SERVICE v2.1")
     print("  Supports: Actor | Thinker | Tasker modes")
     print("=" * 50 + "\n")
     
