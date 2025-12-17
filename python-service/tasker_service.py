@@ -2,11 +2,15 @@
 Tasker Service - FastAPI wrapper for OAGI
 Supports all three Lux modes: Actor, Thinker, and Tasker
 Runs locally and receives requests from Architect's Hand Bridge
+v2.5 - Auto browser launch with start_url
 """
 
 import asyncio
 import os
 import io
+import webbrowser
+import subprocess
+import time
 from typing import Optional, List
 from contextlib import asynccontextmanager
 
@@ -51,7 +55,7 @@ class TaskResponse(BaseModel):
 class StatusResponse(BaseModel):
     status: str
     oagi_available: bool
-    version: str = "2.4.0"
+    version: str = "2.5.0"
 
 
 # Global state
@@ -75,7 +79,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Tasker Service",
     description="Local service for OAGI execution (Actor/Thinker/Tasker modes)",
-    version="2.4.0",
+    version="2.5.0",
     lifespan=lifespan
 )
 
@@ -87,6 +91,40 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def open_browser_with_url(url: str):
+    """Open browser with specified URL and wait for it to load"""
+    print(f"\n>>> Opening browser with URL: {url}")
+    
+    # Try to open Chrome specifically, fallback to default browser
+    chrome_paths = [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        os.path.expanduser(r"~\AppData\Local\Google\Chrome\Application\chrome.exe"),
+    ]
+    
+    chrome_opened = False
+    for chrome_path in chrome_paths:
+        if os.path.exists(chrome_path):
+            try:
+                # Open Chrome with the URL, maximized
+                subprocess.Popen([chrome_path, "--start-maximized", url])
+                chrome_opened = True
+                print(f">>> Chrome opened from: {chrome_path}")
+                break
+            except Exception as e:
+                print(f">>> Failed to open Chrome from {chrome_path}: {e}")
+    
+    if not chrome_opened:
+        # Fallback to default browser
+        print(">>> Chrome not found, using default browser")
+        webbrowser.open(url)
+    
+    # Wait for browser to open and load
+    print(">>> Waiting 3 seconds for browser to load...")
+    time.sleep(3)
+    print(">>> Browser should be ready\n")
 
 
 def take_screenshot_bytes():
@@ -193,6 +231,12 @@ async def execute_task(request: TaskRequest):
     try:
         # Set API key
         os.environ["OAGI_API_KEY"] = request.api_key
+        
+        # ========================================
+        # AUTO-OPEN BROWSER IF start_url PROVIDED
+        # ========================================
+        if request.start_url:
+            open_browser_with_url(request.start_url)
         
         # Route based on mode
         mode = request.mode.lower()
@@ -399,9 +443,10 @@ async def root():
     """Root endpoint with service info"""
     return {
         "service": "Tasker Service",
-        "version": "2.4.0",
+        "version": "2.5.0",
         "oagi_available": OAGI_AVAILABLE,
         "supported_modes": ["actor", "thinker", "tasker", "direct"],
+        "features": ["auto_browser_launch"],
         "endpoints": [
             "GET /status - Check service status",
             "POST /execute - Execute a task",
@@ -414,8 +459,9 @@ if __name__ == "__main__":
     import uvicorn
     
     print("\n" + "=" * 50)
-    print("  TASKER SERVICE v2.4")
+    print("  TASKER SERVICE v2.5")
     print("  Supports: Actor | Thinker | Tasker modes")
+    print("  + Auto browser launch with start_url")
     print("=" * 50 + "\n")
     
     uvicorn.run(
