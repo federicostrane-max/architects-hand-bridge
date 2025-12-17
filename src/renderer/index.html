@@ -3,196 +3,821 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';">
-  <title>Architect's Hand - Local Bridge</title>
-  <link rel="stylesheet" href="styles.css">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline';">
+  <title>Architect's Hand Bridge</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+    
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+      color: #e0e0e0;
+      min-height: 100vh;
+    }
+    
+    .container {
+      max-width: 800px;
+      margin: 0 auto;
+      padding: 20px;
+    }
+    
+    /* Header */
+    .header {
+      text-align: center;
+      padding: 20px 0;
+      border-bottom: 1px solid rgba(255,255,255,0.1);
+      margin-bottom: 20px;
+    }
+    
+    .header h1 {
+      font-size: 24px;
+      color: #fff;
+      margin-bottom: 5px;
+    }
+    
+    .header .subtitle {
+      color: #888;
+      font-size: 14px;
+    }
+    
+    /* Tabs */
+    .tabs {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 20px;
+    }
+    
+    .tab {
+      padding: 10px 20px;
+      background: rgba(255,255,255,0.05);
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 8px;
+      color: #888;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    
+    .tab:hover {
+      background: rgba(255,255,255,0.1);
+    }
+    
+    .tab.active {
+      background: #4f46e5;
+      border-color: #4f46e5;
+      color: #fff;
+    }
+    
+    /* Pages */
+    .page {
+      display: none;
+    }
+    
+    .page.active {
+      display: block;
+    }
+    
+    /* Cards */
+    .card {
+      background: rgba(255,255,255,0.05);
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 12px;
+      padding: 20px;
+      margin-bottom: 20px;
+    }
+    
+    .card h2 {
+      font-size: 16px;
+      color: #fff;
+      margin-bottom: 15px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    
+    .card h2 .icon {
+      font-size: 20px;
+    }
+    
+    /* Form */
+    .form-group {
+      margin-bottom: 15px;
+    }
+    
+    .form-group label {
+      display: block;
+      font-size: 13px;
+      color: #888;
+      margin-bottom: 5px;
+    }
+    
+    .form-group input {
+      width: 100%;
+      padding: 12px;
+      background: rgba(0,0,0,0.3);
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 8px;
+      color: #fff;
+      font-size: 14px;
+      transition: border-color 0.2s;
+    }
+    
+    .form-group input:focus {
+      outline: none;
+      border-color: #4f46e5;
+    }
+    
+    .form-group input::placeholder {
+      color: #555;
+    }
+    
+    .form-group.checkbox {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    
+    .form-group.checkbox input {
+      width: auto;
+    }
+    
+    .form-group.checkbox label {
+      margin-bottom: 0;
+      cursor: pointer;
+    }
+    
+    /* Buttons */
+    .btn {
+      padding: 12px 24px;
+      border: none;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    
+    .btn-primary {
+      background: #4f46e5;
+      color: #fff;
+    }
+    
+    .btn-primary:hover {
+      background: #4338ca;
+    }
+    
+    .btn-primary:disabled {
+      background: #333;
+      cursor: not-allowed;
+    }
+    
+    .btn-secondary {
+      background: rgba(255,255,255,0.1);
+      color: #fff;
+    }
+    
+    .btn-secondary:hover {
+      background: rgba(255,255,255,0.2);
+    }
+    
+    .btn-danger {
+      background: #dc2626;
+      color: #fff;
+    }
+    
+    .btn-danger:hover {
+      background: #b91c1c;
+    }
+    
+    .btn-success {
+      background: #16a34a;
+      color: #fff;
+    }
+    
+    .btn-success:hover {
+      background: #15803d;
+    }
+    
+    .btn-group {
+      display: flex;
+      gap: 10px;
+    }
+    
+    /* Status */
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 12px;
+      border-radius: 20px;
+      font-size: 13px;
+      font-weight: 500;
+    }
+    
+    .status-badge.offline {
+      background: rgba(239, 68, 68, 0.2);
+      color: #ef4444;
+    }
+    
+    .status-badge.running {
+      background: rgba(34, 197, 94, 0.2);
+      color: #22c55e;
+    }
+    
+    .status-badge.paused {
+      background: rgba(234, 179, 8, 0.2);
+      color: #eab308;
+    }
+    
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: currentColor;
+    }
+    
+    /* Logs */
+    .logs-container {
+      background: rgba(0,0,0,0.3);
+      border-radius: 8px;
+      padding: 15px;
+      max-height: 300px;
+      overflow-y: auto;
+      font-family: 'Monaco', 'Consolas', monospace;
+      font-size: 12px;
+    }
+    
+    .log-entry {
+      padding: 3px 0;
+      border-bottom: 1px solid rgba(255,255,255,0.05);
+    }
+    
+    .log-entry:last-child {
+      border-bottom: none;
+    }
+    
+    .log-entry.INFO { color: #60a5fa; }
+    .log-entry.WARN { color: #fbbf24; }
+    .log-entry.ERROR { color: #f87171; }
+    .log-entry.SUCCESS { color: #4ade80; }
+    
+    /* Messages */
+    .message {
+      padding: 12px;
+      border-radius: 8px;
+      margin-bottom: 15px;
+      font-size: 14px;
+    }
+    
+    .message.error {
+      background: rgba(239, 68, 68, 0.2);
+      border: 1px solid rgba(239, 68, 68, 0.3);
+      color: #fca5a5;
+    }
+    
+    .message.success {
+      background: rgba(34, 197, 94, 0.2);
+      border: 1px solid rgba(34, 197, 94, 0.3);
+      color: #86efac;
+    }
+    
+    .message.info {
+      background: rgba(59, 130, 246, 0.2);
+      border: 1px solid rgba(59, 130, 246, 0.3);
+      color: #93c5fd;
+    }
+    
+    /* User info */
+    .user-info {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 15px;
+      background: rgba(34, 197, 94, 0.1);
+      border: 1px solid rgba(34, 197, 94, 0.2);
+      border-radius: 8px;
+      margin-bottom: 20px;
+    }
+    
+    .user-info .email {
+      color: #4ade80;
+      font-weight: 500;
+    }
+    
+    /* Loading */
+    .loading {
+      display: inline-block;
+      width: 16px;
+      height: 16px;
+      border: 2px solid rgba(255,255,255,0.3);
+      border-top-color: #fff;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+    
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+    
+    /* Hidden */
+    .hidden {
+      display: none !important;
+    }
+  </style>
 </head>
 <body>
-  <div class="app-container">
+  <div class="container">
     <!-- Header -->
-    <header class="app-header">
-      <div class="header-left">
-        <h1>🤖 Architect's Hand</h1>
-        <span class="subtitle">Local Bridge</span>
-      </div>
-      <div class="header-right">
-        <div class="status-indicator" id="status-indicator">
-          <span class="status-dot"></span>
-          <span class="status-text">Disconnected</span>
+    <div class="header">
+      <h1>🏗️ Architect's Hand Bridge</h1>
+      <p class="subtitle">Desktop automation powered by OpenAGI Lux</p>
+    </div>
+    
+    <!-- Tabs -->
+    <div class="tabs">
+      <div class="tab active" data-page="login">Login</div>
+      <div class="tab" data-page="bridge">Bridge</div>
+      <div class="tab" data-page="settings">Settings</div>
+    </div>
+    
+    <!-- Login Page -->
+    <div id="page-login" class="page active">
+      <div class="card">
+        <h2><span class="icon">🔐</span> Login to Supabase</h2>
+        
+        <div id="login-message"></div>
+        
+        <div id="login-form">
+          <div class="form-group">
+            <label for="email">Email</label>
+            <input type="email" id="email" placeholder="your@email.com" autocomplete="email">
+          </div>
+          
+          <div class="form-group">
+            <label for="password">Password</label>
+            <input type="password" id="password" placeholder="••••••••" autocomplete="current-password">
+          </div>
+          
+          <div class="form-group checkbox">
+            <input type="checkbox" id="remember-me" checked>
+            <label for="remember-me">Remember me (save credentials securely)</label>
+          </div>
+          
+          <button id="btn-login" class="btn btn-primary">
+            <span class="btn-text">Login</span>
+            <span class="loading hidden"></span>
+          </button>
+        </div>
+        
+        <!-- Logged in state -->
+        <div id="logged-in" class="hidden">
+          <div class="user-info">
+            <div>
+              <span>Logged in as:</span>
+              <span class="email" id="user-email"></span>
+            </div>
+            <button id="btn-logout" class="btn btn-secondary">Logout</button>
+          </div>
+          <p class="message info">✓ You're logged in! Go to the Bridge tab to start automation.</p>
         </div>
       </div>
-    </header>
-
-    <!-- Main Content -->
-    <main class="main-content">
-      <!-- Sidebar -->
-      <aside class="sidebar">
-        <nav class="nav-tabs">
-          <button class="nav-tab active" data-tab="dashboard">📊 Dashboard</button>
-          <button class="nav-tab" data-tab="tasks">📋 Tasks</button>
-          <button class="nav-tab" data-tab="settings">⚙️ Settings</button>
-        </nav>
-      </aside>
-
-      <!-- Content Area -->
-      <div class="content-area">
-        <!-- Dashboard Tab -->
-        <section class="tab-content active" id="tab-dashboard">
-          <div class="dashboard-grid">
-            
-            <!-- Auth Panel -->
-            <div class="card auth-panel" id="auth-panel">
-              <h2>🔐 Account</h2>
-              
-              <!-- Login Form (shown when logged out) -->
-              <div id="login-section">
-                <form id="login-form">
-                  <div class="form-group">
-                    <label for="login-email">Email</label>
-                    <input type="email" id="login-email" placeholder="your@email.com" required />
-                  </div>
-                  <div class="form-group">
-                    <label for="login-password">Password</label>
-                    <input type="password" id="login-password" placeholder="••••••••" required />
-                  </div>
-                  <div class="form-actions">
-                    <button type="submit" class="btn btn-primary">🔓 Login</button>
-                    <span class="login-error" id="login-error"></span>
-                  </div>
-                </form>
-                <p class="auth-hint">Usa le stesse credenziali della tua web app.</p>
-              </div>
-              
-              <!-- User Info (shown when logged in) -->
-              <div id="user-section" style="display: none;">
-                <div class="user-info">
-                  <span class="user-avatar">👤</span>
-                  <div class="user-details">
-                    <span class="user-email" id="user-email">-</span>
-                    <span class="user-status">✅ Logged in</span>
-                  </div>
-                </div>
-                <button class="btn btn-secondary" id="btn-logout">🚪 Logout</button>
-              </div>
-            </div>
-
-            <!-- Control Panel -->
-            <div class="card control-panel">
-              <h2>Control Panel</h2>
-              <div class="control-buttons">
-                <button class="btn btn-primary btn-large" id="btn-start" disabled>
-                  ▶️ Start Bridge
-                </button>
-                <button class="btn btn-warning" id="btn-pause" disabled>
-                  ⏸️ Pause
-                </button>
-                <button class="btn btn-danger" id="btn-stop" disabled>
-                  ⏹️ Stop
-                </button>
-              </div>
-              <div class="connection-info" id="connection-info">
-                <p>Login to start receiving tasks</p>
-              </div>
-            </div>
-
-            <!-- Current Task -->
-            <div class="card current-task">
-              <h2>Current Task</h2>
-              <div id="current-task-content">
-                <p class="empty-state">No active task</p>
-              </div>
-            </div>
-
-            <!-- Current Step -->
-            <div class="card current-step">
-              <h2>Current Step</h2>
-              <div id="current-step-content">
-                <p class="empty-state">Waiting for task...</p>
-              </div>
-              <div class="step-progress" id="step-progress" style="display: none;">
-                <div class="progress-bar">
-                  <div class="progress-fill" id="progress-fill"></div>
-                </div>
-                <span class="progress-text" id="progress-text">0%</span>
-              </div>
-            </div>
-
-            <!-- Screenshot Preview -->
-            <div class="card screenshot-preview">
-              <h2>Browser View</h2>
-              <div class="screenshot-container" id="screenshot-container">
-                <p class="empty-state">No screenshot available</p>
-              </div>
-            </div>
+    </div>
+    
+    <!-- Bridge Page -->
+    <div id="page-bridge" class="page">
+      <div class="card">
+        <h2><span class="icon">🌉</span> Bridge Status</h2>
+        
+        <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px;">
+          <div class="status-badge offline" id="bridge-status">
+            <span class="status-dot"></span>
+            <span>Offline</span>
           </div>
-
-          <!-- Log Panel -->
-          <div class="card log-panel">
-            <div class="log-header">
-              <h2>📜 Activity Log</h2>
-              <button class="btn btn-small" id="btn-clear-log">Clear</button>
-            </div>
-            <div class="log-container" id="log-container">
-              <p class="log-entry log-info">Welcome to Architect's Hand Bridge</p>
-            </div>
+          
+          <div class="btn-group">
+            <button id="btn-start-bridge" class="btn btn-success">Start Bridge</button>
+            <button id="btn-stop-bridge" class="btn btn-danger hidden">Stop Bridge</button>
+            <button id="btn-pause-bridge" class="btn btn-secondary hidden">Pause</button>
+            <button id="btn-resume-bridge" class="btn btn-primary hidden">Resume</button>
           </div>
-        </section>
-
-        <!-- Tasks Tab -->
-        <section class="tab-content" id="tab-tasks">
-          <div class="card">
-            <h2>Task Queue</h2>
-            <div class="task-list" id="task-list">
-              <p class="empty-state">No tasks in queue</p>
-            </div>
+        </div>
+        
+        <div id="current-task" class="hidden">
+          <h3 style="font-size: 14px; color: #888; margin-bottom: 10px;">Current Task</h3>
+          <div style="background: rgba(79, 70, 229, 0.2); padding: 15px; border-radius: 8px;">
+            <p id="task-description" style="color: #a5b4fc;"></p>
+            <p id="task-progress" style="color: #888; font-size: 12px; margin-top: 5px;"></p>
           </div>
-        </section>
-
-        <!-- Settings Tab -->
-        <section class="tab-content" id="tab-settings">
-          <div class="card settings-card">
-            <h2>🔑 API Configuration</h2>
-            <form id="settings-form">
-              <div class="form-group">
-                <label for="supabase-url">Supabase URL</label>
-                <input type="text" id="supabase-url" placeholder="https://your-project.supabase.co" />
-              </div>
-              
-              <div class="form-group">
-                <label for="supabase-key">Supabase Anon Key</label>
-                <input type="password" id="supabase-key" placeholder="eyJhbGciOiJIUzI1NiIs..." />
-                <small>ℹ️ Public anon key (safe to use client-side)</small>
-              </div>
-              
-              <div class="form-group">
-                <label for="openagi-key">OpenAGI (Lux) API Key</label>
-                <input type="password" id="openagi-key" placeholder="sk-..." />
-                <small>⚠️ This key stays on your PC only</small>
-              </div>
-
-              <div class="form-divider"></div>
-
-              <h2>📁 Default Folders</h2>
-              
-              <div class="form-group">
-                <label>Output Folder (for downloaded files)</label>
-                <div class="folder-input">
-                  <input type="text" id="output-folder" readonly placeholder="Click to select..." />
-                  <button type="button" class="btn" id="btn-select-output">Browse</button>
-                </div>
-              </div>
-
-              <div class="form-actions">
-                <button type="submit" class="btn btn-primary">💾 Save Settings</button>
-                <span class="save-status" id="save-status"></span>
-              </div>
-            </form>
-          </div>
-        </section>
+        </div>
       </div>
-    </main>
+      
+      <div class="card">
+        <h2><span class="icon">📋</span> Logs</h2>
+        <div class="logs-container" id="logs">
+          <div class="log-entry INFO">Waiting to start...</div>
+        </div>
+      </div>
+    </div>
+    
+    <!-- Settings Page -->
+    <div id="page-settings" class="page">
+      <div class="card">
+        <h2><span class="icon">🔧</span> Supabase Configuration</h2>
+        
+        <div class="form-group">
+          <label for="supabase-url">Supabase URL</label>
+          <input type="url" id="supabase-url" placeholder="https://your-project.supabase.co">
+        </div>
+        
+        <div class="form-group">
+          <label for="supabase-key">Supabase Anon Key</label>
+          <input type="password" id="supabase-key" placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...">
+        </div>
+      </div>
+      
+      <div class="card">
+        <h2><span class="icon">🤖</span> OpenAGI Configuration</h2>
+        
+        <div class="form-group">
+          <label for="openagi-key">OpenAGI API Key</label>
+          <input type="password" id="openagi-key" placeholder="your-openagi-api-key">
+        </div>
+      </div>
+      
+      <div class="card">
+        <h2><span class="icon">⚙️</span> Options</h2>
+        
+        <div class="form-group checkbox">
+          <input type="checkbox" id="auto-start-bridge">
+          <label for="auto-start-bridge">Auto-start bridge on login</label>
+        </div>
+      </div>
+      
+      <div id="settings-message"></div>
+      
+      <div class="btn-group">
+        <button id="btn-save-settings" class="btn btn-primary">Save Settings</button>
+        <button id="btn-test-connection" class="btn btn-secondary">Test Connection</button>
+      </div>
+    </div>
   </div>
-
-  <script src="renderer.js"></script>
+  
+  <script>
+    // ==========================================
+    // STATE
+    // ==========================================
+    let currentUser = null;
+    let bridgeStatus = 'offline';
+    let logs = [];
+    
+    // ==========================================
+    // DOM ELEMENTS
+    // ==========================================
+    const elements = {
+      // Tabs
+      tabs: document.querySelectorAll('.tab'),
+      pages: document.querySelectorAll('.page'),
+      
+      // Login
+      email: document.getElementById('email'),
+      password: document.getElementById('password'),
+      rememberMe: document.getElementById('remember-me'),
+      btnLogin: document.getElementById('btn-login'),
+      btnLogout: document.getElementById('btn-logout'),
+      loginForm: document.getElementById('login-form'),
+      loggedIn: document.getElementById('logged-in'),
+      userEmail: document.getElementById('user-email'),
+      loginMessage: document.getElementById('login-message'),
+      
+      // Bridge
+      bridgeStatus: document.getElementById('bridge-status'),
+      btnStartBridge: document.getElementById('btn-start-bridge'),
+      btnStopBridge: document.getElementById('btn-stop-bridge'),
+      btnPauseBridge: document.getElementById('btn-pause-bridge'),
+      btnResumeBridge: document.getElementById('btn-resume-bridge'),
+      currentTask: document.getElementById('current-task'),
+      taskDescription: document.getElementById('task-description'),
+      taskProgress: document.getElementById('task-progress'),
+      logs: document.getElementById('logs'),
+      
+      // Settings
+      supabaseUrl: document.getElementById('supabase-url'),
+      supabaseKey: document.getElementById('supabase-key'),
+      openagiKey: document.getElementById('openagi-key'),
+      autoStartBridge: document.getElementById('auto-start-bridge'),
+      btnSaveSettings: document.getElementById('btn-save-settings'),
+      btnTestConnection: document.getElementById('btn-test-connection'),
+      settingsMessage: document.getElementById('settings-message')
+    };
+    
+    // ==========================================
+    // TABS
+    // ==========================================
+    elements.tabs.forEach(tab => {
+      tab.addEventListener('click', () => {
+        const pageName = tab.dataset.page;
+        
+        // Update tabs
+        elements.tabs.forEach(t => t.classList.remove('active'));
+        tab.classList.add('active');
+        
+        // Update pages
+        elements.pages.forEach(p => p.classList.remove('active'));
+        document.getElementById(`page-${pageName}`).classList.add('active');
+      });
+    });
+    
+    // ==========================================
+    // LOGIN
+    // ==========================================
+    elements.btnLogin.addEventListener('click', async () => {
+      const email = elements.email.value.trim();
+      const password = elements.password.value;
+      const rememberMe = elements.rememberMe.checked;
+      
+      if (!email || !password) {
+        showMessage('login', 'Please enter email and password', 'error');
+        return;
+      }
+      
+      setLoading('login', true);
+      
+      try {
+        const result = await window.api.login(email, password, rememberMe);
+        
+        if (result.success) {
+          currentUser = result.user;
+          showLoggedInState();
+          showMessage('login', 'Login successful!', 'success');
+          
+          // Switch to Bridge tab
+          setTimeout(() => {
+            document.querySelector('.tab[data-page="bridge"]').click();
+          }, 500);
+        } else {
+          showMessage('login', result.error || 'Login failed', 'error');
+        }
+      } catch (e) {
+        showMessage('login', e.message, 'error');
+      } finally {
+        setLoading('login', false);
+      }
+    });
+    
+    elements.btnLogout.addEventListener('click', async () => {
+      await window.api.logout();
+      currentUser = null;
+      showLoggedOutState();
+      
+      // Optionally clear credentials
+      // await window.api.clearCredentials();
+    });
+    
+    // Enter key to login
+    elements.password.addEventListener('keypress', (e) => {
+      if (e.key === 'Enter') {
+        elements.btnLogin.click();
+      }
+    });
+    
+    function showLoggedInState() {
+      elements.loginForm.classList.add('hidden');
+      elements.loggedIn.classList.remove('hidden');
+      elements.userEmail.textContent = currentUser?.email || '';
+    }
+    
+    function showLoggedOutState() {
+      elements.loginForm.classList.remove('hidden');
+      elements.loggedIn.classList.add('hidden');
+      elements.loginMessage.innerHTML = '';
+    }
+    
+    // ==========================================
+    // BRIDGE
+    // ==========================================
+    elements.btnStartBridge.addEventListener('click', async () => {
+      const result = await window.api.startBridge();
+      if (!result.success) {
+        addLog('ERROR', result.error);
+      }
+    });
+    
+    elements.btnStopBridge.addEventListener('click', async () => {
+      await window.api.stopBridge();
+    });
+    
+    elements.btnPauseBridge.addEventListener('click', async () => {
+      await window.api.pauseBridge();
+    });
+    
+    elements.btnResumeBridge.addEventListener('click', async () => {
+      await window.api.resumeBridge();
+    });
+    
+    function updateBridgeStatus(status) {
+      bridgeStatus = status;
+      const badge = elements.bridgeStatus;
+      
+      badge.className = 'status-badge ' + status;
+      badge.querySelector('span:last-child').textContent = 
+        status.charAt(0).toUpperCase() + status.slice(1);
+      
+      // Update buttons
+      if (status === 'offline' || status === 'stopped') {
+        elements.btnStartBridge.classList.remove('hidden');
+        elements.btnStopBridge.classList.add('hidden');
+        elements.btnPauseBridge.classList.add('hidden');
+        elements.btnResumeBridge.classList.add('hidden');
+      } else if (status === 'running') {
+        elements.btnStartBridge.classList.add('hidden');
+        elements.btnStopBridge.classList.remove('hidden');
+        elements.btnPauseBridge.classList.remove('hidden');
+        elements.btnResumeBridge.classList.add('hidden');
+      } else if (status === 'paused') {
+        elements.btnStartBridge.classList.add('hidden');
+        elements.btnStopBridge.classList.remove('hidden');
+        elements.btnPauseBridge.classList.add('hidden');
+        elements.btnResumeBridge.classList.remove('hidden');
+      }
+    }
+    
+    function addLog(level, message) {
+      const entry = document.createElement('div');
+      entry.className = 'log-entry ' + level;
+      entry.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
+      elements.logs.appendChild(entry);
+      elements.logs.scrollTop = elements.logs.scrollHeight;
+      
+      // Keep only last 100 logs
+      while (elements.logs.children.length > 100) {
+        elements.logs.removeChild(elements.logs.firstChild);
+      }
+    }
+    
+    // ==========================================
+    // SETTINGS
+    // ==========================================
+    elements.btnSaveSettings.addEventListener('click', async () => {
+      const config = {
+        supabaseUrl: elements.supabaseUrl.value.trim(),
+        supabaseAnonKey: elements.supabaseKey.value.trim(),
+        openAgiApiKey: elements.openagiKey.value.trim(),
+        autoStartBridge: elements.autoStartBridge.checked
+      };
+      
+      try {
+        await window.api.saveConfig(config);
+        showMessage('settings', 'Settings saved successfully!', 'success');
+      } catch (e) {
+        showMessage('settings', 'Failed to save settings: ' + e.message, 'error');
+      }
+    });
+    
+    elements.btnTestConnection.addEventListener('click', async () => {
+      showMessage('settings', 'Testing connection...', 'info');
+      
+      // Test by checking if we can get user (requires valid Supabase config)
+      try {
+        const result = await window.api.isConfigured();
+        
+        let msg = [];
+        if (result.supabase) msg.push('✓ Supabase configured');
+        else msg.push('✗ Supabase not configured');
+        
+        if (result.openAgi) msg.push('✓ OpenAGI configured');
+        else msg.push('✗ OpenAGI not configured');
+        
+        showMessage('settings', msg.join('<br>'), result.complete ? 'success' : 'info');
+      } catch (e) {
+        showMessage('settings', 'Connection test failed: ' + e.message, 'error');
+      }
+    });
+    
+    // ==========================================
+    // HELPERS
+    // ==========================================
+    function showMessage(section, text, type = 'info') {
+      const el = section === 'login' ? elements.loginMessage : elements.settingsMessage;
+      el.innerHTML = `<div class="message ${type}">${text}</div>`;
+      
+      // Auto-hide success messages
+      if (type === 'success') {
+        setTimeout(() => el.innerHTML = '', 3000);
+      }
+    }
+    
+    function setLoading(section, loading) {
+      if (section === 'login') {
+        elements.btnLogin.disabled = loading;
+        elements.btnLogin.querySelector('.btn-text').classList.toggle('hidden', loading);
+        elements.btnLogin.querySelector('.loading').classList.toggle('hidden', !loading);
+      }
+    }
+    
+    // ==========================================
+    // EVENT LISTENERS (from main process)
+    // ==========================================
+    window.api.onBridgeLog(({ level, message }) => {
+      addLog(level, message);
+    });
+    
+    window.api.onBridgeStatus((status) => {
+      updateBridgeStatus(status);
+    });
+    
+    window.api.onTaskUpdate((task) => {
+      if (task) {
+        elements.currentTask.classList.remove('hidden');
+        elements.taskDescription.textContent = task.task_description;
+        elements.taskProgress.textContent = `Mode: ${task.lux_mode || 'actor'} | Status: ${task.status}`;
+      } else {
+        elements.currentTask.classList.add('hidden');
+      }
+    });
+    
+    window.api.onStepUpdate((step) => {
+      if (step) {
+        elements.taskProgress.textContent = 
+          `Step ${step.current}/${step.total}: ${step.description}`;
+      }
+    });
+    
+    // ==========================================
+    // INITIALIZATION
+    // ==========================================
+    async function init() {
+      console.log('Initializing app...');
+      
+      // Load saved config and auto-populate fields
+      try {
+        const config = await window.api.getConfig();
+        console.log('Config loaded:', { 
+          hasEmail: !!config.email, 
+          hasPassword: !!config.password,
+          rememberMe: config.rememberMe 
+        });
+        
+        // Populate login fields
+        if (config.email) {
+          elements.email.value = config.email;
+        }
+        if (config.password) {
+          elements.password.value = config.password;
+        }
+        elements.rememberMe.checked = config.rememberMe !== false;
+        
+        // Populate settings fields
+        if (config.supabaseUrl) {
+          elements.supabaseUrl.value = config.supabaseUrl;
+        }
+        if (config.supabaseAnonKey) {
+          elements.supabaseKey.value = config.supabaseAnonKey;
+        }
+        if (config.openAgiApiKey) {
+          elements.openagiKey.value = config.openAgiApiKey;
+        }
+        elements.autoStartBridge.checked = config.autoStartBridge || false;
+        
+        // Try auto-login if credentials are saved
+        if (config.email && config.password && config.rememberMe) {
+          console.log('Attempting auto-login...');
+          showMessage('login', 'Logging in...', 'info');
+          
+          const result = await window.api.autoLogin();
+          
+          if (result.success) {
+            currentUser = result.user;
+            showLoggedInState();
+            showMessage('login', 'Welcome back!', 'success');
+            
+            // Auto-start bridge if enabled
+            if (config.autoStartBridge) {
+              setTimeout(() => {
+                document.querySelector('.tab[data-page="bridge"]').click();
+                window.api.startBridge();
+              }, 500);
+            }
+          } else {
+            console.log('Auto-login failed:', result.error);
+            elements.loginMessage.innerHTML = '';
+          }
+        }
+      } catch (e) {
+        console.error('Init error:', e);
+      }
+      
+      // Check if settings are configured
+      const configured = await window.api.isConfigured();
+      if (!configured.supabase) {
+        showMessage('login', 'Please configure Supabase in Settings first.', 'info');
+      }
+    }
+    
+    // Run init when DOM is ready
+    init();
+  </script>
 </body>
 </html>
