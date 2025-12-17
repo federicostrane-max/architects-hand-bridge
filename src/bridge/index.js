@@ -1,7 +1,7 @@
 /**
  * Architect's Hand Bridge - Main Entry Point
  * Routes tasks to appropriate executor based on lux_mode
- * Compatible with main.js interface
+ * v3.2 - Added window minimize/restore for Lux execution
  */
 
 const supabaseClient = require('./supabase-client');
@@ -22,7 +22,9 @@ class Bridge {
       sendStatus: null,
       sendTaskUpdate: null,
       sendStepUpdate: null,
-      sendScreenshot: null
+      sendScreenshot: null,
+      minimizeWindow: null,
+      restoreWindow: null
     };
   }
 
@@ -225,6 +227,16 @@ class Bridge {
       // Update status to running
       await this.updateTaskStatus(task.id, 'running');
 
+      // ================================================
+      // MINIMIZE WINDOW BEFORE LUX EXECUTION
+      // ================================================
+      if (this.callbacks.minimizeWindow) {
+        this.log('INFO', 'Minimizing window for Lux execution...');
+        this.callbacks.minimizeWindow();
+        // Wait for minimize animation
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
+
       // Route based on lux_mode
       let success = false;
       const luxMode = task.lux_mode || 'actor';
@@ -255,6 +267,14 @@ class Bridge {
         error_message: error.message
       });
     } finally {
+      // ================================================
+      // RESTORE WINDOW AFTER LUX EXECUTION
+      // ================================================
+      if (this.callbacks.restoreWindow) {
+        this.log('INFO', 'Restoring window after Lux execution...');
+        this.callbacks.restoreWindow();
+      }
+      
       this.currentTask = null;
       if (this.callbacks.sendTaskUpdate) {
         this.callbacks.sendTaskUpdate(null);
@@ -300,10 +320,13 @@ class Bridge {
       model: task.lux_model || 'lux-actor-1',
       maxSteps: task.max_steps || 20,
       temperature: task.temperature || 0.1,
-      startUrl: task.start_url
+      startUrl: task.start_url  // Python service will open browser with this URL
     };
 
     this.log('INFO', `[Actor] Model: ${params.model}, Max Steps: ${params.maxSteps}`);
+    if (params.startUrl) {
+      this.log('INFO', `[Actor] Start URL: ${params.startUrl}`);
+    }
 
     const result = await luxClient.executeDirectTask(params);
 
@@ -325,6 +348,9 @@ class Bridge {
     };
 
     this.log('INFO', `[Thinker] Model: ${params.model}, Max Steps: ${params.maxSteps}`);
+    if (params.startUrl) {
+      this.log('INFO', `[Thinker] Start URL: ${params.startUrl}`);
+    }
 
     const result = await luxClient.executeDirectTask(params);
 
@@ -418,6 +444,10 @@ class Bridge {
     };
 
     this.log('INFO', '[Tasker] Delegating to Tasker Service...');
+    if (params.startUrl) {
+      this.log('INFO', `[Tasker] Start URL: ${params.startUrl}`);
+    }
+    
     const result = await luxClient.executeTaskerTask(params);
 
     this.log('INFO', `[Tasker] Completed ${result.completedTodos}/${result.totalTodos} todos`);
@@ -434,6 +464,11 @@ class Bridge {
     if (this.currentTask && this.currentTask.id === taskId) {
       await luxClient.stopTask();
       this.currentTask = null;
+      
+      // Restore window if it was minimized
+      if (this.callbacks.restoreWindow) {
+        this.callbacks.restoreWindow();
+      }
     }
 
     if (this.supabase) {
