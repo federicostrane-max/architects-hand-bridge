@@ -26,10 +26,15 @@ class LuxClient {
    */
   async checkTaskerService() {
     try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 2000);
+      
       const response = await fetch(`${this.taskerServiceUrl}/status`, {
         method: 'GET',
-        timeout: 2000
+        signal: controller.signal
       });
+      
+      clearTimeout(timeout);
 
       if (response.ok) {
         const data = await response.json();
@@ -66,6 +71,9 @@ class LuxClient {
 
     console.log(`[Lux] Executing direct task with model: ${model}`);
     console.log(`[Lux] Instruction: ${instruction}`);
+    if (startUrl) {
+      console.log(`[Lux] Start URL: ${startUrl}`);
+    }
 
     try {
       // For direct tasks, we send a single todo with the full instruction
@@ -84,8 +92,7 @@ class LuxClient {
           model: model,
           temperature: temperature,
           mode: 'direct' // Flag for direct execution
-        }),
-        timeout: 600000 // 10 minutes timeout
+        })
       });
 
       if (!response.ok) {
@@ -132,6 +139,9 @@ class LuxClient {
     console.log('[Lux] Delegating task to Python Tasker Service...');
     console.log(`[Lux] Task: ${taskDescription}`);
     console.log(`[Lux] Todos: ${todos.length}`);
+    if (startUrl) {
+      console.log(`[Lux] Start URL: ${startUrl}`);
+    }
 
     try {
       // Notify start of first todo
@@ -156,8 +166,7 @@ class LuxClient {
           model: model,
           temperature: temperature,
           mode: 'tasker'
-        }),
-        timeout: 600000 // 10 minutes timeout
+        })
       });
 
       console.log('[Lux] Tasker Service response received');
