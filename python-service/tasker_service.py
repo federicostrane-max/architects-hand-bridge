@@ -2,7 +2,7 @@
 Tasker Service - FastAPI wrapper for OAGI
 Supports all three Lux modes: Actor, Thinker, and Tasker
 Runs locally and receives requests from Architect's Hand Bridge
-v2.5 - Auto browser launch with start_url
+v2.6 - Opens Chrome in NEW WINDOW for clean environment
 """
 
 import asyncio
@@ -55,7 +55,7 @@ class TaskResponse(BaseModel):
 class StatusResponse(BaseModel):
     status: str
     oagi_available: bool
-    version: str = "2.5.0"
+    version: str = "2.6.0"
 
 
 # Global state
@@ -79,7 +79,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Tasker Service",
     description="Local service for OAGI execution (Actor/Thinker/Tasker modes)",
-    version="2.5.0",
+    version="2.6.0",
     lifespan=lifespan
 )
 
@@ -94,7 +94,7 @@ app.add_middleware(
 
 
 def open_browser_with_url(url: str):
-    """Open browser with specified URL and wait for it to load"""
+    """Open browser with specified URL in a NEW WINDOW and wait for it to load"""
     print(f"\n>>> Opening browser with URL: {url}")
     
     # Try to open Chrome specifically, fallback to default browser
@@ -108,10 +108,19 @@ def open_browser_with_url(url: str):
     for chrome_path in chrome_paths:
         if os.path.exists(chrome_path):
             try:
-                # Open Chrome with the URL, maximized
-                subprocess.Popen([chrome_path, "--start-maximized", url])
+                # Open Chrome in a NEW WINDOW (clean, no other tabs)
+                # --new-window: Opens in a new window
+                # --start-maximized: Maximizes the window
+                # --disable-session-crashed-bubble: Prevents "restore pages" popup
+                subprocess.Popen([
+                    chrome_path,
+                    "--new-window",
+                    "--start-maximized",
+                    "--disable-session-crashed-bubble",
+                    url
+                ])
                 chrome_opened = True
-                print(f">>> Chrome opened from: {chrome_path}")
+                print(f">>> Chrome opened in NEW WINDOW from: {chrome_path}")
                 break
             except Exception as e:
                 print(f">>> Failed to open Chrome from {chrome_path}: {e}")
@@ -124,6 +133,15 @@ def open_browser_with_url(url: str):
     # Wait for browser to open and load
     print(">>> Waiting 3 seconds for browser to load...")
     time.sleep(3)
+    
+    # Bring the new window to front using pyautogui
+    try:
+        # Press Alt+Tab to ensure the new window is focused
+        pyautogui.hotkey('alt', 'tab')
+        time.sleep(0.5)
+    except:
+        pass
+    
     print(">>> Browser should be ready\n")
 
 
@@ -443,10 +461,10 @@ async def root():
     """Root endpoint with service info"""
     return {
         "service": "Tasker Service",
-        "version": "2.5.0",
+        "version": "2.6.0",
         "oagi_available": OAGI_AVAILABLE,
         "supported_modes": ["actor", "thinker", "tasker", "direct"],
-        "features": ["auto_browser_launch"],
+        "features": ["auto_browser_launch", "new_window_mode"],
         "endpoints": [
             "GET /status - Check service status",
             "POST /execute - Execute a task",
@@ -459,9 +477,9 @@ if __name__ == "__main__":
     import uvicorn
     
     print("\n" + "=" * 50)
-    print("  TASKER SERVICE v2.5")
+    print("  TASKER SERVICE v2.6")
     print("  Supports: Actor | Thinker | Tasker modes")
-    print("  + Auto browser launch with start_url")
+    print("  + Opens Chrome in NEW WINDOW (clean env)")
     print("=" * 50 + "\n")
     
     uvicorn.run(
