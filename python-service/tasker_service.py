@@ -2,7 +2,7 @@
 Tasker Service - FastAPI wrapper for OAGI
 Supports all three Lux modes: Actor, Thinker, and Tasker
 Runs locally and receives requests from Architect's Hand Bridge
-v2.6 - Opens Chrome in NEW WINDOW for clean environment
+v3.0 - Uses DEDICATED Chrome profile (separate from user's browser)
 """
 
 import asyncio
@@ -55,7 +55,7 @@ class TaskResponse(BaseModel):
 class StatusResponse(BaseModel):
     status: str
     oagi_available: bool
-    version: str = "2.6.0"
+    version: str = "3.0.0"
 
 
 # Global state
@@ -79,7 +79,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Tasker Service",
     description="Local service for OAGI execution (Actor/Thinker/Tasker modes)",
-    version="2.6.0",
+    version="3.0.0",
     lifespan=lifespan
 )
 
@@ -94,55 +94,97 @@ app.add_middleware(
 
 
 def open_browser_with_url(url: str):
-    """Open browser with specified URL in a NEW WINDOW and wait for it to load"""
+    """Open Chrome with DEDICATED PROFILE for Lux (separate from user's browser)"""
     print(f"\n>>> Opening browser with URL: {url}")
     
-    # Try to open Chrome specifically, fallback to default browser
-    chrome_paths = [
-        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-        os.path.expanduser(r"~\AppData\Local\Google\Chrome\Application\chrome.exe"),
-    ]
+    import platform
+    system = platform.system()
     
-    chrome_opened = False
-    for chrome_path in chrome_paths:
-        if os.path.exists(chrome_path):
-            try:
-                # Open Chrome in a NEW WINDOW (clean, no other tabs)
-                # --new-window: Opens in a new window
-                # --start-maximized: Maximizes the window
-                # --disable-session-crashed-bubble: Prevents "restore pages" popup
-                subprocess.Popen([
-                    chrome_path,
-                    "--new-window",
-                    "--start-maximized",
-                    "--disable-session-crashed-bubble",
-                    url
-                ])
-                chrome_opened = True
-                print(f">>> Chrome opened in NEW WINDOW from: {chrome_path}")
-                break
-            except Exception as e:
-                print(f">>> Failed to open Chrome from {chrome_path}: {e}")
-    
-    if not chrome_opened:
-        # Fallback to default browser
-        print(">>> Chrome not found, using default browser")
-        webbrowser.open(url)
+    if system == "Windows":
+        # Use dedicated profile so Lux Chrome is SEPARATE from user's Chrome
+        chrome_path = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+        
+        # Alternative paths
+        if not os.path.exists(chrome_path):
+            chrome_path = r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
+        if not os.path.exists(chrome_path):
+            chrome_path = os.path.expanduser(r"~\AppData\Local\Google\Chrome\Application\chrome.exe")
+        
+        # Lux dedicated profile path
+        lux_profile_path = os.path.join(
+            os.path.expanduser("~"),
+            "AppData", "Local", "Google", "Chrome", "User Data", "LuxProfile"
+        )
+        
+        try:
+            # Launch Chrome with:
+            # --user-data-dir: Dedicated profile (SEPARATE instance from user's Chrome)
+            # --remote-debugging-port: For potential CDP connection
+            # --start-maximized: Full screen
+            # --new-window: New window
+            # --no-first-run: Skip first run dialogs
+            # --no-default-browser-check: Skip default browser prompt
+            process = subprocess.Popen([
+                chrome_path,
+                f"--user-data-dir={lux_profile_path}",
+                "--remote-debugging-port=9222",
+                "--start-maximized",
+                "--new-window",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-session-crashed-bubble",
+                url
+            ], 
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+            )
+            print(f">>> Chrome launched with DEDICATED Lux profile")
+            print(f">>> Profile: {lux_profile_path}")
+            print(f">>> PID: {process.pid}")
+        except Exception as e:
+            print(f">>> Chrome launch failed: {e}, trying webbrowser")
+            webbrowser.open(url)
+    else:
+        # macOS/Linux
+        chrome_paths = [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/usr/bin/google-chrome",
+            "/usr/bin/chromium-browser",
+        ]
+        
+        # Lux profile for non-Windows
+        lux_profile_path = os.path.expanduser("~/.config/google-chrome-lux")
+        
+        chrome_opened = False
+        for chrome_path in chrome_paths:
+            if os.path.exists(chrome_path):
+                try:
+                    subprocess.Popen([
+                        chrome_path,
+                        f"--user-data-dir={lux_profile_path}",
+                        "--remote-debugging-port=9222",
+                        "--start-maximized",
+                        "--new-window",
+                        url
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                    )
+                    chrome_opened = True
+                    print(f">>> Chrome opened with Lux profile from: {chrome_path}")
+                    break
+                except Exception as e:
+                    print(f">>> Failed: {e}")
+        
+        if not chrome_opened:
+            print(">>> Using default browser")
+            webbrowser.open(url)
     
     # Wait for browser to open and load
-    print(">>> Waiting 3 seconds for browser to load...")
-    time.sleep(3)
+    print(">>> Waiting 4 seconds for browser to load...")
+    time.sleep(4)
     
-    # Bring the new window to front using pyautogui
-    try:
-        # Press Alt+Tab to ensure the new window is focused
-        pyautogui.hotkey('alt', 'tab')
-        time.sleep(0.5)
-    except:
-        pass
-    
-    print(">>> Browser should be ready\n")
+    print(">>> Browser ready - Lux can now see ONLY this page\n")
 
 
 def take_screenshot_bytes():
@@ -192,13 +234,46 @@ def execute_action(action):
             pyautogui.press(argument.lower())
     
     elif action_type == 'scroll':
-        # Argument is scroll amount
+        # Handle multiple scroll formats:
+        # Format 1: "421,476,up" or "421,476,down" (x, y, direction)
+        # Format 2: "-3" or "3" (scroll amount)
         try:
-            amount = int(argument) if argument else 0
-            print(f"  -> Scrolling: {amount}")
-            pyautogui.scroll(amount)
-        except:
-            print(f"  -> Scroll error")
+            parts = argument.replace(' ', '').split(',')
+            if len(parts) >= 3:
+                # Format: x, y, direction
+                x = int(parts[0])
+                y = int(parts[1])
+                direction = parts[2].lower()
+                amount = 3 if direction == 'up' else -3
+                print(f"  -> Scrolling {direction} at ({x}, {y})")
+                pyautogui.moveTo(x, y)
+                pyautogui.scroll(amount)
+            elif len(parts) == 1:
+                # Format: just amount
+                amount = int(argument) if argument else 0
+                print(f"  -> Scrolling: {amount}")
+                pyautogui.scroll(amount)
+            else:
+                print(f"  -> Unknown scroll format: {argument}")
+        except Exception as e:
+            print(f"  -> Scroll error: {e}")
+    
+    elif action_type == 'drag':
+        # Format: "startX, startY, endX, endY"
+        try:
+            parts = argument.replace(' ', '').split(',')
+            if len(parts) >= 4:
+                start_x = int(parts[0])
+                start_y = int(parts[1])
+                end_x = int(parts[2])
+                end_y = int(parts[3])
+                print(f"  -> Dragging from ({start_x}, {start_y}) to ({end_x}, {end_y})")
+                pyautogui.moveTo(start_x, start_y)
+                pyautogui.drag(end_x - start_x, end_y - start_y, duration=0.5)
+            else:
+                print(f"  -> Drag requires 4 coordinates")
+        except Exception as e:
+            print(f"  -> Drag error: {e}")
     
     elif action_type == 'hotkey':
         # Argument is keys separated by +
@@ -461,10 +536,10 @@ async def root():
     """Root endpoint with service info"""
     return {
         "service": "Tasker Service",
-        "version": "2.6.0",
+        "version": "3.0.0",
         "oagi_available": OAGI_AVAILABLE,
         "supported_modes": ["actor", "thinker", "tasker", "direct"],
-        "features": ["auto_browser_launch", "new_window_mode"],
+        "features": ["dedicated_chrome_profile", "scroll_drag_support", "remote_debugging"],
         "endpoints": [
             "GET /status - Check service status",
             "POST /execute - Execute a task",
@@ -477,9 +552,9 @@ if __name__ == "__main__":
     import uvicorn
     
     print("\n" + "=" * 50)
-    print("  TASKER SERVICE v2.6")
+    print("  TASKER SERVICE v3.0")
     print("  Supports: Actor | Thinker | Tasker modes")
-    print("  + Opens Chrome in NEW WINDOW (clean env)")
+    print("  + Dedicated Chrome profile (LuxProfile)")
     print("=" * 50 + "\n")
     
     uvicorn.run(
