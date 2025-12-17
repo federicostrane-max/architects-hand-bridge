@@ -2,7 +2,7 @@
 Tasker Service - FastAPI wrapper for OAGI
 Supports all three Lux modes: Actor, Thinker, and Tasker
 Runs locally and receives requests from Architect's Hand Bridge
-v3.0 - Uses DEDICATED Chrome profile (separate from user's browser)
+v3.2 - Added delays after ALL actions for JavaScript processing
 """
 
 import asyncio
@@ -55,7 +55,7 @@ class TaskResponse(BaseModel):
 class StatusResponse(BaseModel):
     status: str
     oagi_available: bool
-    version: str = "3.0.0"
+    version: str = "3.2.0"
 
 
 # Global state
@@ -79,7 +79,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Tasker Service",
     description="Local service for OAGI execution (Actor/Thinker/Tasker modes)",
-    version="3.0.0",
+    version="3.2.0",
     lifespan=lifespan
 )
 
@@ -196,7 +196,7 @@ def take_screenshot_bytes():
 
 
 def execute_action(action):
-    """Execute a single action using pyautogui"""
+    """Execute a single action using pyautogui with proper delays for web forms"""
     # Get action type - handle both enum and string
     action_type = None
     if hasattr(action, 'type'):
@@ -218,6 +218,9 @@ def execute_action(action):
             y = int(coords[1])
             print(f"  -> Clicking at ({x}, {y})")
             pyautogui.click(x, y)
+            # IMPORTANT: Wait for JavaScript to process click event
+            time.sleep(0.5)
+            print(f"  -> Waited 500ms for JS to process")
         except Exception as e:
             print(f"  -> Click parse error: {e}")
     
@@ -225,13 +228,44 @@ def execute_action(action):
         # Argument is the text to type
         if argument:
             print(f"  -> Typing: {argument}")
-            pyautogui.write(argument, interval=0.02)
+            # Use clipboard paste method - more reliable for web forms
+            try:
+                import pyperclip
+                # Save current clipboard
+                try:
+                    old_clipboard = pyperclip.paste()
+                except:
+                    old_clipboard = ""
+                
+                # Copy text to clipboard and paste
+                pyperclip.copy(argument)
+                time.sleep(0.2)  # Wait before paste
+                pyautogui.hotkey('ctrl', 'v')
+                time.sleep(0.5)  # Wait for text to appear
+                
+                # Restore old clipboard
+                try:
+                    pyperclip.copy(old_clipboard)
+                except:
+                    pass
+                    
+                print(f"  -> Typed via clipboard paste, waited 500ms")
+            except ImportError:
+                # Fallback to typewrite if pyperclip not available
+                print(f"  -> pyperclip not available, using slow typewrite")
+                pyautogui.typewrite(argument, interval=0.15)  # 150ms between chars
+                time.sleep(0.5)
+            except Exception as e:
+                print(f"  -> Clipboard method failed: {e}, using slow typewrite")
+                pyautogui.typewrite(argument, interval=0.15)
+                time.sleep(0.5)
     
     elif action_type == 'key' or action_type == 'press':
         # Argument is the key to press
         if argument:
             print(f"  -> Pressing key: {argument}")
             pyautogui.press(argument.lower())
+            time.sleep(0.3)  # Wait for key action to process
     
     elif action_type == 'scroll':
         # Handle multiple scroll formats:
@@ -255,6 +289,7 @@ def execute_action(action):
                 pyautogui.scroll(amount)
             else:
                 print(f"  -> Unknown scroll format: {argument}")
+            time.sleep(0.5)  # Wait for scroll to complete
         except Exception as e:
             print(f"  -> Scroll error: {e}")
     
@@ -270,6 +305,7 @@ def execute_action(action):
                 print(f"  -> Dragging from ({start_x}, {start_y}) to ({end_x}, {end_y})")
                 pyautogui.moveTo(start_x, start_y)
                 pyautogui.drag(end_x - start_x, end_y - start_y, duration=0.5)
+                time.sleep(0.5)  # Wait for drag to complete
             else:
                 print(f"  -> Drag requires 4 coordinates")
         except Exception as e:
@@ -281,10 +317,20 @@ def execute_action(action):
             keys = [k.strip().lower() for k in argument.split('+')]
             print(f"  -> Hotkey: {keys}")
             pyautogui.hotkey(*keys)
+            time.sleep(0.3)  # Wait for hotkey to process
     
     elif action_type == 'finish':
         print(f"  -> Finish action received")
         return 'finish'
+    
+    elif action_type == 'wait':
+        # Wait/pause action
+        try:
+            wait_time = float(argument) if argument else 1.0
+        except:
+            wait_time = 1.0
+        print(f"  -> Waiting {wait_time} seconds")
+        time.sleep(wait_time)
     
     else:
         print(f"  -> Unknown action type: {action_type}")
@@ -536,10 +582,10 @@ async def root():
     """Root endpoint with service info"""
     return {
         "service": "Tasker Service",
-        "version": "3.0.0",
+        "version": "3.2.0",
         "oagi_available": OAGI_AVAILABLE,
         "supported_modes": ["actor", "thinker", "tasker", "direct"],
-        "features": ["dedicated_chrome_profile", "scroll_drag_support", "remote_debugging"],
+        "features": ["dedicated_chrome_profile", "clipboard_typing", "js_delays", "wait_action"],
         "endpoints": [
             "GET /status - Check service status",
             "POST /execute - Execute a task",
@@ -552,9 +598,9 @@ if __name__ == "__main__":
     import uvicorn
     
     print("\n" + "=" * 50)
-    print("  TASKER SERVICE v3.0")
+    print("  TASKER SERVICE v3.2")
     print("  Supports: Actor | Thinker | Tasker modes")
-    print("  + Dedicated Chrome profile (LuxProfile)")
+    print("  + JS delays + clipboard paste")
     print("=" * 50 + "\n")
     
     uvicorn.run(
