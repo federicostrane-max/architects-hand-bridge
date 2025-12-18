@@ -2,7 +2,7 @@
 Tasker Service - FastAPI wrapper for OAGI
 Supports all three Lux modes: Actor, Thinker, and Tasker
 Runs locally and receives requests from Architect's Hand Bridge
-v3.5 - moveTo + triple-click + 1s delays (95% focus success)
+v3.6 - NO clipboard/Ctrl+V - uses keyboard.write/typewrite/press
 """
 
 import asyncio
@@ -55,7 +55,7 @@ class TaskResponse(BaseModel):
 class StatusResponse(BaseModel):
     status: str
     oagi_available: bool
-    version: str = "3.5.0"
+    version: str = "3.6.0"
 
 
 # Global state
@@ -79,7 +79,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Tasker Service",
     description="Local service for OAGI execution (Actor/Thinker/Tasker modes)",
-    version="3.5.0",
+    version="3.6.0",
     lifespan=lifespan
 )
 
@@ -235,28 +235,45 @@ def execute_action(action):
         # Argument is the text to type
         if argument:
             print(f"  -> Typing: {argument}")
-            # Use clipboard paste - field should have focus from triple-click
-            try:
-                import pyperclip
-                pyperclip.copy(argument)
-                time.sleep(0.2)  # Small delay before paste
-                pyautogui.hotkey('ctrl', 'v')
-                print(f"  -> Pasted via Ctrl+V, waiting 1000ms for rendering")
-                time.sleep(1.0)  # 1000ms delay for DOM update
-            except ImportError:
-                # Fallback to keyboard module
+            # Expert: PyAutoGUI hotkey('ctrl','v') has bugs - use typing methods instead
+            # 3 fallback methods, NO clipboard paste
+            
+            typed = False
+            
+            # Method 1: keyboard.write() - BEST (simulates real typing)
+            if not typed:
                 try:
                     import keyboard
                     keyboard.write(argument, delay=0.1)
-                    print(f"  -> Typed via keyboard module")
-                    time.sleep(1.0)
+                    print(f"  -> Typed via keyboard.write (100ms/char)")
+                    time.sleep(0.5)
+                    typed = True
                 except ImportError:
-                    # Last fallback to pyautogui
-                    pyautogui.write(argument, interval=0.15)
-                    print(f"  -> Typed via pyautogui")
-                    time.sleep(1.0)
-            except Exception as e:
-                print(f"  -> Typing error: {e}")
+                    print(f"  -> keyboard module not available")
+                except Exception as e:
+                    print(f"  -> keyboard.write failed: {e}")
+            
+            # Method 2: pyautogui.typewrite() - KB standard
+            if not typed:
+                try:
+                    pyautogui.typewrite(argument, interval=0.1)
+                    print(f"  -> Typed via pyautogui.typewrite (100ms/char)")
+                    time.sleep(0.5)
+                    typed = True
+                except Exception as e:
+                    print(f"  -> pyautogui.typewrite failed: {e}")
+            
+            # Method 3: Character-by-character - last resort
+            if not typed:
+                try:
+                    for char in argument:
+                        pyautogui.press(char)
+                        time.sleep(0.1)
+                    print(f"  -> Typed char-by-char via pyautogui.press")
+                    time.sleep(0.5)
+                    typed = True
+                except Exception as e:
+                    print(f"  -> char-by-char typing failed: {e}")
     
     elif action_type == 'key' or action_type == 'press':
         # Argument is the key to press
@@ -580,10 +597,10 @@ async def root():
     """Root endpoint with service info"""
     return {
         "service": "Tasker Service",
-        "version": "3.5.0",
+        "version": "3.6.0",
         "oagi_available": OAGI_AVAILABLE,
         "supported_modes": ["actor", "thinker", "tasker", "direct"],
-        "features": ["dedicated_chrome_profile", "moveTo_triple_click", "1s_delays"],
+        "features": ["dedicated_chrome_profile", "keyboard_write", "triple_click"],
         "endpoints": [
             "GET /status - Check service status",
             "POST /execute - Execute a task",
@@ -596,9 +613,9 @@ if __name__ == "__main__":
     import uvicorn
     
     print("\n" + "=" * 50)
-    print("  TASKER SERVICE v3.5")
+    print("  TASKER SERVICE v3.6")
     print("  Supports: Actor | Thinker | Tasker modes")
-    print("  + moveTo + triple-click + 1s delays")
+    print("  + keyboard.write() for typing")
     print("=" * 50 + "\n")
     
     uvicorn.run(
