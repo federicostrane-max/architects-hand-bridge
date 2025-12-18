@@ -2,17 +2,20 @@
 Tasker Service - FastAPI wrapper for OAGI
 Supports all three Lux modes: Actor, Thinker, and Tasker
 Runs locally and receives requests from Architect's Hand Bridge
-v4.0 - KB-Compliant: Windows Unicode SendInput, single click, no delays
+v4.1 - KB-Pure with Debug Logging for Booking.com analysis
 """
 
 import asyncio
 import os
 import io
+import sys
 import webbrowser
 import subprocess
 import time
 from typing import Optional, List
 from contextlib import asynccontextmanager
+from datetime import datetime
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,6 +23,67 @@ from pydantic import BaseModel
 
 # PyAutoGUI for screenshots and actions
 import pyautogui
+
+# Import Windows Unicode handler (KB official)
+WINDOWS_UNICODE_AVAILABLE = False
+typewrite_exact = None
+
+if sys.platform == "win32":
+    try:
+        from _windows import typewrite_exact
+        WINDOWS_UNICODE_AVAILABLE = True
+        print("✅ Windows Unicode handler loaded (KB official)")
+    except ImportError as e:
+        print(f"⚠️ Windows Unicode handler not available: {e}")
+else:
+    print(f"ℹ️ Platform: {sys.platform} - Windows Unicode not applicable")
+
+# === DEBUG LOGGING SYSTEM ===
+DEBUG_LOGS_DIR = Path("debug_logs")
+DEBUG_LOGS_DIR.mkdir(exist_ok=True)
+
+def get_debug_log_path() -> Path:
+    """Generate timestamped debug log file path"""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return DEBUG_LOGS_DIR / f"debug_{timestamp}.log"
+
+# Initialize current debug log file
+current_debug_log = get_debug_log_path()
+print(f"📁 Debug logs directory: {DEBUG_LOGS_DIR.absolute()}")
+
+def debug_log(message: str, level: str = "INFO"):
+    """Write debug message to both console and file."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    log_line = f"[{timestamp}] [{level}] {message}"
+    print(log_line)
+    try:
+        with open(current_debug_log, 'a', encoding='utf-8') as f:
+            f.write(log_line + '\n')
+    except Exception as e:
+        print(f"[ERROR] Failed to write debug log: {e}")
+
+def debug_screenshot(label: str) -> str:
+    """Take screenshot for debug analysis."""
+    try:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        filename = f"screenshot_{label}_{timestamp}.png"
+        filepath = DEBUG_LOGS_DIR / filename
+        screenshot = pyautogui.screenshot()
+        screenshot.save(str(filepath))
+        debug_log(f"Screenshot saved: {filename}", "DEBUG")
+        return str(filepath)
+    except Exception as e:
+        debug_log(f"Screenshot failed: {e}", "ERROR")
+        return ""
+
+def debug_mouse_position() -> tuple:
+    """Get current mouse position for coordinate verification"""
+    try:
+        x, y = pyautogui.position()
+        return (x, y)
+    except Exception as e:
+        debug_log(f"Failed to get mouse position: {e}", "ERROR")
+        return (0, 0)
 
 # OAGI imports - all from main module
 try:
@@ -55,7 +119,7 @@ class TaskResponse(BaseModel):
 class StatusResponse(BaseModel):
     status: str
     oagi_available: bool
-    version: str = "4.0.0"
+    version: str = "4.1.0"
 
 
 # Global state
@@ -79,7 +143,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Tasker Service",
     description="Local service for OAGI execution (Actor/Thinker/Tasker modes)",
-    version="4.0.0",
+    version="4.1.0",
     lifespan=lifespan
 )
 
@@ -217,11 +281,43 @@ def execute_action(action):
             x = int(coords[0])
             y = int(coords[1])
             
-            # KB Standard: Single click, no artificial delays
-            print(f"  -> Clicking at ({x}, {y})")
+            debug_log(f"=== CLICK ACTION START ===", "INFO")
+            debug_log(f"Target coordinates: ({x}, {y})", "INFO")
+            
+            # Screenshot BEFORE click
+            screenshot_before = debug_screenshot("before_click")
+            
+            # Get mouse position before
+            mouse_before = debug_mouse_position()
+            debug_log(f"Mouse position before: {mouse_before}", "DEBUG")
+            
+            # Execute CLICK (KB Pure: single click)
+            start_time = time.time()
             pyautogui.click(x, y)
-            # NO delay - KB doesn't use artificial delays
+            click_duration = time.time() - start_time
+            
+            debug_log(f"Click executed in {click_duration*1000:.2f}ms", "INFO")
+            
+            # Get mouse position after
+            mouse_after = debug_mouse_position()
+            debug_log(f"Mouse position after: {mouse_after}", "DEBUG")
+            
+            # Verify mouse moved to target
+            if mouse_after == (x, y):
+                debug_log(f"✅ Mouse position verified at target", "INFO")
+            else:
+                debug_log(f"⚠️ Mouse position mismatch: expected ({x},{y}), got {mouse_after}", "WARNING")
+            
+            # Small delay for UI response
+            time.sleep(0.1)
+            
+            # Screenshot AFTER click
+            screenshot_after = debug_screenshot("after_click")
+            
+            debug_log(f"=== CLICK ACTION END ===", "INFO")
+            
         except Exception as e:
+            debug_log(f"Click FAILED: {e}", "ERROR")
             print(f"  -> Click parse error: {e}")
     
     elif action_type == 'type':
@@ -230,27 +326,86 @@ def execute_action(action):
             # Remove quotes if present (KB standard)
             text = argument.strip("\"'")
             
-            print(f"  -> Typing: {text}")
+            debug_log(f"=== TYPE ACTION START ===", "INFO")
+            debug_log(f"Text to type: '{text}'", "INFO")
+            debug_log(f"Text length: {len(text)} characters", "INFO")
+            debug_log(f"Windows Unicode available: {WINDOWS_UNICODE_AVAILABLE}", "INFO")
             
-            # KB Official: Platform-specific Unicode handler
-            import sys
-            if sys.platform == "win32":
-                try:
-                    from _windows import typewrite_exact
-                    # Windows: Unicode SendInput (ignores capslock, keyboard layout)
-                    typewrite_exact(text, interval=0.01)  # 10ms between chars (KB standard)
-                    print(f"  -> Typed via Windows Unicode (10ms/char)")
-                except ImportError as e:
-                    print(f"  -> _windows module not found: {e}, using fallback")
+            # Screenshot BEFORE typing
+            screenshot_before = debug_screenshot("before_type")
+            
+            # Get mouse position
+            mouse_pos = debug_mouse_position()
+            debug_log(f"Mouse position: {mouse_pos}", "DEBUG")
+            
+            # Execute TYPE (KB Pure: platform-specific handler)
+            typing_success = False
+            typing_method = "unknown"
+            
+            try:
+                start_time = time.time()
+                
+                if sys.platform == "win32" and WINDOWS_UNICODE_AVAILABLE:
+                    # KB Official: Windows Unicode handler
+                    typing_method = "Windows Unicode (KB official)"
+                    debug_log(f"Using: {typing_method}", "INFO")
+                    
+                    # Type each character with logging
+                    for i, char in enumerate(text):
+                        debug_log(f"Char {i+1}/{len(text)}: '{char}' (U+{ord(char):04X})", "DEBUG")
+                        typewrite_exact(char, interval=0.01)
+                    
+                    typing_success = True
+                else:
+                    # KB Fallback: pyautogui
+                    typing_method = "PyAutoGUI (KB fallback)"
+                    debug_log(f"Using: {typing_method}", "INFO")
                     pyautogui.typewrite(text, interval=0.01)
-                    print(f"  -> Typed via pyautogui fallback (10ms/char)")
-                except Exception as e:
-                    print(f"  -> Windows Unicode failed: {e}, using fallback")
-                    pyautogui.typewrite(text, interval=0.01)
-            else:
-                # macOS/Linux: pyautogui fallback
-                pyautogui.typewrite(text, interval=0.01)
-                print(f"  -> Typed via pyautogui (10ms/char)")
+                    typing_success = True
+                
+                typing_duration = time.time() - start_time
+                debug_log(f"Typing completed in {typing_duration*1000:.2f}ms", "INFO")
+                
+            except Exception as e:
+                debug_log(f"Typing FAILED: {e}", "ERROR")
+                import traceback
+                debug_log(f"Traceback:\n{traceback.format_exc()}", "ERROR")
+            
+            # Small delay for rendering
+            time.sleep(0.2)
+            
+            # Screenshot AFTER typing
+            screenshot_after = debug_screenshot("after_type")
+            
+            # Attempt to verify text presence
+            try:
+                import pyperclip
+                
+                # Select all and copy
+                pyautogui.hotkey('ctrl', 'a')
+                time.sleep(0.05)
+                pyautogui.hotkey('ctrl', 'c')
+                time.sleep(0.05)
+                
+                clipboard_content = pyperclip.paste()
+                debug_log(f"Clipboard content: '{clipboard_content}'", "DEBUG")
+                
+                if text.lower() in clipboard_content.lower():
+                    debug_log(f"✅ TEXT VERIFIED: Found in field", "INFO")
+                else:
+                    debug_log(f"⚠️ TEXT NOT FOUND: Expected '{text}', got '{clipboard_content}'", "WARNING")
+                    debug_log(f"Possible causes:", "WARNING")
+                    debug_log(f"  1. Wrong element focused", "WARNING")
+                    debug_log(f"  2. Field cleared by JavaScript", "WARNING")
+                    debug_log(f"  3. Field inside iFrame", "WARNING")
+                    
+            except Exception as e:
+                debug_log(f"Text verification failed: {e}", "WARNING")
+            
+            debug_log(f"=== TYPE ACTION END ===", "INFO")
+            
+            if typing_success:
+                print(f'  -> Typed "{text}" via {typing_method}')
     
     elif action_type == 'key' or action_type == 'press':
         # Argument is the key to press
@@ -570,10 +725,10 @@ async def root():
     """Root endpoint with service info"""
     return {
         "service": "Tasker Service",
-        "version": "4.0.0",
+        "version": "4.1.0",
         "oagi_available": OAGI_AVAILABLE,
         "supported_modes": ["actor", "thinker", "tasker", "direct"],
-        "features": ["kb_compliant", "windows_unicode_input", "single_click", "no_delays"],
+        "features": ["kb_compliant", "windows_unicode_input", "debug_logging", "screenshots"],
         "endpoints": [
             "GET /status - Check service status",
             "POST /execute - Execute a task",
@@ -586,9 +741,9 @@ if __name__ == "__main__":
     import uvicorn
     
     print("\n" + "=" * 50)
-    print("  TASKER SERVICE v4.0 (KB-Compliant)")
+    print("  TASKER SERVICE v4.1 (KB-Pure + Debug)")
     print("  Supports: Actor | Thinker | Tasker modes")
-    print("  + Windows Unicode SendInput")
+    print("  + Windows Unicode + Debug Logging")
     print("=" * 50 + "\n")
     
     uvicorn.run(
