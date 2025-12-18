@@ -2,7 +2,7 @@
 Tasker Service - FastAPI wrapper for OAGI
 Supports all three Lux modes: Actor, Thinker, and Tasker
 Runs locally and receives requests from Architect's Hand Bridge
-v3.6 - NO clipboard/Ctrl+V - uses keyboard.write/typewrite/press
+v4.0 - KB-Compliant: Windows Unicode SendInput, single click, no delays
 """
 
 import asyncio
@@ -55,7 +55,7 @@ class TaskResponse(BaseModel):
 class StatusResponse(BaseModel):
     status: str
     oagi_available: bool
-    version: str = "3.6.0"
+    version: str = "4.0.0"
 
 
 # Global state
@@ -79,7 +79,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Tasker Service",
     description="Local service for OAGI execution (Actor/Thinker/Tasker modes)",
-    version="3.6.0",
+    version="4.0.0",
     lifespan=lifespan
 )
 
@@ -217,70 +217,46 @@ def execute_action(action):
             x = int(coords[0])
             y = int(coords[1])
             
-            # Move to position FIRST (KB pattern from _macos.py)
-            pyautogui.moveTo(x, y)
-            time.sleep(0.1)
-            
-            # Triple-click for GUARANTEED focus (expert recommendation)
-            print(f"  -> Triple-clicking at ({x}, {y}) for guaranteed focus")
-            pyautogui.click(x, y, clicks=3, interval=0.1)
-            
-            # Wait 1 second for JavaScript to process and give focus
-            time.sleep(1.0)
-            print(f"  -> Waited 1000ms for focus")
+            # KB Standard: Single click, no artificial delays
+            print(f"  -> Clicking at ({x}, {y})")
+            pyautogui.click(x, y)
+            # NO delay - KB doesn't use artificial delays
         except Exception as e:
             print(f"  -> Click parse error: {e}")
     
     elif action_type == 'type':
         # Argument is the text to type
         if argument:
-            print(f"  -> Typing: {argument}")
-            # Expert: PyAutoGUI hotkey('ctrl','v') has bugs - use typing methods instead
-            # 3 fallback methods, NO clipboard paste
+            # Remove quotes if present (KB standard)
+            text = argument.strip("\"'")
             
-            typed = False
+            print(f"  -> Typing: {text}")
             
-            # Method 1: keyboard.write() - BEST (simulates real typing)
-            if not typed:
+            # KB Official: Platform-specific Unicode handler
+            import sys
+            if sys.platform == "win32":
                 try:
-                    import keyboard
-                    keyboard.write(argument, delay=0.1)
-                    print(f"  -> Typed via keyboard.write (100ms/char)")
-                    time.sleep(0.5)
-                    typed = True
-                except ImportError:
-                    print(f"  -> keyboard module not available")
+                    from _windows import typewrite_exact
+                    # Windows: Unicode SendInput (ignores capslock, keyboard layout)
+                    typewrite_exact(text, interval=0.01)  # 10ms between chars (KB standard)
+                    print(f"  -> Typed via Windows Unicode (10ms/char)")
+                except ImportError as e:
+                    print(f"  -> _windows module not found: {e}, using fallback")
+                    pyautogui.typewrite(text, interval=0.01)
+                    print(f"  -> Typed via pyautogui fallback (10ms/char)")
                 except Exception as e:
-                    print(f"  -> keyboard.write failed: {e}")
-            
-            # Method 2: pyautogui.typewrite() - KB standard
-            if not typed:
-                try:
-                    pyautogui.typewrite(argument, interval=0.1)
-                    print(f"  -> Typed via pyautogui.typewrite (100ms/char)")
-                    time.sleep(0.5)
-                    typed = True
-                except Exception as e:
-                    print(f"  -> pyautogui.typewrite failed: {e}")
-            
-            # Method 3: Character-by-character - last resort
-            if not typed:
-                try:
-                    for char in argument:
-                        pyautogui.press(char)
-                        time.sleep(0.1)
-                    print(f"  -> Typed char-by-char via pyautogui.press")
-                    time.sleep(0.5)
-                    typed = True
-                except Exception as e:
-                    print(f"  -> char-by-char typing failed: {e}")
+                    print(f"  -> Windows Unicode failed: {e}, using fallback")
+                    pyautogui.typewrite(text, interval=0.01)
+            else:
+                # macOS/Linux: pyautogui fallback
+                pyautogui.typewrite(text, interval=0.01)
+                print(f"  -> Typed via pyautogui (10ms/char)")
     
     elif action_type == 'key' or action_type == 'press':
         # Argument is the key to press
         if argument:
             print(f"  -> Pressing key: {argument}")
             pyautogui.press(argument.lower())
-            time.sleep(0.3)  # Wait for key action to process
     
     elif action_type == 'scroll':
         # Handle multiple scroll formats:
@@ -304,7 +280,6 @@ def execute_action(action):
                 pyautogui.scroll(amount)
             else:
                 print(f"  -> Unknown scroll format: {argument}")
-            time.sleep(0.5)  # Wait for scroll to complete
         except Exception as e:
             print(f"  -> Scroll error: {e}")
     
@@ -320,7 +295,6 @@ def execute_action(action):
                 print(f"  -> Dragging from ({start_x}, {start_y}) to ({end_x}, {end_y})")
                 pyautogui.moveTo(start_x, start_y)
                 pyautogui.drag(end_x - start_x, end_y - start_y, duration=0.5)
-                time.sleep(0.5)  # Wait for drag to complete
             else:
                 print(f"  -> Drag requires 4 coordinates")
         except Exception as e:
@@ -332,7 +306,6 @@ def execute_action(action):
             keys = [k.strip().lower() for k in argument.split('+')]
             print(f"  -> Hotkey: {keys}")
             pyautogui.hotkey(*keys)
-            time.sleep(0.3)  # Wait for hotkey to process
     
     elif action_type == 'finish':
         print(f"  -> Finish action received")
@@ -597,10 +570,10 @@ async def root():
     """Root endpoint with service info"""
     return {
         "service": "Tasker Service",
-        "version": "3.6.0",
+        "version": "4.0.0",
         "oagi_available": OAGI_AVAILABLE,
         "supported_modes": ["actor", "thinker", "tasker", "direct"],
-        "features": ["dedicated_chrome_profile", "keyboard_write", "triple_click"],
+        "features": ["kb_compliant", "windows_unicode_input", "single_click", "no_delays"],
         "endpoints": [
             "GET /status - Check service status",
             "POST /execute - Execute a task",
@@ -613,9 +586,9 @@ if __name__ == "__main__":
     import uvicorn
     
     print("\n" + "=" * 50)
-    print("  TASKER SERVICE v3.6")
+    print("  TASKER SERVICE v4.0 (KB-Compliant)")
     print("  Supports: Actor | Thinker | Tasker modes")
-    print("  + keyboard.write() for typing")
+    print("  + Windows Unicode SendInput")
     print("=" * 50 + "\n")
     
     uvicorn.run(
