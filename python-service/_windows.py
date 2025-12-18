@@ -90,7 +90,8 @@ def typewrite_exact(text: str, interval: float = 0.01) -> None:
         inputs[1].ki.wScan = ord(char)
         inputs[1].ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP
 
-        SendInput(2, inputs, ctypes.sizeof(INPUT))
+        # Fix: pass pointer to first element, not array
+        SendInput(2, ctypes.byref(inputs[0]), ctypes.sizeof(INPUT))
 
         if interval > 0:
             time.sleep(interval)
