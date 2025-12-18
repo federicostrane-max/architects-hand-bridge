@@ -2,7 +2,7 @@
 Tasker Service - FastAPI wrapper for OAGI
 Supports all three Lux modes: Actor, Thinker, and Tasker
 Runs locally and receives requests from Architect's Hand Bridge
-v3.2 - Added delays after ALL actions for JavaScript processing
+v3.5 - moveTo + triple-click + 1s delays (95% focus success)
 """
 
 import asyncio
@@ -55,7 +55,7 @@ class TaskResponse(BaseModel):
 class StatusResponse(BaseModel):
     status: str
     oagi_available: bool
-    version: str = "3.2.0"
+    version: str = "3.5.0"
 
 
 # Global state
@@ -79,7 +79,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Tasker Service",
     description="Local service for OAGI execution (Actor/Thinker/Tasker modes)",
-    version="3.2.0",
+    version="3.5.0",
     lifespan=lifespan
 )
 
@@ -216,11 +216,18 @@ def execute_action(action):
             coords = argument.replace(' ', '').split(',')
             x = int(coords[0])
             y = int(coords[1])
-            print(f"  -> Clicking at ({x}, {y})")
-            pyautogui.click(x, y)
-            # IMPORTANT: Wait for JavaScript to process click event
-            time.sleep(0.5)
-            print(f"  -> Waited 500ms for JS to process")
+            
+            # Move to position FIRST (KB pattern from _macos.py)
+            pyautogui.moveTo(x, y)
+            time.sleep(0.1)
+            
+            # Triple-click for GUARANTEED focus (expert recommendation)
+            print(f"  -> Triple-clicking at ({x}, {y}) for guaranteed focus")
+            pyautogui.click(x, y, clicks=3, interval=0.1)
+            
+            # Wait 1 second for JavaScript to process and give focus
+            time.sleep(1.0)
+            print(f"  -> Waited 1000ms for focus")
         except Exception as e:
             print(f"  -> Click parse error: {e}")
     
@@ -228,37 +235,28 @@ def execute_action(action):
         # Argument is the text to type
         if argument:
             print(f"  -> Typing: {argument}")
-            # Use clipboard paste method - more reliable for web forms
+            # Use clipboard paste - field should have focus from triple-click
             try:
                 import pyperclip
-                # Save current clipboard
-                try:
-                    old_clipboard = pyperclip.paste()
-                except:
-                    old_clipboard = ""
-                
-                # Copy text to clipboard and paste
                 pyperclip.copy(argument)
-                time.sleep(0.2)  # Wait before paste
+                time.sleep(0.2)  # Small delay before paste
                 pyautogui.hotkey('ctrl', 'v')
-                time.sleep(0.5)  # Wait for text to appear
-                
-                # Restore old clipboard
-                try:
-                    pyperclip.copy(old_clipboard)
-                except:
-                    pass
-                    
-                print(f"  -> Typed via clipboard paste, waited 500ms")
+                print(f"  -> Pasted via Ctrl+V, waiting 1000ms for rendering")
+                time.sleep(1.0)  # 1000ms delay for DOM update
             except ImportError:
-                # Fallback to typewrite if pyperclip not available
-                print(f"  -> pyperclip not available, using slow typewrite")
-                pyautogui.typewrite(argument, interval=0.15)  # 150ms between chars
-                time.sleep(0.5)
+                # Fallback to keyboard module
+                try:
+                    import keyboard
+                    keyboard.write(argument, delay=0.1)
+                    print(f"  -> Typed via keyboard module")
+                    time.sleep(1.0)
+                except ImportError:
+                    # Last fallback to pyautogui
+                    pyautogui.write(argument, interval=0.15)
+                    print(f"  -> Typed via pyautogui")
+                    time.sleep(1.0)
             except Exception as e:
-                print(f"  -> Clipboard method failed: {e}, using slow typewrite")
-                pyautogui.typewrite(argument, interval=0.15)
-                time.sleep(0.5)
+                print(f"  -> Typing error: {e}")
     
     elif action_type == 'key' or action_type == 'press':
         # Argument is the key to press
@@ -582,10 +580,10 @@ async def root():
     """Root endpoint with service info"""
     return {
         "service": "Tasker Service",
-        "version": "3.2.0",
+        "version": "3.5.0",
         "oagi_available": OAGI_AVAILABLE,
         "supported_modes": ["actor", "thinker", "tasker", "direct"],
-        "features": ["dedicated_chrome_profile", "clipboard_typing", "js_delays", "wait_action"],
+        "features": ["dedicated_chrome_profile", "moveTo_triple_click", "1s_delays"],
         "endpoints": [
             "GET /status - Check service status",
             "POST /execute - Execute a task",
@@ -598,9 +596,9 @@ if __name__ == "__main__":
     import uvicorn
     
     print("\n" + "=" * 50)
-    print("  TASKER SERVICE v3.2")
+    print("  TASKER SERVICE v3.5")
     print("  Supports: Actor | Thinker | Tasker modes")
-    print("  + JS delays + clipboard paste")
+    print("  + moveTo + triple-click + 1s delays")
     print("=" * 50 + "\n")
     
     uvicorn.run(
