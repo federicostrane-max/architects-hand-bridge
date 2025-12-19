@@ -57,23 +57,14 @@ class INPUT(ctypes.Structure):
     ]
 
 
-# Get SendInput function - no argtypes to avoid ctypes type checking issues
-SendInput = ctypes.windll.user32.SendInput
+# Get SendInput function directly (fresh reference, no argtypes)
+_user32 = ctypes.WinDLL('user32', use_last_error=True)
 
 
 def typewrite_exact(text: str, interval: float = 0.01) -> None:
     """
     Type text exactly using Unicode input - ignores capslock, keyboard layout, etc.
-    
-    This function uses SendInput with KEYEVENTF_UNICODE to send characters
-    directly by their Unicode codepoint, completely bypassing keyboard state
-    (capslock, layout, etc.).
-    
-    Official OAGI implementation for Windows.
-    
-    Args:
-        text: The text to type exactly as specified
-        interval: Time in seconds between each character (default: 0.01 = 10ms)
+    Uses ctypes.byref() for maximum compatibility.
     """
     for char in text:
         inputs = (INPUT * 2)()
@@ -88,8 +79,8 @@ def typewrite_exact(text: str, interval: float = 0.01) -> None:
         inputs[1].ki.wScan = ord(char)
         inputs[1].ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP
 
-        # Call SendInput: nInputs=2, pInputs=array, cbSize=sizeof(INPUT)
-        SendInput(2, inputs, ctypes.sizeof(INPUT))
+        # Use byref to pass pointer - most reliable method
+        _user32.SendInput(2, ctypes.byref(inputs), ctypes.sizeof(INPUT))
 
         if interval > 0:
             time.sleep(interval)
