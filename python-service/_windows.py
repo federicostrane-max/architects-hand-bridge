@@ -57,10 +57,8 @@ class INPUT(ctypes.Structure):
     ]
 
 
-# Configure SendInput with proper argtypes for 64-bit compatibility
+# Get SendInput function - no argtypes to avoid ctypes type checking issues
 SendInput = ctypes.windll.user32.SendInput
-SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
-SendInput.restype = wintypes.UINT
 
 
 def typewrite_exact(text: str, interval: float = 0.01) -> None:
@@ -90,8 +88,8 @@ def typewrite_exact(text: str, interval: float = 0.01) -> None:
         inputs[1].ki.wScan = ord(char)
         inputs[1].ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP
 
-        # Fix: cast array to pointer type expected by SendInput
-        SendInput(2, ctypes.cast(inputs, ctypes.POINTER(INPUT)), ctypes.sizeof(INPUT))
+        # Call SendInput: nInputs=2, pInputs=array, cbSize=sizeof(INPUT)
+        SendInput(2, inputs, ctypes.sizeof(INPUT))
 
         if interval > 0:
             time.sleep(interval)
