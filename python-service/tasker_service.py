@@ -350,10 +350,12 @@ def execute_action(action):
                     typing_method = "Windows Unicode (KB official)"
                     debug_log(f"Using: {typing_method}", "INFO")
                     
-                    # Type each character with logging
+                    # Log characters for debug
                     for i, char in enumerate(text):
                         debug_log(f"Char {i+1}/{len(text)}: '{char}' (U+{ord(char):04X})", "DEBUG")
-                        typewrite_exact(char, interval=0.01)
+                    
+                    # Type entire text at once (more efficient)
+                    typewrite_exact(text, interval=0.01)
                     
                     typing_success = True
                 else:
