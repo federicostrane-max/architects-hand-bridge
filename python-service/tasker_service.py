@@ -379,30 +379,15 @@ def execute_action(action):
             # Screenshot AFTER typing
             screenshot_after = debug_screenshot("after_type")
             
-            # Attempt to verify text presence
-            try:
-                import pyperclip
-                
-                # Select all and copy
-                pyautogui.hotkey('ctrl', 'a')
-                time.sleep(0.05)
-                pyautogui.hotkey('ctrl', 'c')
-                time.sleep(0.05)
-                
-                clipboard_content = pyperclip.paste()
-                debug_log(f"Clipboard content: '{clipboard_content}'", "DEBUG")
-                
-                if text.lower() in clipboard_content.lower():
-                    debug_log(f"✅ TEXT VERIFIED: Found in field", "INFO")
-                else:
-                    debug_log(f"⚠️ TEXT NOT FOUND: Expected '{text}', got '{clipboard_content}'", "WARNING")
-                    debug_log(f"Possible causes:", "WARNING")
-                    debug_log(f"  1. Wrong element focused", "WARNING")
-                    debug_log(f"  2. Field cleared by JavaScript", "WARNING")
-                    debug_log(f"  3. Field inside iFrame", "WARNING")
-                    
-            except Exception as e:
-                debug_log(f"Text verification failed: {e}", "WARNING")
+            # Simple verification - just check if typing succeeded
+            # Note: Ctrl+A selects entire page, not useful for field verification
+            # We rely on the typing_success flag instead
+            if not typing_success:
+                debug_log(f"⚠️ Typing may have failed - check screenshots", "WARNING")
+                debug_log(f"Possible causes:", "WARNING")
+                debug_log(f"  1. Wrong element focused", "WARNING")
+                debug_log(f"  2. Field cleared by JavaScript", "WARNING")
+                debug_log(f"  3. Field inside iFrame", "WARNING")
             
             debug_log(f"=== TYPE ACTION END ===", "INFO")
             
