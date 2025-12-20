@@ -25,10 +25,9 @@ def get_element_coordinates(page, selector: str, description: str) -> dict:
         if element:
             box = element.bounding_box()
             if box:
-                # Calculate center point (where to click)
                 center_x = int(box['x'] + box['width'] / 2)
                 center_y = int(box['y'] + box['height'] / 2)
-                
+
                 return {
                     'found': True,
                     'description': description,
@@ -46,7 +45,7 @@ def get_element_coordinates(page, selector: str, description: str) -> dict:
                 }
     except Exception as e:
         pass
-    
+
     return {
         'found': False,
         'description': description,
@@ -61,7 +60,7 @@ def main():
     print("  Finding REAL element coordinates from DOM")
     print("=" * 60)
     print()
-    
+
     # Get screen info
     try:
         import pyautogui
@@ -70,40 +69,44 @@ def main():
     except:
         screen_w, screen_h = 1920, 1200
         print(f"📺 Screen Resolution: {screen_w} x {screen_h} (assumed)")
-    
+
     print()
     print("🔌 Connecting to Chrome via CDP...")
     print("   (Chrome must be running with --remote-debugging-port=9222)")
     print()
-    
+
     try:
         with sync_playwright() as p:
             # Connect to existing Chrome
             browser = p.chromium.connect_over_cdp('http://localhost:9222')
-            
-            if not browser.contexts():
+
+            # FIX: contexts is a property, not a method
+            contexts = browser.contexts
+            if not contexts:
                 print("❌ No browser contexts found!")
                 return
-            
-            context = browser.contexts()[0]
-            
-            if not context.pages():
+
+            context = contexts[0]
+
+            # FIX: pages is a property, not a method
+            pages = context.pages
+            if not pages:
                 print("❌ No pages found!")
                 return
-            
-            page = context.pages()[0]
-            
+
+            page = pages[0]
+
             # Get current URL
             current_url = page.url
             print(f"📄 Current Page: {current_url}")
             print()
-            
+
             # Check if it's Booking.com
             if 'booking.com' not in current_url.lower():
                 print("⚠️  WARNING: Not on Booking.com!")
                 print("   Navigate to booking.com first for accurate results")
                 print()
-            
+
             # Define selectors to search for
             selectors = [
                 ('input[name="ss"]', 'Booking.com destination field (name=ss)'),
@@ -114,20 +117,20 @@ def main():
                 ('.sb-searchbox__input input', 'Searchbox input'),
                 ('#ss', 'Element with ID "ss"'),
             ]
-            
+
             print("🔍 Searching for destination field...")
             print("-" * 60)
-            
+
             found_elements = []
-            
+
             for selector, description in selectors:
                 result = get_element_coordinates(page, selector, description)
-                
+
                 if result['found']:
                     found_elements.append(result)
                     box = result['bounding_box']
                     center = result['center']
-                    
+
                     print(f"\n✅ FOUND: {description}")
                     print(f"   Selector: {selector}")
                     print(f"   ┌─────────────────────────────────────────┐")
@@ -140,26 +143,25 @@ def main():
                     print(f"   │   X: {center['x']/screen_w*100:.1f}% from left")
                     print(f"   │   Y: {center['y']/screen_h*100:.1f}% from top")
                     print(f"   └─────────────────────────────────────────┘")
-            
+
             if not found_elements:
                 print("\n❌ No destination field found!")
                 print("   Make sure you're on the Booking.com homepage")
                 print()
-                
+
                 # Try to find ANY input fields
                 print("🔍 Looking for any input fields on page...")
                 inputs = page.query_selector_all('input')
                 print(f"   Found {len(inputs)} input elements")
-                
-                for i, inp in enumerate(inputs[:5]):  # Show first 5
+
+                for i, inp in enumerate(inputs[:5]):
                     try:
                         box = inp.bounding_box()
-                        if box and box['width'] > 50:  # Only visible inputs
+                        if box and box['width'] > 50:
                             print(f"\n   Input #{i+1}:")
                             print(f"     Position: ({int(box['x'])}, {int(box['y'])})")
                             print(f"     Size: {int(box['width'])} x {int(box['height'])}")
-                            
-                            # Try to get attributes
+
                             name = inp.get_attribute('name') or ''
                             placeholder = inp.get_attribute('placeholder') or ''
                             if name:
@@ -168,33 +170,33 @@ def main():
                                 print(f"     placeholder='{placeholder}'")
                     except:
                         pass
-            
+
             else:
                 # Summary
                 print("\n" + "=" * 60)
                 print("  SUMMARY - REAL COORDINATES")
                 print("=" * 60)
-                
+
                 best = found_elements[0]
                 center = best['center']
-                
+
                 print(f"\n🎯 Best match: {best['description']}")
                 print(f"\n   CLICK HERE: ({center['x']}, {center['y']})")
                 print(f"   Percentage:  X={center['x']/screen_w*100:.1f}%, Y={center['y']/screen_h*100:.1f}%")
-                
+
                 print(f"\n📊 Compare with LUX coordinates:")
                 print(f"   LUX sends:   (242, 601)")
                 print(f"   Should be:   ({center['x']}, {center['y']})")
                 print(f"   X error:     {242 - center['x']:+d} px")
                 print(f"   Y error:     {601 - center['y']:+d} px (before scaling)")
-                
+
                 # Calculate what Y should be in LUX reference (1080)
                 y_in_lux_ref = int(center['y'] * 1080 / screen_h)
                 print(f"\n   Y in LUX reference (1080p): {y_in_lux_ref}")
                 print(f"   Y error in LUX ref:         {601 - y_in_lux_ref:+d} px")
-                
+
             browser.close()
-            
+
     except Exception as e:
         print(f"\n❌ Error: {e}")
         print("\nTroubleshooting:")
