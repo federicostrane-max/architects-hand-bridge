@@ -1,0 +1,23 @@
+# Tasker Service v5.0 - Requirements
+# Install with: pip install -r requirements.txt
+
+# OAGI SDK - Official LUX model SDK
+oagi>=0.12.1
+
+# FastAPI and ASGI server
+fastapi>=0.104.0
+uvicorn>=0.24.0
+pydantic>=2.0.0
+
+# PyAutoGUI for desktop automation (included in oagi[desktop])
+pyautogui>=0.9.54
+
+# Image processing for visual markers
+Pillow>=10.0.0
+
+# HTTP client (used by OAGI internally)
+httpx>=0.25.0
+
+# Optional: Playwright for DOM-based coordinate detection
+# pip install playwright
+# playwright install chromium
