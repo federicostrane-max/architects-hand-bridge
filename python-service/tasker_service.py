@@ -974,6 +974,59 @@ async def test_mouse_movement():
     }
 
 # ============================================================
+# DEBUG: TEST CLICK AT COORDINATES
+# ============================================================
+@app.post("/debug/test_click_at")
+async def test_click_at_coordinates(lux_x: int = 500, lux_y: int = 350):
+    """Test click at scaled coordinates - simulates what Lux would do"""
+    if not PYAUTOGUI_AVAILABLE:
+        return {"error": "PyAutoGUI not available"}
+    
+    import time
+    
+    screen_width, screen_height = pyautogui.size()
+    x_scaled, y_scaled = scale_coordinates(lux_x, lux_y, screen_width, screen_height)
+    
+    logger.log(f"🎯 TEST CLICK - LUX coords: ({lux_x}, {lux_y})")
+    logger.log(f"📐 Scaled to: ({x_scaled}, {y_scaled}) on {screen_width}x{screen_height}")
+    logger.log(f"🖱️ Clicking...")
+    
+    # Move to position first (so you can see where it goes)
+    pyautogui.moveTo(x_scaled, y_scaled)
+    time.sleep(0.3)
+    
+    # Click
+    pyautogui.click(x_scaled, y_scaled)
+    time.sleep(0.2)
+    
+    return {
+        "lux_coords": {"x": lux_x, "y": lux_y},
+        "lux_resolution": f"{LUX_REF_WIDTH}x{LUX_REF_HEIGHT}",
+        "screen_resolution": f"{screen_width}x{screen_height}",
+        "scaled_coords": {"x": x_scaled, "y": y_scaled},
+        "clicked": True
+    }
+
+@app.post("/debug/test_type")
+async def test_type_text(text: str = "test123"):
+    """Test typing text"""
+    if not PYAUTOGUI_AVAILABLE:
+        return {"error": "PyAutoGUI not available"}
+    
+    import time
+    
+    logger.log(f"⌨️ TEST TYPE - Typing: '{text}'")
+    
+    # Type with small interval
+    pyautogui.typewrite(text, interval=0.05)
+    time.sleep(0.2)
+    
+    return {
+        "typed": text,
+        "success": True
+    }
+
+# ============================================================
 # MAIN
 # ============================================================
 if __name__ == "__main__":
