@@ -362,7 +362,10 @@ def open_browser_with_url(url: str):
         chrome_path = next((p for p in chrome_paths if os.path.exists(p)), None)
         if chrome_path:
             lux_profile = os.path.expanduser("~\\AppData\\Local\\Google\\Chrome\\User Data\\LuxProfile")
-            subprocess.Popen([chrome_path, f"--user-data-dir={lux_profile}", "--remote-debugging-port=9222", "--start-maximized", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                subprocess.Popen([chrome_path, f"--user-data-dir={lux_profile}", "--remote-debugging-port=9222", "--start-maximized", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except:
+                webbrowser.open(url)
         else:
             webbrowser.open(url)
     else:
@@ -373,20 +376,44 @@ def open_browser_with_url(url: str):
 # ============================================================
 # ENDPOINTS
 # ============================================================
-@app.get("/", response_model=StatusResponse)
+@app.get("/")
 async def root():
-    return StatusResponse(status="busy" if is_running else "ready", oagi_available=OAGI_AVAILABLE, analyzer_available=ANALYZER_AVAILABLE)
+    """Root endpoint"""
+    return await get_status()
+
+@app.get("/status", response_model=StatusResponse)
+async def get_status():
+    """Status endpoint - required by bridge"""
+    return StatusResponse(
+        status="busy" if is_running else "ready", 
+        oagi_available=OAGI_AVAILABLE, 
+        analyzer_available=ANALYZER_AVAILABLE,
+        version=SERVICE_VERSION
+    )
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "version": SERVICE_VERSION, "oagi_available": OAGI_AVAILABLE, "screen": debug_screen_info()}
+    """Health check endpoint"""
+    screen_info = debug_screen_info()
+    return {
+        "status": "healthy", 
+        "version": SERVICE_VERSION, 
+        "oagi_available": OAGI_AVAILABLE,
+        "pil_available": PIL_AVAILABLE,
+        "analyzer_available": ANALYZER_AVAILABLE,
+        "pyautogui_available": PYAUTOGUI_AVAILABLE,
+        "is_running": is_running,
+        "current_task": current_task,
+        "screen": screen_info
+    }
 
 @app.post("/execute", response_model=TaskResponse)
 async def execute_task(request: TaskRequest):
+    """Main execution endpoint"""
     global is_running, current_task
     
     if not OAGI_AVAILABLE:
-        raise HTTPException(status_code=500, detail="OAGI SDK not available")
+        raise HTTPException(status_code=500, detail=f"OAGI SDK not available: {OAGI_IMPORT_ERROR}")
     if is_running:
         raise HTTPException(status_code=409, detail=f"Task running: {current_task}")
     
@@ -394,7 +421,17 @@ async def execute_task(request: TaskRequest):
     current_task = request.task_description
     
     try:
+        logger.log(f"{'='*60}")
+        logger.log(f"EXECUTING TASK")
+        logger.log(f"{'='*60}")
         logger.log(f"Task: {request.task_description}")
+        logger.log(f"Mode: {request.mode}")
+        logger.log(f"Model: {request.model}")
+        logger.log(f"Max Steps: {request.max_steps}")
+        logger.log(f"Start URL: {request.start_url}")
+        logger.log(f"Screenshot Resize: {request.enable_screenshot_resize}")
+        logger.log(f"Coordinate Scaling: {request.enable_scaling}")
+        
         os.environ["OAGI_API_KEY"] = request.api_key
         
         if request.start_url:
@@ -402,14 +439,29 @@ async def execute_task(request: TaskRequest):
         
         result, execution_report = await execute_with_manual_control(request)
         result.execution_report = execution_report
+        
+        logger.log(f"Task completed: success={result.success}")
         return result
         
     except Exception as e:
         logger.log(f"Error: {e}", "ERROR")
+        import traceback
+        logger.log(traceback.format_exc(), "ERROR")
         return TaskResponse(success=False, message="Failed", error=str(e))
     finally:
         is_running = False
         current_task = None
+
+@app.post("/stop")
+async def stop_task():
+    """Stop current task"""
+    global is_running, current_task
+    if not is_running:
+        return {"status": "no task running"}
+    is_running = False
+    stopped = current_task
+    current_task = None
+    return {"status": "stopped", "task": stopped}
 
 # ============================================================
 # RESIZED SCREENSHOT MAKER
@@ -439,18 +491,26 @@ class ResizedScreenshotMaker:
             return screenshot
 
 def scale_coordinates(x: int, y: int, screen_width: int, screen_height: int) -> tuple:
+    """Scale coordinates from LUX reference (1920x1080) to actual screen"""
     return int(x * screen_width / LUX_REF_WIDTH), int(y * screen_height / LUX_REF_HEIGHT)
 
 # ============================================================
-# MANUAL CONTROL EXECUTION
+# MANUAL CONTROL EXECUTION - Captures Reasoning
 # ============================================================
 async def execute_with_manual_control(request: TaskRequest) -> tuple[TaskResponse, Optional[str]]:
+    """Execute with manual step control to capture reasoning"""
     logger.log("Manual Control execution with reasoning capture")
     
+    # Determine model
     model = request.model
     if request.mode == "thinker" and "thinker" not in model:
         model = "lux-thinker-1"
+    elif request.mode == "actor" and "actor" not in model:
+        model = "lux-actor-1"
     
+    logger.log(f"Model: {model}")
+    
+    # Screen info
     if PYAUTOGUI_AVAILABLE:
         screen_width, screen_height = pyautogui.size()
     else:
@@ -458,8 +518,14 @@ async def execute_with_manual_control(request: TaskRequest) -> tuple[TaskRespons
     
     logger.log(f"Screen: {screen_width}x{screen_height}, Scale Y: {screen_height/LUX_REF_HEIGHT:.3f}")
     
+    # Create components
     screenshot_maker = ResizedScreenshotMaker() if request.enable_screenshot_resize else AsyncScreenshotMaker()
-    pyautogui_config = PyautoguiConfig(drag_duration=request.drag_duration, scroll_amount=request.scroll_amount, wait_duration=request.wait_duration, action_pause=request.action_pause)
+    pyautogui_config = PyautoguiConfig(
+        drag_duration=request.drag_duration, 
+        scroll_amount=request.scroll_amount, 
+        wait_duration=request.wait_duration, 
+        action_pause=request.action_pause
+    )
     base_action_handler = AsyncPyautoguiActionHandler(config=pyautogui_config)
     
     history = ExecutionHistory(request.task_description)
@@ -472,10 +538,17 @@ async def execute_with_manual_control(request: TaskRequest) -> tuple[TaskRespons
             
             for step_num in range(1, request.max_steps + 1):
                 step_record = StepRecord(step_num)
-                logger.log(f"{'='*50}\nSTEP {step_num}/{request.max_steps}\n{'='*50}")
+                logger.log(f"{'='*50}")
+                logger.log(f"STEP {step_num}/{request.max_steps}")
+                logger.log(f"{'='*50}")
                 
+                # Screenshot before
                 step_record.screenshot_before = debug_screenshot(f"step_{step_num}_before")
+                
+                # Get image for Lux
                 image = await screenshot_maker()
+                
+                # Get step from Lux
                 step = await actor.step(image)
                 
                 # 🎯 CAPTURE REASONING
@@ -483,6 +556,7 @@ async def execute_with_manual_control(request: TaskRequest) -> tuple[TaskRespons
                 step_record.reasoning = reasoning
                 logger.log(f"🧠 REASONING: {reasoning}")
                 
+                # Check if done
                 if step.stop:
                     logger.log("✅ Task complete")
                     step_record.stop = True
@@ -491,6 +565,7 @@ async def execute_with_manual_control(request: TaskRequest) -> tuple[TaskRespons
                     completed = True
                     break
                 
+                # Process actions
                 actions = step.actions or []
                 logger.log(f"📋 Actions: {len(actions)}")
                 
@@ -510,13 +585,20 @@ async def execute_with_manual_control(request: TaskRequest) -> tuple[TaskRespons
                                 x_scaled, y_scaled = scale_coordinates(x_lux, y_lux, screen_width, screen_height)
                                 action_data["scaled_coords"] = {"x": x_scaled, "y": y_scaled}
                                 logger.log(f"   🎯 Click: LUX ({x_lux}, {y_lux}) → Scaled ({x_scaled}, {y_scaled})")
-                        except: pass
+                        except Exception as e:
+                            logger.log(f"   ⚠️ Parse error: {e}", "WARNING")
                     elif action_type == "type":
                         logger.log(f"   ⌨️ Type: '{argument[:50]}'")
+                    elif action_type == "scroll":
+                        logger.log(f"   🖱️ Scroll: {argument}")
+                    elif action_type == "hotkey":
+                        logger.log(f"   ⌨️ Hotkey: {argument}")
+                    else:
+                        logger.log(f"   ❓ {action_type}: {argument}")
                     
                     step_record.actions.append(action_data)
                 
-                # Execute
+                # Execute actions
                 try:
                     if request.enable_scaling and PYAUTOGUI_AVAILABLE:
                         for action in actions:
@@ -539,22 +621,32 @@ async def execute_with_manual_control(request: TaskRequest) -> tuple[TaskRespons
                                     x2_s, y2_s = scale_coordinates(x2, y2, screen_width, screen_height)
                                     pyautogui.moveTo(x1_s, y1_s)
                                     pyautogui.drag(x2_s - x1_s, y2_s - y1_s, duration=0.5)
+                                else:
+                                    await base_action_handler([action])
                             else:
                                 await base_action_handler([action])
                     else:
                         await base_action_handler(actions)
                     
                     step_record.success = True
+                    logger.log(f"✅ Step {step_num} executed")
+                    
                 except Exception as e:
                     step_record.error = str(e)
-                    logger.log(f"❌ Error: {e}", "ERROR")
+                    logger.log(f"❌ Step error: {e}", "ERROR")
                 
+                # Screenshot after
                 step_record.screenshot_after = debug_screenshot(f"step_{step_num}_after")
                 history.add_step(step_record)
                 
+                # Delay
                 if request.step_delay > 0:
                     await asyncio.sleep(request.step_delay)
+            
+            else:
+                logger.log(f"⚠️ Max steps ({request.max_steps}) reached")
         
+        # Generate report
         history.finish(completed)
         report_dir = ANALYSIS_DIR / f"execution_{int(time.time())}"
         execution_report = history.generate_report(report_dir)
@@ -582,6 +674,7 @@ async def execute_with_manual_control(request: TaskRequest) -> tuple[TaskRespons
 # ============================================================
 @app.post("/execute_step")
 async def execute_single_step(request: dict):
+    """Execute single step for debugging"""
     if not OAGI_AVAILABLE:
         raise HTTPException(status_code=500, detail="OAGI not available")
     
@@ -597,15 +690,35 @@ async def execute_single_step(request: dict):
         step = await actor.step(image)
         
         reasoning = getattr(step, "reason", None) or getattr(step, "reasoning", None)
-        actions_data = [{"type": str(a.type.value) if hasattr(a.type, "value") else str(a.type), "argument": str(getattr(a, "argument", ""))} for a in (step.actions or [])]
+        actions_data = [
+            {"type": str(a.type.value) if hasattr(a.type, "value") else str(a.type), "argument": str(getattr(a, "argument", ""))} 
+            for a in (step.actions or [])
+        ]
         
         return {"stop": getattr(step, "stop", False), "reasoning": reasoning, "actions": actions_data}
 
+@app.get("/analysis/sessions")
+async def list_analysis_sessions():
+    """List all analysis sessions"""
+    sessions = []
+    if ANALYSIS_DIR.exists():
+        for session_dir in ANALYSIS_DIR.iterdir():
+            if session_dir.is_dir():
+                report_path = session_dir / "execution_report.html"
+                sessions.append({
+                    "name": session_dir.name,
+                    "path": str(session_dir),
+                    "has_report": report_path.exists(),
+                    "report_path": str(report_path) if report_path.exists() else None
+                })
+    return {"sessions": sorted(sessions, key=lambda x: x['name'], reverse=True)}
+
 @app.get("/analysis/latest")
 async def get_latest_analysis():
+    """Get latest analysis session"""
     if not ANALYSIS_DIR.exists():
         return {"error": "No sessions"}
-    sessions = sorted(ANALYSIS_DIR.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True)
+    sessions = sorted([d for d in ANALYSIS_DIR.iterdir() if d.is_dir()], key=lambda x: x.stat().st_mtime, reverse=True)
     if not sessions:
         return {"error": "No sessions"}
     latest = sessions[0]
@@ -614,7 +727,14 @@ async def get_latest_analysis():
 
 @app.get("/debug/screen")
 async def get_screen_debug_info():
+    """Get screen info"""
     return debug_screen_info()
+
+@app.post("/debug/screenshot")
+async def capture_debug_screenshot(label: str = "manual"):
+    """Capture debug screenshot"""
+    path = debug_screenshot(f"manual_{label}")
+    return {"success": path is not None, "path": path}
 
 # ============================================================
 # MAIN
