@@ -237,6 +237,11 @@ class TaskRequest(BaseModel):
     # Analysis options
     enable_analysis: bool = True
     
+    # Resolution scaling (IMPORTANT for non-1080p screens!)
+    # LUX is trained on 1920x1080. If your screen is different (e.g., 1920x1200),
+    # coordinates need to be scaled. Set to True to auto-scale.
+    enable_scaling: bool = True
+    
     class Config:
         json_schema_extra = {
             "example": {
@@ -246,7 +251,8 @@ class TaskRequest(BaseModel):
                 "model": "lux-actor-1",
                 "max_steps": 20,
                 "start_url": "https://www.booking.com",
-                "enable_analysis": True
+                "enable_analysis": True,
+                "enable_scaling": True
             }
         }
 
@@ -587,6 +593,7 @@ async def execute_with_default_agent(
     
     logger.log(f"Model: {model}")
     logger.log(f"Config: pause={pyautogui_config.action_pause}s, scroll={pyautogui_config.scroll_amount}")
+    logger.log(f"Scaling: {'ENABLED' if request.enable_scaling else 'disabled'}")
     
     try:
         # Create agent
@@ -601,9 +608,19 @@ async def execute_with_default_agent(
         action_handler = AsyncPyautoguiActionHandler(config=pyautogui_config)
         screenshot_maker = AsyncScreenshotMaker()
         
-        # If analyzer is active, wrap handlers to capture data
+        # Wrap handler based on options:
+        # - If analysis enabled: use AnalyzingActionHandler (includes scaling)
+        # - If only scaling enabled: use ScalingActionHandler
+        # - If both disabled: use raw SDK handler
         if analyzer:
-            action_handler = AnalyzingActionHandler(action_handler, analyzer)
+            action_handler = AnalyzingActionHandler(
+                action_handler, 
+                analyzer, 
+                enable_scaling=request.enable_scaling
+            )
+        elif request.enable_scaling:
+            # Scaling without analysis
+            action_handler = ScalingActionHandler(action_handler)
         
         logger.log("Starting agent.execute()...")
         
@@ -681,8 +698,16 @@ async def execute_with_tasker_agent(
         action_handler = AsyncPyautoguiActionHandler(config=pyautogui_config)
         screenshot_maker = AsyncScreenshotMaker()
         
+        # Wrap handler based on options:
         if analyzer:
-            action_handler = AnalyzingActionHandler(action_handler, analyzer)
+            action_handler = AnalyzingActionHandler(
+                action_handler, 
+                analyzer,
+                enable_scaling=request.enable_scaling
+            )
+        elif request.enable_scaling:
+            # Scaling without analysis
+            action_handler = ScalingActionHandler(action_handler)
         
         # Execute todos
         completed_count = 0
@@ -726,25 +751,132 @@ async def execute_with_tasker_agent(
         raise
 
 # ============================================================
-# ANALYZING ACTION HANDLER WRAPPER (with full logging)
+# RESOLUTION SCALING CONFIGURATION
+# ============================================================
+# LUX models are trained on 1920x1080 resolution.
+# If your screen is different, coordinates need to be scaled.
+
+LUX_REF_WIDTH = 1920
+LUX_REF_HEIGHT = 1080
+
+def scale_coordinates(x: int, y: int, screen_width: int, screen_height: int) -> tuple:
+    """
+    Scale coordinates from LUX reference (1920x1080) to actual screen resolution.
+    
+    Args:
+        x, y: Original coordinates from LUX (in 1920x1080 space)
+        screen_width, screen_height: Actual screen resolution
+        
+    Returns:
+        (x_scaled, y_scaled): Coordinates adjusted for actual screen
+    """
+    # Scale X (usually 1.0 if width is 1920)
+    x_scaled = int(x * screen_width / LUX_REF_WIDTH)
+    
+    # Scale Y (important for 1920x1200 screens: 1200/1080 = 1.111)
+    y_scaled = int(y * screen_height / LUX_REF_HEIGHT)
+    
+    return x_scaled, y_scaled
+
+# ============================================================
+# SCALING ACTION HANDLER (lightweight, no logging)
+# ============================================================
+
+class ScalingActionHandler:
+    """
+    Lightweight wrapper that ONLY scales coordinates.
+    Use this when enable_scaling=True but enable_analysis=False.
+    
+    For full logging with scaling, use AnalyzingActionHandler instead.
+    """
+    
+    def __init__(self, handler: AsyncPyautoguiActionHandler):
+        self.handler = handler
+        
+        # Get screen info
+        if PYAUTOGUI_AVAILABLE:
+            self.screen_width, self.screen_height = pyautogui.size()
+        else:
+            self.screen_width, self.screen_height = 1920, 1080
+        
+        self.scale_x = self.screen_width / LUX_REF_WIDTH
+        self.scale_y = self.screen_height / LUX_REF_HEIGHT
+        
+        if self.scale_y != 1.0:
+            print(f"📐 ScalingActionHandler: Y coords will be scaled by {self.scale_y:.3f}")
+    
+    async def __call__(self, actions):
+        """Execute actions with scaled coordinates"""
+        for action in actions:
+            action_type = str(action.type.value) if hasattr(action.type, 'value') else str(action.type)
+            argument = str(action.argument) if hasattr(action, 'argument') else ""
+            
+            if action_type == 'click' and PYAUTOGUI_AVAILABLE:
+                coords = argument.replace(' ', '').split(',')
+                x_lux, y_lux = int(coords[0]), int(coords[1])
+                x_scaled, y_scaled = scale_coordinates(
+                    x_lux, y_lux,
+                    self.screen_width, self.screen_height
+                )
+                print(f"🖱️ Click: ({x_lux},{y_lux}) → ({x_scaled},{y_scaled})")
+                pyautogui.click(x_scaled, y_scaled)
+                time.sleep(0.1)
+                
+            elif action_type == 'drag' and PYAUTOGUI_AVAILABLE:
+                parts = argument.replace(' ', '').split(',')
+                if len(parts) >= 4:
+                    x1_lux, y1_lux = int(parts[0]), int(parts[1])
+                    x2_lux, y2_lux = int(parts[2]), int(parts[3])
+                    x1_s, y1_s = scale_coordinates(x1_lux, y1_lux, self.screen_width, self.screen_height)
+                    x2_s, y2_s = scale_coordinates(x2_lux, y2_lux, self.screen_width, self.screen_height)
+                    pyautogui.moveTo(x1_s, y1_s)
+                    pyautogui.drag(x2_s - x1_s, y2_s - y1_s, duration=0.5)
+                else:
+                    await self.handler([action])
+            else:
+                # Non-coordinate actions: use SDK
+                await self.handler([action])
+
+# ============================================================
+# ANALYZING ACTION HANDLER WRAPPER (with full logging + SCALING)
 # ============================================================
 
 class AnalyzingActionHandler:
     """
-    Wrapper around AsyncPyautoguiActionHandler that logs actions
-    to the LuxAnalyzer with screenshots before/after each action.
+    Wrapper around AsyncPyautoguiActionHandler that:
+    1. SCALES coordinates from LUX reference (1920x1080) to actual screen
+    2. Logs actions to LuxAnalyzer with screenshots
+    3. Provides detailed debug logging
     
-    This provides the same detailed logging as v4.x debug system.
+    This fixes the coordinate mismatch on non-1080p screens!
     """
     
-    def __init__(self, handler: AsyncPyautoguiActionHandler, analyzer: LuxAnalyzer):
+    def __init__(self, handler: AsyncPyautoguiActionHandler, analyzer: LuxAnalyzer, enable_scaling: bool = True):
         self.handler = handler
         self.analyzer = analyzer
         self.action_counter = 0
+        self.enable_scaling = enable_scaling
+        
+        # Get screen info once at init
+        if PYAUTOGUI_AVAILABLE:
+            self.screen_width, self.screen_height = pyautogui.size()
+        else:
+            self.screen_width, self.screen_height = 1920, 1080
+        
+        # Calculate scale factors
+        self.scale_x = self.screen_width / LUX_REF_WIDTH
+        self.scale_y = self.screen_height / LUX_REF_HEIGHT
+        
+        debug_log(f"📐 Resolution Scaling initialized:", "INFO")
+        debug_log(f"   LUX reference: {LUX_REF_WIDTH}x{LUX_REF_HEIGHT}", "INFO")
+        debug_log(f"   Your screen:   {self.screen_width}x{self.screen_height}", "INFO")
+        debug_log(f"   Scale factors: X={self.scale_x:.3f}, Y={self.scale_y:.3f}", "INFO")
+        
+        if self.scale_y != 1.0:
+            debug_log(f"   ⚠️  Y-scaling active! LUX Y coords will be multiplied by {self.scale_y:.3f}", "WARNING")
     
     async def __call__(self, actions):
-        """Execute actions while logging with screenshots"""
-        results = []
+        """Execute actions with coordinate scaling and logging"""
         
         for action in actions:
             self.action_counter += 1
@@ -756,11 +888,10 @@ class AnalyzingActionHandler:
             debug_log(f"{'='*60}", "INFO")
             debug_log(f"ACTION #{self.action_counter}: {action_type.upper()}", "INFO")
             debug_log(f"{'='*60}", "INFO")
-            debug_log(f"Argument: {argument}", "INFO")
+            debug_log(f"Raw argument from LUX: {argument}", "INFO")
             
             # Get screen info
             screen_info = debug_screen_info()
-            debug_log(f"Screen: {screen_info['width']}x{screen_info['height']} (scale Y: {screen_info['scale_y']:.3f})", "DEBUG")
             
             # Screenshot BEFORE action
             screenshot_before = debug_screenshot(f"action_{self.action_counter}_before")
@@ -775,22 +906,38 @@ class AnalyzingActionHandler:
             if action_type == 'click':
                 try:
                     coords = argument.replace(' ', '').split(',')
-                    x, y = int(coords[0]), int(coords[1])
+                    x_lux, y_lux = int(coords[0]), int(coords[1])
+                    
+                    # SCALE COORDINATES!
+                    if self.enable_scaling:
+                        x_scaled, y_scaled = scale_coordinates(
+                            x_lux, y_lux, 
+                            self.screen_width, self.screen_height
+                        )
+                        debug_log(f"🎯 LUX coords:    ({x_lux}, {y_lux})", "INFO")
+                        debug_log(f"📐 Scaled coords: ({x_scaled}, {y_scaled})", "INFO")
+                        debug_log(f"   Y adjustment: {y_lux} → {y_scaled} (×{self.scale_y:.3f})", "INFO")
+                    else:
+                        x_scaled, y_scaled = x_lux, y_lux
+                        debug_log(f"Target coords (no scaling): ({x_scaled}, {y_scaled})", "INFO")
                     
                     # Calculate percentages for analysis
-                    x_pct = (x / screen_info['width']) * 100
-                    y_pct = (y / screen_info['height']) * 100
-                    
-                    debug_log(f"Target coordinates: ({x}, {y})", "INFO")
-                    debug_log(f"As percentage: X={x_pct:.1f}%, Y={y_pct:.1f}%", "INFO")
+                    x_pct = (x_scaled / self.screen_width) * 100
+                    y_pct = (y_scaled / self.screen_height) * 100
+                    debug_log(f"   Screen position: {x_pct:.1f}%, {y_pct:.1f}%", "INFO")
                     
                     # Log to analyzer with screenshot
                     logged_action = self.analyzer.log_action(
                         action_type='click',
-                        x=x,
-                        y=y,
+                        x=x_scaled,  # Log SCALED coordinates
+                        y=y_scaled,
                         metadata={
                             'raw_argument': argument,
+                            'lux_x': x_lux,
+                            'lux_y': y_lux,
+                            'scaled_x': x_scaled,
+                            'scaled_y': y_scaled,
+                            'scale_factor_y': self.scale_y,
                             'x_percent': x_pct,
                             'y_percent': y_pct,
                             'mouse_before': mouse_before,
@@ -844,12 +991,55 @@ class AnalyzingActionHandler:
             else:
                 debug_log(f"Other action type: {action_type} with arg: {argument}", "INFO")
         
-        # Execute all actions with original handler
-        debug_log(f"Executing {len(actions)} action(s) via SDK handler...", "INFO")
+        # ============================================================
+        # EXECUTE ACTIONS WITH SCALING
+        # ============================================================
+        # For clicks with scaling enabled, we execute manually with pyautogui
+        # to apply the coordinate transformation. Other actions use SDK.
+        
+        debug_log(f"Executing {len(actions)} action(s)...", "INFO")
         start_time = time.time()
         
         try:
-            result = await self.handler(actions)
+            for action in actions:
+                action_type = str(action.type.value) if hasattr(action.type, 'value') else str(action.type)
+                argument = str(action.argument) if hasattr(action, 'argument') else ""
+                
+                if action_type == 'click' and self.enable_scaling and PYAUTOGUI_AVAILABLE:
+                    # EXECUTE CLICK WITH SCALED COORDINATES
+                    coords = argument.replace(' ', '').split(',')
+                    x_lux, y_lux = int(coords[0]), int(coords[1])
+                    x_scaled, y_scaled = scale_coordinates(
+                        x_lux, y_lux,
+                        self.screen_width, self.screen_height
+                    )
+                    
+                    debug_log(f"🖱️ Executing click at SCALED ({x_scaled}, {y_scaled})", "INFO")
+                    pyautogui.click(x_scaled, y_scaled)
+                    time.sleep(0.1)  # Small pause after click
+                    
+                elif action_type == 'drag' and self.enable_scaling and PYAUTOGUI_AVAILABLE:
+                    # EXECUTE DRAG WITH SCALED COORDINATES
+                    # Format: "x1,y1,x2,y2"
+                    parts = argument.replace(' ', '').split(',')
+                    if len(parts) >= 4:
+                        x1_lux, y1_lux = int(parts[0]), int(parts[1])
+                        x2_lux, y2_lux = int(parts[2]), int(parts[3])
+                        
+                        x1_scaled, y1_scaled = scale_coordinates(x1_lux, y1_lux, self.screen_width, self.screen_height)
+                        x2_scaled, y2_scaled = scale_coordinates(x2_lux, y2_lux, self.screen_width, self.screen_height)
+                        
+                        debug_log(f"🖱️ Executing drag from ({x1_scaled}, {y1_scaled}) to ({x2_scaled}, {y2_scaled})", "INFO")
+                        pyautogui.moveTo(x1_scaled, y1_scaled)
+                        pyautogui.drag(x2_scaled - x1_scaled, y2_scaled - y1_scaled, duration=0.5)
+                    else:
+                        # Fallback to SDK
+                        await self.handler([action])
+                
+                else:
+                    # For non-coordinate actions (type, scroll, hotkey), use SDK handler
+                    await self.handler([action])
+            
             execution_time = (time.time() - start_time) * 1000
             debug_log(f"✅ Actions executed in {execution_time:.2f}ms", "INFO")
             
@@ -864,7 +1054,7 @@ class AnalyzingActionHandler:
             if logged_action:
                 self.analyzer.mark_action_complete(logged_action, success=True)
             
-            return result
+            return None
             
         except Exception as e:
             debug_log(f"❌ Action execution failed: {e}", "ERROR")
