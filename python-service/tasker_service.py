@@ -64,7 +64,7 @@ except ImportError:
     print("⚠️ PyAutoGUI not available")
 
 # Configuration
-SERVICE_VERSION = "5.2.1"
+SERVICE_VERSION = "5.2.2"
 SERVICE_PORT = 8765
 DEBUG_LOGS_DIR = Path("debug_logs")
 ANALYSIS_DIR = Path("lux_analysis")
@@ -635,7 +635,36 @@ async def execute_with_manual_control(request: TaskRequest) -> tuple[TaskRespons
                                 x_scaled, y_scaled = scale_coordinates(x_lux, y_lux, screen_width, screen_height)
                                 logger.log(f"   🖱️ Click at ({x_scaled}, {y_scaled})")
                                 pyautogui.click(x_scaled, y_scaled)
+                                time.sleep(0.15)
+                            
+                            elif action_type == "type":
+                                # Type text character by character
+                                logger.log(f"   ⌨️ Typing: '{argument}'")
+                                time.sleep(0.1)  # Small delay before typing
+                                pyautogui.write(argument, interval=0.03)
                                 time.sleep(0.1)
+                            
+                            elif action_type == "hotkey":
+                                # Handle hotkeys like "enter", "ctrl+a", "ctrl+c"
+                                logger.log(f"   ⌨️ Pressing hotkey: {argument}")
+                                time.sleep(0.1)
+                                keys = argument.lower().replace(" ", "").split("+")
+                                pyautogui.hotkey(*keys)
+                                time.sleep(0.1)
+                            
+                            elif action_type == "scroll":
+                                # Scroll up or down
+                                logger.log(f"   🖱️ Scrolling: {argument}")
+                                try:
+                                    scroll_amount = int(argument)
+                                    pyautogui.scroll(scroll_amount)
+                                except:
+                                    if "down" in argument.lower():
+                                        pyautogui.scroll(-3)
+                                    else:
+                                        pyautogui.scroll(3)
+                                time.sleep(0.1)
+                            
                             elif action_type == "drag":
                                 parts = argument.replace(" ", "").split(",")
                                 if len(parts) >= 4:
@@ -643,11 +672,25 @@ async def execute_with_manual_control(request: TaskRequest) -> tuple[TaskRespons
                                     x2, y2 = int(parts[2]), int(parts[3])
                                     x1_s, y1_s = scale_coordinates(x1, y1, screen_width, screen_height)
                                     x2_s, y2_s = scale_coordinates(x2, y2, screen_width, screen_height)
+                                    logger.log(f"   🖱️ Drag from ({x1_s}, {y1_s}) to ({x2_s}, {y2_s})")
                                     pyautogui.moveTo(x1_s, y1_s)
                                     pyautogui.drag(x2_s - x1_s, y2_s - y1_s, duration=0.5)
                                 else:
                                     await base_action_handler([action])
+                                time.sleep(0.1)
+                            
+                            elif action_type == "wait":
+                                # Wait action
+                                try:
+                                    wait_time = float(argument)
+                                except:
+                                    wait_time = 1.0
+                                logger.log(f"   ⏳ Waiting {wait_time}s")
+                                time.sleep(wait_time)
+                            
                             else:
+                                # Fallback for unknown actions
+                                logger.log(f"   ❓ Unknown action '{action_type}', trying base handler")
                                 await base_action_handler([action])
                     else:
                         await base_action_handler(actions)
