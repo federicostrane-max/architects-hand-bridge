@@ -1,8 +1,18 @@
 """
-Tasker Service v5.2.1 - Fixed ResizedScreenshotMaker
+Tasker Service v5.3.0 - SDK Resolution Fix (1260x700)
 =====================================================
 
-FIX: PILImage object handling - access .image attribute instead of .to_pil()
+CHANGE: Using SDK-recommended 1260x700 resolution instead of 1920x1080
+
+From oagi-python SDK README:
+    config = ImageConfig(
+        format="JPEG",
+        quality=85,
+        width=1260,
+        height=700
+    )
+
+This is the resolution Lux API expects for optimal coordinate detection.
 """
 
 import asyncio
@@ -64,16 +74,30 @@ except ImportError:
     print("⚠️ PyAutoGUI not available")
 
 # Configuration
-SERVICE_VERSION = "5.2.2"
+SERVICE_VERSION = "5.3.0"
 SERVICE_PORT = 8765
 DEBUG_LOGS_DIR = Path("debug_logs")
 ANALYSIS_DIR = Path("lux_analysis")
 DEBUG_LOGS_DIR.mkdir(exist_ok=True)
 ANALYSIS_DIR.mkdir(exist_ok=True)
 
-# LUX Resolution (from KB/README.md)
-LUX_REF_WIDTH = 1920
-LUX_REF_HEIGHT = 1080
+# ============================================================
+# LUX RESOLUTION - FROM SDK ImageConfig EXAMPLE
+# ============================================================
+# The SDK recommends 1260x700 for optimal Lux coordinate detection.
+# This is different from the OSWorld training resolution (1920x1080).
+# 
+# SDK Example:
+#   config = ImageConfig(format="JPEG", quality=85, width=1260, height=700)
+#
+# Flow:
+#   1. Capture screenshot at real resolution (e.g., 1920x1200)
+#   2. Resize to 1260x700 for Lux API
+#   3. Lux returns coordinates relative to 1260x700
+#   4. Scale coordinates back to real screen resolution
+
+LUX_REF_WIDTH = 1260
+LUX_REF_HEIGHT = 700
 
 # ============================================================
 # STEP HISTORY - Stores reasoning and actions
@@ -133,10 +157,11 @@ class ExecutionHistory:
         
         if PYAUTOGUI_AVAILABLE:
             screen_width, screen_height = pyautogui.size()
+            scale_x = screen_width / LUX_REF_WIDTH
             scale_y = screen_height / LUX_REF_HEIGHT
         else:
-            screen_width, screen_height = LUX_REF_WIDTH, LUX_REF_HEIGHT
-            scale_y = 1.0
+            screen_width, screen_height = 1920, 1080
+            scale_x = scale_y = 1.0
         
         duration = (self.end_time - self.start_time).total_seconds() if self.end_time else 0
         
@@ -166,16 +191,21 @@ class ExecutionHistory:
         .stat-value {{ font-size: 24px; font-weight: bold; color: #667eea; }}
         .stat-label {{ font-size: 12px; color: #888; }}
         .screen-info {{ background: #fff3cd; padding: 10px 15px; border-radius: 6px; margin-bottom: 20px; }}
+        .sdk-note {{ background: #d4edda; padding: 10px 15px; border-radius: 6px; margin-bottom: 20px; border-left: 4px solid #28a745; }}
     </style>
 </head>
 <body>
     <div class="header">
-        <h1>🤖 LUX Execution Report</h1>
+        <h1>🤖 LUX Execution Report v5.3.0</h1>
         <div><strong>Task:</strong> {self.task_description}</div>
         <div><strong>Duration:</strong> {duration:.1f}s | <strong>Status:</strong> {"✅ Completed" if self.completed else "❌ Not Completed"}</div>
     </div>
+    <div class="sdk-note">
+        📐 <strong>SDK Resolution:</strong> Using <strong>{LUX_REF_WIDTH}×{LUX_REF_HEIGHT}</strong> as per SDK ImageConfig recommendation
+    </div>
     <div class="screen-info">
-        📐 <strong>Screen:</strong> {screen_width}x{screen_height} | <strong>Lux:</strong> {LUX_REF_WIDTH}x{LUX_REF_HEIGHT} | <strong>Y Scale:</strong> {scale_y:.3f}
+        🖥️ <strong>Screen:</strong> {screen_width}×{screen_height} | 
+        <strong>Scale:</strong> X={scale_x:.3f}, Y={scale_y:.3f}
     </div>
 '''
         
@@ -197,7 +227,7 @@ class ExecutionHistory:
                 
                 if action_type == "click" and lux_coords:
                     if scaled_coords:
-                        coords_html = f'LUX: <span class="original">({lux_coords["x"]}, {lux_coords["y"]})</span> → Scaled: <span class="scaled">({scaled_coords["x"]}, {scaled_coords["y"]})</span>'
+                        coords_html = f'LUX ({LUX_REF_WIDTH}×{LUX_REF_HEIGHT}): <span class="original">({lux_coords["x"]}, {lux_coords["y"]})</span> → Screen: <span class="scaled">({scaled_coords["x"]}, {scaled_coords["y"]})</span>'
                     else:
                         coords_html = f'({lux_coords["x"]}, {lux_coords["y"]})'
                 else:
@@ -281,7 +311,7 @@ def debug_screen_info() -> dict:
             "width": w, "height": h,
             "lux_ref_width": LUX_REF_WIDTH, "lux_ref_height": LUX_REF_HEIGHT,
             "scale_x": w / LUX_REF_WIDTH, "scale_y": h / LUX_REF_HEIGHT,
-            "needs_resize": (w != LUX_REF_WIDTH or h != LUX_REF_HEIGHT),
+            "needs_resize": True,  # Always resize to SDK resolution
             "source": "pyautogui"
         }
     except:
@@ -331,6 +361,7 @@ async def lifespan(app: FastAPI):
     logger.log(f"Tasker Service v{SERVICE_VERSION} starting...")
     screen_info = debug_screen_info()
     logger.log(f"Screen: {screen_info['width']}x{screen_info['height']}")
+    logger.log(f"SDK Resolution: {LUX_REF_WIDTH}x{LUX_REF_HEIGHT}")
     yield
     logger.log("Shutting down...")
 
@@ -398,7 +429,8 @@ async def health_check():
         "pyautogui_available": PYAUTOGUI_AVAILABLE,
         "is_running": is_running,
         "current_task": current_task,
-        "screen": screen_info
+        "screen": screen_info,
+        "lux_resolution": f"{LUX_REF_WIDTH}x{LUX_REF_HEIGHT}"
     }
 
 @app.post("/execute", response_model=TaskResponse)
@@ -423,6 +455,7 @@ async def execute_task(request: TaskRequest):
         logger.log(f"Model: {request.model}")
         logger.log(f"Max Steps: {request.max_steps}")
         logger.log(f"Start URL: {request.start_url}")
+        logger.log(f"SDK Resolution: {LUX_REF_WIDTH}x{LUX_REF_HEIGHT}")
         logger.log(f"Screenshot Resize: {request.enable_screenshot_resize}")
         logger.log(f"Coordinate Scaling: {request.enable_scaling}")
         
@@ -458,40 +491,48 @@ async def stop_task():
     return {"status": "stopped", "task": stopped}
 
 # ============================================================
-# RESIZED SCREENSHOT MAKER - FIXED v5.2.1
+# RESIZED SCREENSHOT MAKER - SDK RESOLUTION (1260x700)
 # ============================================================
 class ResizedScreenshotMaker:
     """
-    Screenshot maker that resizes to 1920x1080 for Lux.
+    Screenshot maker that resizes to 1260x700 for Lux API.
     
-    FIX v5.2.1: PILImage doesn't have .to_pil() method.
-    Instead, we need to access the underlying PIL image directly
-    or use pyautogui to capture and resize manually.
+    From SDK (oagi-python) ImageConfig example:
+        config = ImageConfig(
+            format="JPEG",
+            quality=85,
+            width=1260,
+            height=700
+        )
+    
+    This resolution is optimized for Lux coordinate detection.
+    
+    Flow:
+        1. Capture screenshot at real resolution (e.g., 1920x1200)
+        2. Resize to 1260x700 for Lux API
+        3. Lux returns coordinates relative to 1260x700
+        4. Scale coordinates back to real screen resolution
     """
     
     def __init__(self):
         if PYAUTOGUI_AVAILABLE:
             self.screen_width, self.screen_height = pyautogui.size()
         else:
-            self.screen_width, self.screen_height = LUX_REF_WIDTH, LUX_REF_HEIGHT
+            self.screen_width, self.screen_height = 1920, 1080
         
-        self.needs_resize = (self.screen_width != LUX_REF_WIDTH or self.screen_height != LUX_REF_HEIGHT)
+        # Always resize since SDK expects 1260x700
+        self.needs_resize = True
         
-        if self.needs_resize:
-            debug_log(f"📸 ResizedScreenshotMaker: {self.screen_width}x{self.screen_height} → {LUX_REF_WIDTH}x{LUX_REF_HEIGHT}")
-        else:
-            debug_log(f"📸 Screen already {LUX_REF_WIDTH}x{LUX_REF_HEIGHT} - no resize needed")
+        debug_log(f"📸 ResizedScreenshotMaker (SDK v5.3.0):")
+        debug_log(f"   Screen: {self.screen_width}x{self.screen_height}")
+        debug_log(f"   Lux SDK expects: {LUX_REF_WIDTH}x{LUX_REF_HEIGHT}")
+        debug_log(f"   Scale factors: X={self.screen_width/LUX_REF_WIDTH:.3f}, Y={self.screen_height/LUX_REF_HEIGHT:.3f}")
     
     async def __call__(self):
-        """Capture screenshot and resize to 1920x1080 for Lux"""
-        
-        if not self.needs_resize:
-            # No resize needed, use standard maker
-            base_maker = AsyncScreenshotMaker()
-            return await base_maker()
+        """Capture screenshot and resize to 1260x700 for Lux"""
         
         if not PIL_AVAILABLE or not PYAUTOGUI_AVAILABLE:
-            debug_log("⚠️ PIL or PyAutoGUI not available - using unresized screenshot", "WARNING")
+            debug_log("⚠️ PIL or PyAutoGUI not available - using SDK default", "WARNING")
             base_maker = AsyncScreenshotMaker()
             return await base_maker()
         
@@ -500,10 +541,10 @@ class ResizedScreenshotMaker:
             pil_screenshot = pyautogui.screenshot()
             original_size = pil_screenshot.size
             
-            # Resize to Lux reference resolution
+            # Resize to SDK reference resolution (1260x700)
             resized = pil_screenshot.resize((LUX_REF_WIDTH, LUX_REF_HEIGHT), Image.LANCZOS)
             
-            debug_log(f"📸 Screenshot resized: {original_size[0]}x{original_size[1]} → {LUX_REF_WIDTH}x{LUX_REF_HEIGHT}")
+            debug_log(f"📸 Screenshot: {original_size[0]}x{original_size[1]} → {LUX_REF_WIDTH}x{LUX_REF_HEIGHT}")
             
             # Wrap in PILImage for OAGI SDK
             return PILImage(resized)
@@ -515,8 +556,20 @@ class ResizedScreenshotMaker:
             return await base_maker()
 
 def scale_coordinates(x: int, y: int, screen_width: int, screen_height: int) -> tuple:
-    """Scale coordinates from LUX reference (1920x1080) to actual screen"""
-    return int(x * screen_width / LUX_REF_WIDTH), int(y * screen_height / LUX_REF_HEIGHT)
+    """
+    Scale coordinates from Lux SDK reference (1260x700) to actual screen.
+    
+    Lux returns coordinates relative to 1260x700.
+    We need to scale them to the actual screen resolution.
+    
+    Example:
+        Lux says click at (290, 272) on 1260x700
+        Screen is 1920x1200
+        Scale to: (290 * 1920/1260, 272 * 1200/700) = (442, 466)
+    """
+    x_scaled = int(x * screen_width / LUX_REF_WIDTH)
+    y_scaled = int(y * screen_height / LUX_REF_HEIGHT)
+    return x_scaled, y_scaled
 
 # ============================================================
 # MANUAL CONTROL EXECUTION - Captures Reasoning
@@ -538,9 +591,13 @@ async def execute_with_manual_control(request: TaskRequest) -> tuple[TaskRespons
     if PYAUTOGUI_AVAILABLE:
         screen_width, screen_height = pyautogui.size()
     else:
-        screen_width, screen_height = LUX_REF_WIDTH, LUX_REF_HEIGHT
+        screen_width, screen_height = 1920, 1080
     
-    logger.log(f"Screen: {screen_width}x{screen_height}, Scale Y: {screen_height/LUX_REF_HEIGHT:.3f}")
+    scale_x = screen_width / LUX_REF_WIDTH
+    scale_y = screen_height / LUX_REF_HEIGHT
+    logger.log(f"Screen: {screen_width}x{screen_height}")
+    logger.log(f"SDK Resolution: {LUX_REF_WIDTH}x{LUX_REF_HEIGHT}")
+    logger.log(f"Scale factors: X={scale_x:.3f}, Y={scale_y:.3f}")
     
     # Create components
     screenshot_maker = ResizedScreenshotMaker() if request.enable_screenshot_resize else AsyncScreenshotMaker()
@@ -569,7 +626,7 @@ async def execute_with_manual_control(request: TaskRequest) -> tuple[TaskRespons
                 # Screenshot before
                 step_record.screenshot_before = debug_screenshot(f"step_{step_num}_before")
                 
-                # Get image for Lux
+                # Get image for Lux (resized to 1260x700)
                 image = await screenshot_maker()
                 
                 # Get step from Lux
@@ -608,7 +665,7 @@ async def execute_with_manual_control(request: TaskRequest) -> tuple[TaskRespons
                             if request.enable_scaling:
                                 x_scaled, y_scaled = scale_coordinates(x_lux, y_lux, screen_width, screen_height)
                                 action_data["scaled_coords"] = {"x": x_scaled, "y": y_scaled}
-                                logger.log(f"   🎯 Click: LUX ({x_lux}, {y_lux}) → Scaled ({x_scaled}, {y_scaled})")
+                                logger.log(f"   🎯 Click: LUX ({x_lux}, {y_lux}) on {LUX_REF_WIDTH}x{LUX_REF_HEIGHT} → Screen ({x_scaled}, {y_scaled})")
                         except Exception as e:
                             logger.log(f"   ⚠️ Parse error: {e}", "WARNING")
                     elif action_type == "type":
@@ -724,7 +781,14 @@ async def execute_with_manual_control(request: TaskRequest) -> tuple[TaskRespons
             message="Completed" if completed else "Max steps reached",
             completed_todos=1 if completed else 0,
             total_todos=1,
-            execution_summary={"model": model, "steps": len(history.steps), "completed": completed}
+            execution_summary={
+                "model": model, 
+                "steps": len(history.steps), 
+                "completed": completed,
+                "lux_resolution": f"{LUX_REF_WIDTH}x{LUX_REF_HEIGHT}",
+                "screen_resolution": f"{screen_width}x{screen_height}",
+                "scale_factors": {"x": scale_x, "y": scale_y}
+            }
         ), execution_report
         
     except Exception as e:
@@ -762,7 +826,12 @@ async def execute_single_step(request: dict):
             for a in (step.actions or [])
         ]
         
-        return {"stop": getattr(step, "stop", False), "reasoning": reasoning, "actions": actions_data}
+        return {
+            "stop": getattr(step, "stop", False), 
+            "reasoning": reasoning, 
+            "actions": actions_data,
+            "lux_resolution": f"{LUX_REF_WIDTH}x{LUX_REF_HEIGHT}"
+        }
 
 @app.get("/analysis/sessions")
 async def list_analysis_sessions():
@@ -794,8 +863,10 @@ async def get_latest_analysis():
 
 @app.get("/debug/screen")
 async def get_screen_debug_info():
-    """Get screen info"""
-    return debug_screen_info()
+    """Get screen info with SDK resolution"""
+    info = debug_screen_info()
+    info["lux_resolution"] = f"{LUX_REF_WIDTH}x{LUX_REF_HEIGHT}"
+    return info
 
 @app.post("/debug/screenshot")
 async def capture_debug_screenshot(label: str = "manual"):
@@ -805,7 +876,7 @@ async def capture_debug_screenshot(label: str = "manual"):
 
 @app.post("/debug/test_resize")
 async def test_screenshot_resize():
-    """Test screenshot resize functionality"""
+    """Test screenshot resize functionality with SDK resolution"""
     if not PIL_AVAILABLE or not PYAUTOGUI_AVAILABLE:
         return {"error": "PIL or PyAutoGUI not available"}
     
@@ -815,18 +886,44 @@ async def test_screenshot_resize():
         original_path = DEBUG_SCREENSHOTS_DIR / "test_original.png"
         original.save(original_path)
         
-        # Resize
+        # Resize to SDK resolution
         resized = original.resize((LUX_REF_WIDTH, LUX_REF_HEIGHT), Image.LANCZOS)
-        resized_path = DEBUG_SCREENSHOTS_DIR / "test_resized.png"
+        resized_path = DEBUG_SCREENSHOTS_DIR / "test_resized_sdk.png"
         resized.save(resized_path)
         
         return {
             "success": True,
             "original": {"path": str(original_path), "size": original.size},
-            "resized": {"path": str(resized_path), "size": resized.size}
+            "resized": {"path": str(resized_path), "size": resized.size},
+            "sdk_resolution": f"{LUX_REF_WIDTH}x{LUX_REF_HEIGHT}",
+            "scale_factors": {
+                "x": original.size[0] / LUX_REF_WIDTH,
+                "y": original.size[1] / LUX_REF_HEIGHT
+            }
         }
     except Exception as e:
         return {"error": str(e)}
+
+@app.post("/debug/test_coordinate_scaling")
+async def test_coordinate_scaling(lux_x: int = 290, lux_y: int = 272):
+    """Test coordinate scaling from SDK resolution to screen"""
+    if not PYAUTOGUI_AVAILABLE:
+        return {"error": "PyAutoGUI not available"}
+    
+    screen_width, screen_height = pyautogui.size()
+    x_scaled, y_scaled = scale_coordinates(lux_x, lux_y, screen_width, screen_height)
+    
+    return {
+        "lux_coords": {"x": lux_x, "y": lux_y},
+        "lux_resolution": f"{LUX_REF_WIDTH}x{LUX_REF_HEIGHT}",
+        "screen_resolution": f"{screen_width}x{screen_height}",
+        "scaled_coords": {"x": x_scaled, "y": y_scaled},
+        "scale_factors": {
+            "x": screen_width / LUX_REF_WIDTH,
+            "y": screen_height / LUX_REF_HEIGHT
+        },
+        "explanation": f"LUX ({lux_x}, {lux_y}) on {LUX_REF_WIDTH}x{LUX_REF_HEIGHT} → ({x_scaled}, {y_scaled}) on {screen_width}x{screen_height}"
+    }
 
 # ============================================================
 # MAIN
@@ -837,12 +934,11 @@ if __name__ == "__main__":
     screen_info = debug_screen_info()
     print(f"\n{'='*60}")
     print(f"  TASKER SERVICE v{SERVICE_VERSION}")
-    print(f"  Manual Control + Reasoning Capture")
+    print(f"  SDK Resolution: {LUX_REF_WIDTH}x{LUX_REF_HEIGHT}")
     print(f"{'='*60}")
     print(f"  OAGI: {'✅' if OAGI_AVAILABLE else '❌'}  PIL: {'✅' if PIL_AVAILABLE else '❌'}  PyAutoGUI: {'✅' if PYAUTOGUI_AVAILABLE else '❌'}")
-    print(f"  Screen: {screen_info['width']}x{screen_info['height']} | Lux: {LUX_REF_WIDTH}x{LUX_REF_HEIGHT}")
-    if screen_info.get("needs_resize"):
-        print(f"  ⚠️  Screenshot resize REQUIRED | Scale Y: {screen_info['scale_y']:.3f}")
+    print(f"  Screen: {screen_info['width']}x{screen_info['height']}")
+    print(f"  Scale: X={screen_info['scale_x']:.3f}, Y={screen_info['scale_y']:.3f}")
     print(f"{'='*60}")
     print(f"  http://127.0.0.1:{SERVICE_PORT}")
     print(f"  Reports: {ANALYSIS_DIR}/execution_<timestamp>/")
