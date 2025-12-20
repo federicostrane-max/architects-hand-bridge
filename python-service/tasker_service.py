@@ -1026,6 +1026,36 @@ async def test_type_text(text: str = "test123"):
         "success": True
     }
 
+@app.post("/debug/test_click_and_type")
+async def test_click_and_type(lux_x: int = 630, lux_y: int = 350, text: str = "test"):
+    """Click and type in one action - prevents focus loss"""
+    if not PYAUTOGUI_AVAILABLE:
+        return {"error": "PyAutoGUI not available"}
+    
+    import time
+    
+    screen_width, screen_height = pyautogui.size()
+    x_scaled, y_scaled = scale_coordinates(lux_x, lux_y, screen_width, screen_height)
+    
+    logger.log(f"🎯 CLICK+TYPE - LUX ({lux_x}, {lux_y}) → Screen ({x_scaled}, {y_scaled})")
+    logger.log(f"⌨️ Will type: '{text}'")
+    
+    # Click
+    pyautogui.click(x_scaled, y_scaled)
+    time.sleep(0.3)
+    
+    # Type immediately after click
+    pyautogui.typewrite(text, interval=0.05)
+    
+    logger.log(f"✅ Click+Type completed")
+    
+    return {
+        "lux_coords": {"x": lux_x, "y": lux_y},
+        "clicked_at": {"x": x_scaled, "y": y_scaled},
+        "typed": text,
+        "success": True
+    }
+
 # ============================================================
 # MAIN
 # ============================================================
