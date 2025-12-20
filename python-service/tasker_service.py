@@ -1,14 +1,8 @@
 """
-Tasker Service v5.2 - Official OAGI SDK + Reasoning Capture
-============================================================
+Tasker Service v5.2.1 - Fixed ResizedScreenshotMaker
+=====================================================
 
-Key Features:
-- Manual step control with REASONING capture for each step
-- ResizedScreenshotMaker - resizes screenshots to 1920x1080
-- Coordinate scaling from Lux 1080p to actual screen resolution
-- HTML execution report with full reasoning chain
-
-Based on: https://github.com/agiopen-org/oagi-python
+FIX: PILImage object handling - access .image attribute instead of .to_pil()
 """
 
 import asyncio
@@ -70,7 +64,7 @@ except ImportError:
     print("⚠️ PyAutoGUI not available")
 
 # Configuration
-SERVICE_VERSION = "5.2"
+SERVICE_VERSION = "5.2.1"
 SERVICE_PORT = 8765
 DEBUG_LOGS_DIR = Path("debug_logs")
 ANALYSIS_DIR = Path("lux_analysis")
@@ -464,31 +458,61 @@ async def stop_task():
     return {"status": "stopped", "task": stopped}
 
 # ============================================================
-# RESIZED SCREENSHOT MAKER
+# RESIZED SCREENSHOT MAKER - FIXED v5.2.1
 # ============================================================
 class ResizedScreenshotMaker:
+    """
+    Screenshot maker that resizes to 1920x1080 for Lux.
+    
+    FIX v5.2.1: PILImage doesn't have .to_pil() method.
+    Instead, we need to access the underlying PIL image directly
+    or use pyautogui to capture and resize manually.
+    """
+    
     def __init__(self):
-        self.base_maker = AsyncScreenshotMaker()
         if PYAUTOGUI_AVAILABLE:
             self.screen_width, self.screen_height = pyautogui.size()
         else:
             self.screen_width, self.screen_height = LUX_REF_WIDTH, LUX_REF_HEIGHT
+        
         self.needs_resize = (self.screen_width != LUX_REF_WIDTH or self.screen_height != LUX_REF_HEIGHT)
+        
         if self.needs_resize:
             debug_log(f"📸 ResizedScreenshotMaker: {self.screen_width}x{self.screen_height} → {LUX_REF_WIDTH}x{LUX_REF_HEIGHT}")
+        else:
+            debug_log(f"📸 Screen already {LUX_REF_WIDTH}x{LUX_REF_HEIGHT} - no resize needed")
     
     async def __call__(self):
-        screenshot = await self.base_maker()
-        if not self.needs_resize or not PIL_AVAILABLE:
-            return screenshot
+        """Capture screenshot and resize to 1920x1080 for Lux"""
+        
+        if not self.needs_resize:
+            # No resize needed, use standard maker
+            base_maker = AsyncScreenshotMaker()
+            return await base_maker()
+        
+        if not PIL_AVAILABLE or not PYAUTOGUI_AVAILABLE:
+            debug_log("⚠️ PIL or PyAutoGUI not available - using unresized screenshot", "WARNING")
+            base_maker = AsyncScreenshotMaker()
+            return await base_maker()
+        
         try:
-            pil_image = screenshot.to_pil()
-            resized = pil_image.resize((LUX_REF_WIDTH, LUX_REF_HEIGHT), Image.LANCZOS)
-            debug_log(f"📸 Resized: {pil_image.size} → {LUX_REF_WIDTH}x{LUX_REF_HEIGHT}")
+            # Capture screenshot directly with pyautogui
+            pil_screenshot = pyautogui.screenshot()
+            original_size = pil_screenshot.size
+            
+            # Resize to Lux reference resolution
+            resized = pil_screenshot.resize((LUX_REF_WIDTH, LUX_REF_HEIGHT), Image.LANCZOS)
+            
+            debug_log(f"📸 Screenshot resized: {original_size[0]}x{original_size[1]} → {LUX_REF_WIDTH}x{LUX_REF_HEIGHT}")
+            
+            # Wrap in PILImage for OAGI SDK
             return PILImage(resized)
+            
         except Exception as e:
-            debug_log(f"Resize failed: {e}", "ERROR")
-            return screenshot
+            debug_log(f"⚠️ Screenshot resize failed: {e}", "ERROR")
+            # Fallback to standard maker
+            base_maker = AsyncScreenshotMaker()
+            return await base_maker()
 
 def scale_coordinates(x: int, y: int, screen_width: int, screen_height: int) -> tuple:
     """Scale coordinates from LUX reference (1920x1080) to actual screen"""
@@ -735,6 +759,31 @@ async def capture_debug_screenshot(label: str = "manual"):
     """Capture debug screenshot"""
     path = debug_screenshot(f"manual_{label}")
     return {"success": path is not None, "path": path}
+
+@app.post("/debug/test_resize")
+async def test_screenshot_resize():
+    """Test screenshot resize functionality"""
+    if not PIL_AVAILABLE or not PYAUTOGUI_AVAILABLE:
+        return {"error": "PIL or PyAutoGUI not available"}
+    
+    try:
+        # Capture original
+        original = pyautogui.screenshot()
+        original_path = DEBUG_SCREENSHOTS_DIR / "test_original.png"
+        original.save(original_path)
+        
+        # Resize
+        resized = original.resize((LUX_REF_WIDTH, LUX_REF_HEIGHT), Image.LANCZOS)
+        resized_path = DEBUG_SCREENSHOTS_DIR / "test_resized.png"
+        resized.save(resized_path)
+        
+        return {
+            "success": True,
+            "original": {"path": str(original_path), "size": original.size},
+            "resized": {"path": str(resized_path), "size": resized.size}
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 # ============================================================
 # MAIN
