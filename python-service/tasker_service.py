@@ -682,34 +682,43 @@ async def execute_with_manual_control(request: TaskRequest) -> tuple[TaskRespons
                 # Execute actions
                 try:
                     if request.enable_scaling and PYAUTOGUI_AVAILABLE:
+                        logger.log(f"   🔧 Executing {len(actions)} actions with scaling...")
                         for action in actions:
                             action_type = str(action.type.value) if hasattr(action.type, "value") else str(action.type)
                             argument = str(action.argument) if hasattr(action, "argument") else ""
                             
-                            if action_type == "click":
+                            logger.log(f"   🔍 Action type: '{action_type}' (lowercase: '{action_type.lower()}')")
+                            
+                            if action_type.lower() == "click":
                                 coords = argument.replace(" ", "").split(",")
                                 x_lux, y_lux = int(coords[0]), int(coords[1])
                                 x_scaled, y_scaled = scale_coordinates(x_lux, y_lux, screen_width, screen_height)
-                                logger.log(f"   🖱️ Click at ({x_scaled}, {y_scaled})")
+                                logger.log(f"   🖱️ EXECUTING Click at ({x_scaled}, {y_scaled})")
+                                print(f">>> PYAUTOGUI CLICK: ({x_scaled}, {y_scaled})")
                                 pyautogui.click(x_scaled, y_scaled)
-                                time.sleep(0.15)
+                                print(f">>> CLICK DONE")
+                                time.sleep(0.3)
                             
-                            elif action_type == "type":
+                            elif action_type.lower() == "type":
                                 # Type text character by character
-                                logger.log(f"   ⌨️ Typing: '{argument}'")
-                                time.sleep(0.1)  # Small delay before typing
-                                pyautogui.write(argument, interval=0.03)
-                                time.sleep(0.1)
+                                logger.log(f"   ⌨️ EXECUTING Type: '{argument}'")
+                                print(f">>> PYAUTOGUI TYPE: '{argument}'")
+                                time.sleep(0.2)  # Delay before typing
+                                pyautogui.write(argument, interval=0.05)
+                                print(f">>> TYPE DONE")
+                                time.sleep(0.2)
                             
-                            elif action_type == "hotkey":
+                            elif action_type.lower() == "hotkey":
                                 # Handle hotkeys like "enter", "ctrl+a", "ctrl+c"
                                 logger.log(f"   ⌨️ Pressing hotkey: {argument}")
+                                print(f">>> PYAUTOGUI HOTKEY: {argument}")
                                 time.sleep(0.1)
                                 keys = argument.lower().replace(" ", "").split("+")
                                 pyautogui.hotkey(*keys)
+                                print(f">>> HOTKEY DONE")
                                 time.sleep(0.1)
                             
-                            elif action_type == "scroll":
+                            elif action_type.lower() == "scroll":
                                 # Scroll up or down
                                 logger.log(f"   🖱️ Scrolling: {argument}")
                                 try:
@@ -722,7 +731,7 @@ async def execute_with_manual_control(request: TaskRequest) -> tuple[TaskRespons
                                         pyautogui.scroll(3)
                                 time.sleep(0.1)
                             
-                            elif action_type == "drag":
+                            elif action_type.lower() == "drag":
                                 parts = argument.replace(" ", "").split(",")
                                 if len(parts) >= 4:
                                     x1, y1 = int(parts[0]), int(parts[1])
@@ -736,7 +745,7 @@ async def execute_with_manual_control(request: TaskRequest) -> tuple[TaskRespons
                                     await base_action_handler([action])
                                 time.sleep(0.1)
                             
-                            elif action_type == "wait":
+                            elif action_type.lower() == "wait":
                                 # Wait action
                                 try:
                                     wait_time = float(argument)
