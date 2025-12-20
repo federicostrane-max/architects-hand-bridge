@@ -334,7 +334,7 @@ class TaskRequest(BaseModel):
     action_pause: float = 0.1
     step_delay: float = 0.3
     enable_analysis: bool = True
-    enable_scaling: bool = True
+    enable_scaling: bool = False  # Use SDK handler by default - it works!
     enable_screenshot_resize: bool = True
 
 class TaskResponse(BaseModel):
@@ -683,81 +683,53 @@ async def execute_with_manual_control(request: TaskRequest) -> tuple[TaskRespons
                 try:
                     if request.enable_scaling and PYAUTOGUI_AVAILABLE:
                         logger.log(f"   🔧 Executing {len(actions)} actions with scaling...")
-                        for action in actions:
-                            action_type = str(action.type.value) if hasattr(action.type, "value") else str(action.type)
-                            argument = str(action.argument) if hasattr(action, "argument") else ""
-                            
-                            logger.log(f"   🔍 Action type: '{action_type}' (lowercase: '{action_type.lower()}')")
-                            
-                            if action_type.lower() == "click":
-                                coords = argument.replace(" ", "").split(",")
-                                x_lux, y_lux = int(coords[0]), int(coords[1])
-                                x_scaled, y_scaled = scale_coordinates(x_lux, y_lux, screen_width, screen_height)
-                                logger.log(f"   🖱️ EXECUTING Click at ({x_scaled}, {y_scaled})")
-                                print(f">>> PYAUTOGUI CLICK: ({x_scaled}, {y_scaled})")
-                                pyautogui.click(x_scaled, y_scaled)
-                                print(f">>> CLICK DONE")
-                                time.sleep(0.3)
-                            
-                            elif action_type.lower() == "type":
-                                # Type text character by character
-                                logger.log(f"   ⌨️ EXECUTING Type: '{argument}'")
-                                print(f">>> PYAUTOGUI TYPE: '{argument}'")
-                                time.sleep(0.2)  # Delay before typing
-                                pyautogui.write(argument, interval=0.05)
-                                print(f">>> TYPE DONE")
-                                time.sleep(0.2)
-                            
-                            elif action_type.lower() == "hotkey":
-                                # Handle hotkeys like "enter", "ctrl+a", "ctrl+c"
-                                logger.log(f"   ⌨️ Pressing hotkey: {argument}")
-                                print(f">>> PYAUTOGUI HOTKEY: {argument}")
-                                time.sleep(0.1)
-                                keys = argument.lower().replace(" ", "").split("+")
-                                pyautogui.hotkey(*keys)
-                                print(f">>> HOTKEY DONE")
-                                time.sleep(0.1)
-                            
-                            elif action_type.lower() == "scroll":
-                                # Scroll up or down
-                                logger.log(f"   🖱️ Scrolling: {argument}")
-                                try:
-                                    scroll_amount = int(argument)
-                                    pyautogui.scroll(scroll_amount)
-                                except:
-                                    if "down" in argument.lower():
-                                        pyautogui.scroll(-3)
-                                    else:
-                                        pyautogui.scroll(3)
-                                time.sleep(0.1)
-                            
-                            elif action_type.lower() == "drag":
-                                parts = argument.replace(" ", "").split(",")
-                                if len(parts) >= 4:
-                                    x1, y1 = int(parts[0]), int(parts[1])
-                                    x2, y2 = int(parts[2]), int(parts[3])
-                                    x1_s, y1_s = scale_coordinates(x1, y1, screen_width, screen_height)
-                                    x2_s, y2_s = scale_coordinates(x2, y2, screen_width, screen_height)
-                                    logger.log(f"   🖱️ Drag from ({x1_s}, {y1_s}) to ({x2_s}, {y2_s})")
-                                    pyautogui.moveTo(x1_s, y1_s)
-                                    pyautogui.drag(x2_s - x1_s, y2_s - y1_s, duration=0.5)
-                                else:
-                                    await base_action_handler([action])
-                                time.sleep(0.1)
-                            
-                            elif action_type.lower() == "wait":
-                                # Wait action
-                                try:
-                                    wait_time = float(argument)
-                                except:
-                                    wait_time = 1.0
-                                logger.log(f"   ⏳ Waiting {wait_time}s")
-                                time.sleep(wait_time)
-                            
-                            else:
-                                # Fallback for unknown actions
-                                logger.log(f"   ❓ Unknown action '{action_type}', trying base handler")
-                                await base_action_handler([action])
+                        
+                        # Run actions in a thread to avoid async interference
+                        def execute_actions_sync():
+                            for action in actions:
+                                action_type = str(action.type.value) if hasattr(action.type, "value") else str(action.type)
+                                argument = str(action.argument) if hasattr(action, "argument") else ""
+                                
+                                print(f">>> [THREAD] Action: {action_type}")
+                                
+                                if action_type.lower() == "click":
+                                    coords = argument.replace(" ", "").split(",")
+                                    x_lux, y_lux = int(coords[0]), int(coords[1])
+                                    x_scaled, y_scaled = scale_coordinates(x_lux, y_lux, screen_width, screen_height)
+                                    print(f">>> [THREAD] Moving to ({x_scaled}, {y_scaled})")
+                                    pyautogui.moveTo(x_scaled, y_scaled)
+                                    time.sleep(0.1)
+                                    print(f">>> [THREAD] Clicking")
+                                    pyautogui.click()
+                                    time.sleep(0.3)
+                                    print(f">>> [THREAD] Click done")
+                                
+                                elif action_type.lower() == "type":
+                                    print(f">>> [THREAD] Typing: '{argument}'")
+                                    pyautogui.click()  # Ensure focus
+                                    time.sleep(0.1)
+                                    pyautogui.typewrite(argument, interval=0.05)
+                                    time.sleep(0.2)
+                                    print(f">>> [THREAD] Type done")
+                                
+                                elif action_type.lower() == "hotkey":
+                                    keys = argument.lower().replace(" ", "").split("+")
+                                    pyautogui.hotkey(*keys)
+                                    time.sleep(0.1)
+                                
+                                elif action_type.lower() == "scroll":
+                                    try:
+                                        scroll_amount = int(argument)
+                                        pyautogui.scroll(scroll_amount)
+                                    except:
+                                        pyautogui.scroll(-3 if "down" in argument.lower() else 3)
+                                    time.sleep(0.1)
+                        
+                        # Execute in thread and wait
+                        import concurrent.futures
+                        with concurrent.futures.ThreadPoolExecutor() as executor:
+                            future = executor.submit(execute_actions_sync)
+                            future.result()  # Wait for completion
                     else:
                         await base_action_handler(actions)
                     
