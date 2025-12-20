@@ -1,153 +1,291 @@
 """
-Tasker Service - FastAPI wrapper for OAGI
-Supports all three Lux modes: Actor, Thinker, and Tasker
-Runs locally and receives requests from Architect's Hand Bridge
-v4.1 - KB-Pure with Debug Logging for Booking.com analysis
+Tasker Service v5.0 - Official OAGI SDK + LUX Analyzer
+======================================================
+
+A FastAPI service that bridges the Lovable web app with local LUX execution.
+
+Key Features:
+- Uses official OAGI SDK patterns (AsyncDefaultAgent, AsyncPyautoguiActionHandler)
+- Integrated LUX behavior analyzer for debugging coordinate issues
+- Supports Actor, Thinker, and Tasker modes
+- Automatic browser launch with dedicated Chrome profile
+- Comprehensive logging and screenshot capture
+
+Based on: https://github.com/agiopen-org/oagi-python
+
+Usage:
+    python tasker_service.py
+    
+    # Service runs on http://127.0.0.1:8765
+    # Lovable web app sends POST requests to /execute
 """
 
 import asyncio
 import os
-import io
 import sys
-import webbrowser
 import subprocess
 import time
-from typing import Optional, List
-from contextlib import asynccontextmanager
+import webbrowser
+import json
+from typing import Optional, List, Dict, Any
 from datetime import datetime
 from pathlib import Path
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# PyAutoGUI for screenshots and actions
-import pyautogui
+# ============================================================
+# OAGI SDK IMPORTS - Official Pattern
+# ============================================================
+OAGI_AVAILABLE = False
+OAGI_IMPORT_ERROR = None
 
-# Import Windows Unicode handler (KB official)
-WINDOWS_UNICODE_AVAILABLE = False
-typewrite_exact = None
+try:
+    from oagi import (
+        # Agents
+        AsyncDefaultAgent,
+        AsyncActor,
+        TaskerAgent,
+        
+        # Action Handlers
+        AsyncPyautoguiActionHandler,
+        PyautoguiConfig,
+        
+        # Screenshot
+        AsyncScreenshotMaker,
+        
+        # Image processing
+        PILImage,
+        ImageConfig,
+    )
+    OAGI_AVAILABLE = True
+    print("✅ OAGI SDK loaded successfully")
+except ImportError as e:
+    OAGI_IMPORT_ERROR = str(e)
+    print(f"❌ OAGI SDK import failed: {e}")
+    print("   Install with: pip install oagi")
 
-if sys.platform == "win32":
-    try:
-        from _windows import typewrite_exact
-        WINDOWS_UNICODE_AVAILABLE = True
-        print("✅ Windows Unicode handler loaded (KB official)")
-    except ImportError as e:
-        print(f"⚠️ Windows Unicode handler not available: {e}")
-else:
-    print(f"ℹ️ Platform: {sys.platform} - Windows Unicode not applicable")
+# ============================================================
+# LUX ANALYZER - For debugging coordinate issues
+# ============================================================
+ANALYZER_AVAILABLE = False
 
-# === DEBUG LOGGING SYSTEM ===
+try:
+    from lux_analyzer import LuxAnalyzer
+    ANALYZER_AVAILABLE = True
+    print("✅ LUX Analyzer loaded")
+except ImportError:
+    print("ℹ️ LUX Analyzer not available (optional - copy lux_analyzer.py to use)")
+
+# ============================================================
+# PYAUTOGUI - Fallback for when SDK not available
+# ============================================================
+try:
+    import pyautogui
+    PYAUTOGUI_AVAILABLE = True
+except ImportError:
+    PYAUTOGUI_AVAILABLE = False
+    print("⚠️ PyAutoGUI not available")
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+SERVICE_VERSION = "5.0"
+SERVICE_PORT = 8765
 DEBUG_LOGS_DIR = Path("debug_logs")
+ANALYSIS_DIR = Path("lux_analysis")
+
+# Create directories
 DEBUG_LOGS_DIR.mkdir(exist_ok=True)
+ANALYSIS_DIR.mkdir(exist_ok=True)
 
-def get_debug_log_path() -> Path:
-    """Generate timestamped debug log file path"""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return DEBUG_LOGS_DIR / f"debug_{timestamp}.log"
+# ============================================================
+# LOGGING SYSTEM
+# ============================================================
+class Logger:
+    """Centralized logging with file output"""
+    
+    def __init__(self):
+        self.log_file = DEBUG_LOGS_DIR / f"service_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        self.analyzer: Optional[LuxAnalyzer] = None
+    
+    def log(self, message: str, level: str = "INFO"):
+        """Log message to console and file"""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        log_line = f"[{timestamp}] [{level}] {message}"
+        print(log_line)
+        
+        try:
+            with open(self.log_file, 'a', encoding='utf-8') as f:
+                f.write(log_line + '\n')
+        except Exception:
+            pass
+    
+    def start_analysis_session(self, session_name: str = None):
+        """Start LUX behavior analysis session"""
+        if ANALYZER_AVAILABLE:
+            name = session_name or f"session_{int(time.time())}"
+            self.analyzer = LuxAnalyzer(session_name=name, output_dir=str(ANALYSIS_DIR))
+            self.log(f"Analysis session started: {name}")
+            return self.analyzer
+        return None
+    
+    def end_analysis_session(self) -> Optional[str]:
+        """End analysis session and generate report"""
+        if self.analyzer:
+            report_path = self.analyzer.generate_report()
+            self.log(f"Analysis report: {report_path}")
+            self.analyzer = None
+            return report_path
+        return None
 
-# Initialize current debug log file
-current_debug_log = get_debug_log_path()
-print(f"📁 Debug logs directory: {DEBUG_LOGS_DIR.absolute()}")
+# Global logger
+logger = Logger()
+
+# ============================================================
+# DETAILED DEBUG FUNCTIONS (from v4.x)
+# ============================================================
+DEBUG_SCREENSHOTS_DIR = DEBUG_LOGS_DIR / "screenshots"
+DEBUG_SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
+
+_debug_step_counter = 0
 
 def debug_log(message: str, level: str = "INFO"):
-    """Write debug message to both console and file."""
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    """Detailed debug logging with timestamp"""
+    timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
     log_line = f"[{timestamp}] [{level}] {message}"
     print(log_line)
-    try:
-        with open(current_debug_log, 'a', encoding='utf-8') as f:
-            f.write(log_line + '\n')
-    except Exception as e:
-        print(f"[ERROR] Failed to write debug log: {e}")
+    
+    # Also write to logger file
+    logger.log(message, level)
 
-def debug_screenshot(label: str) -> str:
-    """Take screenshot for debug analysis."""
+def debug_screenshot(prefix: str = "screenshot") -> Optional[str]:
+    """
+    Capture screenshot for debugging.
+    Returns path to saved screenshot.
+    """
+    global _debug_step_counter
+    _debug_step_counter += 1
+    
+    if not PYAUTOGUI_AVAILABLE:
+        debug_log("Screenshot skipped - PyAutoGUI not available", "WARNING")
+        return None
+    
     try:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-        filename = f"screenshot_{label}_{timestamp}.png"
-        filepath = DEBUG_LOGS_DIR / filename
+        filename = f"{_debug_step_counter:03d}_{prefix}_{timestamp}.png"
+        filepath = DEBUG_SCREENSHOTS_DIR / filename
+        
         screenshot = pyautogui.screenshot()
-        screenshot.save(str(filepath))
-        debug_log(f"Screenshot saved: {filename}", "DEBUG")
+        screenshot.save(filepath)
+        
+        debug_log(f"Screenshot saved: {filepath}", "DEBUG")
         return str(filepath)
     except Exception as e:
         debug_log(f"Screenshot failed: {e}", "ERROR")
-        return ""
+        return None
 
 def debug_mouse_position() -> tuple:
-    """Get current mouse position for coordinate verification"""
+    """Get current mouse position for debugging"""
+    if not PYAUTOGUI_AVAILABLE:
+        return (0, 0)
     try:
-        x, y = pyautogui.position()
-        return (x, y)
-    except Exception as e:
-        debug_log(f"Failed to get mouse position: {e}", "ERROR")
+        return pyautogui.position()
+    except Exception:
         return (0, 0)
 
-# OAGI imports - all from main module
-try:
-    from oagi import Actor, TaskerAgent, AsyncPyautoguiActionHandler, AsyncScreenshotMaker
-    OAGI_AVAILABLE = True
-except ImportError as e:
-    print(f"Warning: OAGI import failed: {e}")
-    OAGI_AVAILABLE = False
+def debug_screen_info() -> dict:
+    """Get screen resolution info for debugging"""
+    if not PYAUTOGUI_AVAILABLE:
+        return {"width": 1920, "height": 1080, "source": "default"}
+    try:
+        w, h = pyautogui.size()
+        return {
+            "width": w,
+            "height": h,
+            "lux_ref_width": 1920,
+            "lux_ref_height": 1080,
+            "scale_x": w / 1920,
+            "scale_y": h / 1080,
+            "source": "pyautogui"
+        }
+    except Exception:
+        return {"width": 1920, "height": 1080, "source": "error"}
 
-
-# Request/Response models
+# ============================================================
+# PYDANTIC MODELS
+# ============================================================
 class TaskRequest(BaseModel):
+    """Request model for task execution"""
     api_key: str
     task_description: str
-    todos: List[str]
-    start_url: Optional[str] = None
-    max_steps: int = 60
-    reflection_interval: int = 20
+    mode: str = "actor"  # actor, thinker, tasker
     model: str = "lux-actor-1"
-    temperature: float = 0.1
-    mode: str = "tasker"  # 'direct', 'tasker', 'actor', 'thinker'
-
+    max_steps: int = 20
+    start_url: Optional[str] = None
+    todos: Optional[List[str]] = None
+    
+    # PyAutoGUI configuration
+    drag_duration: float = 0.5
+    scroll_amount: int = 30
+    wait_duration: float = 1.0
+    action_pause: float = 0.1
+    step_delay: float = 0.3
+    
+    # Analysis options
+    enable_analysis: bool = True
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "api_key": "your-oagi-api-key",
+                "task_description": "Search for hotels in Bergamo on booking.com",
+                "mode": "actor",
+                "model": "lux-actor-1",
+                "max_steps": 20,
+                "start_url": "https://www.booking.com",
+                "enable_analysis": True
+            }
+        }
 
 class TaskResponse(BaseModel):
+    """Response model for task execution"""
     success: bool
     message: str
-    completed_todos: int
-    total_todos: int
+    completed_todos: int = 0
+    total_todos: int = 0
     error: Optional[str] = None
-    execution_summary: Optional[dict] = None
-
+    execution_summary: Optional[Dict[str, Any]] = None
+    analysis_report: Optional[str] = None
 
 class StatusResponse(BaseModel):
+    """Response model for status check"""
     status: str
     oagi_available: bool
-    version: str = "4.1.0"
+    analyzer_available: bool
+    version: str = SERVICE_VERSION
 
-
-# Global state
-current_task = None
-is_running = False
-
-
+# ============================================================
+# FASTAPI APP
+# ============================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown events"""
-    print("=" * 50)
-    print("Tasker Service Starting...")
-    print(f"OAGI Available: {OAGI_AVAILABLE}")
-    print("Supported modes: actor, thinker, tasker, direct")
-    print("=" * 50)
+    logger.log(f"Tasker Service v{SERVICE_VERSION} starting...")
+    logger.log(f"OAGI SDK: {'Available' if OAGI_AVAILABLE else 'Not available'}")
+    logger.log(f"Analyzer: {'Available' if ANALYZER_AVAILABLE else 'Not available'}")
     yield
-    print("Tasker Service Shutting Down...")
+    logger.log("Tasker Service shutting down...")
 
-
-# Create FastAPI app
 app = FastAPI(
     title="Tasker Service",
-    description="Local service for OAGI execution (Actor/Thinker/Tasker modes)",
-    version="4.1.0",
+    description="OAGI SDK-based task automation service for Architect's Hand",
+    version=SERVICE_VERSION,
     lifespan=lifespan
 )
 
-# Enable CORS for Electron app
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -156,41 +294,55 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Global state
+is_running = False
+current_task = None
 
+# ============================================================
+# BROWSER MANAGEMENT
+# ============================================================
 def open_browser_with_url(url: str):
-    """Open Chrome with DEDICATED PROFILE for Lux (separate from user's browser)"""
-    print(f"\n>>> Opening browser with URL: {url}")
+    """
+    Open Chrome with dedicated Lux profile.
+    
+    Uses a separate Chrome profile so Lux browser doesn't interfere
+    with user's regular Chrome sessions.
+    """
+    logger.log(f"Opening browser: {url}")
     
     import platform
     system = platform.system()
     
     if system == "Windows":
-        # Use dedicated profile so Lux Chrome is SEPARATE from user's Chrome
-        chrome_path = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+        # Find Chrome
+        chrome_paths = [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            os.path.expanduser(r"~\AppData\Local\Google\Chrome\Application\chrome.exe"),
+        ]
         
-        # Alternative paths
-        if not os.path.exists(chrome_path):
-            chrome_path = r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
-        if not os.path.exists(chrome_path):
-            chrome_path = os.path.expanduser(r"~\AppData\Local\Google\Chrome\Application\chrome.exe")
+        chrome_path = None
+        for path in chrome_paths:
+            if os.path.exists(path):
+                chrome_path = path
+                break
         
-        # Lux dedicated profile path
-        lux_profile_path = os.path.join(
+        if not chrome_path:
+            logger.log("Chrome not found, using default browser", "WARNING")
+            webbrowser.open(url)
+            time.sleep(4)
+            return
+        
+        # Dedicated Lux profile
+        lux_profile = os.path.join(
             os.path.expanduser("~"),
             "AppData", "Local", "Google", "Chrome", "User Data", "LuxProfile"
         )
         
         try:
-            # Launch Chrome with:
-            # --user-data-dir: Dedicated profile (SEPARATE instance from user's Chrome)
-            # --remote-debugging-port: For potential CDP connection
-            # --start-maximized: Full screen
-            # --new-window: New window
-            # --no-first-run: Skip first run dialogs
-            # --no-default-browser-check: Skip default browser prompt
-            process = subprocess.Popen([
+            subprocess.Popen([
                 chrome_path,
-                f"--user-data-dir={lux_profile_path}",
+                f"--user-data-dir={lux_profile}",
                 "--remote-debugging-port=9222",
                 "--start-maximized",
                 "--new-window",
@@ -198,452 +350,325 @@ def open_browser_with_url(url: str):
                 "--no-default-browser-check",
                 "--disable-session-crashed-bubble",
                 url
-            ], 
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-            )
-            print(f">>> Chrome launched with DEDICATED Lux profile")
-            print(f">>> Profile: {lux_profile_path}")
-            print(f">>> PID: {process.pid}")
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            
+            logger.log(f"Chrome launched with Lux profile: {lux_profile}")
+            
         except Exception as e:
-            print(f">>> Chrome launch failed: {e}, trying webbrowser")
+            logger.log(f"Chrome launch failed: {e}", "ERROR")
             webbrowser.open(url)
-    else:
-        # macOS/Linux
+    
+    elif system == "Darwin":  # macOS
+        chrome_path = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        lux_profile = os.path.expanduser("~/Library/Application Support/Google/Chrome/LuxProfile")
+        
+        if os.path.exists(chrome_path):
+            try:
+                subprocess.Popen([
+                    chrome_path,
+                    f"--user-data-dir={lux_profile}",
+                    "--remote-debugging-port=9222",
+                    "--start-maximized",
+                    url
+                ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                logger.log("Chrome launched on macOS")
+            except Exception as e:
+                logger.log(f"Chrome launch failed: {e}", "ERROR")
+                webbrowser.open(url)
+        else:
+            webbrowser.open(url)
+    
+    else:  # Linux
         chrome_paths = [
-            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
             "/usr/bin/google-chrome",
             "/usr/bin/chromium-browser",
+            "/usr/bin/chromium",
         ]
         
-        # Lux profile for non-Windows
-        lux_profile_path = os.path.expanduser("~/.config/google-chrome-lux")
+        lux_profile = os.path.expanduser("~/.config/google-chrome-lux")
         
-        chrome_opened = False
         for chrome_path in chrome_paths:
             if os.path.exists(chrome_path):
                 try:
                     subprocess.Popen([
                         chrome_path,
-                        f"--user-data-dir={lux_profile_path}",
+                        f"--user-data-dir={lux_profile}",
                         "--remote-debugging-port=9222",
                         "--start-maximized",
-                        "--new-window",
                         url
-                    ],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL
-                    )
-                    chrome_opened = True
-                    print(f">>> Chrome opened with Lux profile from: {chrome_path}")
+                    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    logger.log("Chrome launched on Linux")
                     break
-                except Exception as e:
-                    print(f">>> Failed: {e}")
-        
-        if not chrome_opened:
-            print(">>> Using default browser")
+                except Exception:
+                    continue
+        else:
             webbrowser.open(url)
     
-    # Wait for browser to open and load
-    print(">>> Waiting 4 seconds for browser to load...")
+    # Wait for browser to load
+    logger.log("Waiting for browser to load...")
     time.sleep(4)
-    
-    print(">>> Browser ready - Lux can now see ONLY this page\n")
+    logger.log("Browser ready")
 
-
-def take_screenshot_bytes():
-    """Take screenshot and return as bytes"""
-    screenshot = pyautogui.screenshot()
-    img_bytes = io.BytesIO()
-    screenshot.save(img_bytes, format='PNG')
-    return img_bytes.getvalue()
-
-
-def execute_action(action):
-    """Execute a single action using pyautogui with proper delays for web forms"""
-    # Get action type - handle both enum and string
-    action_type = None
-    if hasattr(action, 'type'):
-        if hasattr(action.type, 'value'):
-            action_type = action.type.value  # Enum like ActionType.CLICK
-        else:
-            action_type = str(action.type)
-    
-    # Get argument
-    argument = getattr(action, 'argument', '') or ''
-    
-    print(f"  Executing: {action_type} | Argument: {argument}")
-    
-    if action_type == 'click':
-        # Parse coordinates from argument like "516, 977"
-        try:
-            coords = argument.replace(' ', '').split(',')
-            x = int(coords[0])
-            y = int(coords[1])
-            
-            debug_log(f"=== CLICK ACTION START ===", "INFO")
-            debug_log(f"Target coordinates: ({x}, {y})", "INFO")
-            
-            # Screenshot BEFORE click
-            screenshot_before = debug_screenshot("before_click")
-            
-            # Get mouse position before
-            mouse_before = debug_mouse_position()
-            debug_log(f"Mouse position before: {mouse_before}", "DEBUG")
-            
-            # Execute CLICK (KB Pure: single click)
-            start_time = time.time()
-            pyautogui.click(x, y)
-            click_duration = time.time() - start_time
-            
-            debug_log(f"Click executed in {click_duration*1000:.2f}ms", "INFO")
-            
-            # Get mouse position after
-            mouse_after = debug_mouse_position()
-            debug_log(f"Mouse position after: {mouse_after}", "DEBUG")
-            
-            # Verify mouse moved to target
-            if mouse_after == (x, y):
-                debug_log(f"✅ Mouse position verified at target", "INFO")
-            else:
-                debug_log(f"⚠️ Mouse position mismatch: expected ({x},{y}), got {mouse_after}", "WARNING")
-            
-            # Small delay for UI response
-            time.sleep(0.1)
-            
-            # Screenshot AFTER click
-            screenshot_after = debug_screenshot("after_click")
-            
-            debug_log(f"=== CLICK ACTION END ===", "INFO")
-            
-        except Exception as e:
-            debug_log(f"Click FAILED: {e}", "ERROR")
-            print(f"  -> Click parse error: {e}")
-    
-    elif action_type == 'type':
-        # Argument is the text to type
-        if argument:
-            # Remove quotes if present (KB standard)
-            text = argument.strip("\"'")
-            
-            debug_log(f"=== TYPE ACTION START ===", "INFO")
-            debug_log(f"Text to type: '{text}'", "INFO")
-            debug_log(f"Text length: {len(text)} characters", "INFO")
-            debug_log(f"Windows Unicode available: {WINDOWS_UNICODE_AVAILABLE}", "INFO")
-            
-            # Screenshot BEFORE typing
-            screenshot_before = debug_screenshot("before_type")
-            
-            # Get mouse position
-            mouse_pos = debug_mouse_position()
-            debug_log(f"Mouse position: {mouse_pos}", "DEBUG")
-            
-            # Execute TYPE (KB Pure: platform-specific handler)
-            typing_success = False
-            typing_method = "unknown"
-            
-            try:
-                start_time = time.time()
-                
-                if sys.platform == "win32" and WINDOWS_UNICODE_AVAILABLE:
-                    # KB Official: Windows Unicode handler
-                    typing_method = "Windows Unicode (KB official)"
-                    debug_log(f"Using: {typing_method}", "INFO")
-                    
-                    # Log characters for debug
-                    for i, char in enumerate(text):
-                        debug_log(f"Char {i+1}/{len(text)}: '{char}' (U+{ord(char):04X})", "DEBUG")
-                    
-                    # Type entire text at once (more efficient)
-                    typewrite_exact(text, interval=0.01)
-                    
-                    typing_success = True
-                else:
-                    # KB Fallback: pyautogui
-                    typing_method = "PyAutoGUI (KB fallback)"
-                    debug_log(f"Using: {typing_method}", "INFO")
-                    pyautogui.typewrite(text, interval=0.01)
-                    typing_success = True
-                
-                typing_duration = time.time() - start_time
-                debug_log(f"Typing completed in {typing_duration*1000:.2f}ms", "INFO")
-                
-            except Exception as e:
-                debug_log(f"Typing FAILED: {e}", "ERROR")
-                import traceback
-                debug_log(f"Traceback:\n{traceback.format_exc()}", "ERROR")
-            
-            # Small delay for rendering
-            time.sleep(0.2)
-            
-            # Screenshot AFTER typing
-            screenshot_after = debug_screenshot("after_type")
-            
-            # Simple verification - just check if typing succeeded
-            # Note: Ctrl+A selects entire page, not useful for field verification
-            # We rely on the typing_success flag instead
-            if not typing_success:
-                debug_log(f"⚠️ Typing may have failed - check screenshots", "WARNING")
-                debug_log(f"Possible causes:", "WARNING")
-                debug_log(f"  1. Wrong element focused", "WARNING")
-                debug_log(f"  2. Field cleared by JavaScript", "WARNING")
-                debug_log(f"  3. Field inside iFrame", "WARNING")
-            
-            debug_log(f"=== TYPE ACTION END ===", "INFO")
-            
-            if typing_success:
-                print(f'  -> Typed "{text}" via {typing_method}')
-    
-    elif action_type == 'key' or action_type == 'press':
-        # Argument is the key to press
-        if argument:
-            print(f"  -> Pressing key: {argument}")
-            pyautogui.press(argument.lower())
-    
-    elif action_type == 'scroll':
-        # Handle multiple scroll formats:
-        # Format 1: "421,476,up" or "421,476,down" (x, y, direction)
-        # Format 2: "-3" or "3" (scroll amount)
-        try:
-            parts = argument.replace(' ', '').split(',')
-            if len(parts) >= 3:
-                # Format: x, y, direction
-                x = int(parts[0])
-                y = int(parts[1])
-                direction = parts[2].lower()
-                amount = 3 if direction == 'up' else -3
-                print(f"  -> Scrolling {direction} at ({x}, {y})")
-                pyautogui.moveTo(x, y)
-                pyautogui.scroll(amount)
-            elif len(parts) == 1:
-                # Format: just amount
-                amount = int(argument) if argument else 0
-                print(f"  -> Scrolling: {amount}")
-                pyautogui.scroll(amount)
-            else:
-                print(f"  -> Unknown scroll format: {argument}")
-        except Exception as e:
-            print(f"  -> Scroll error: {e}")
-    
-    elif action_type == 'drag':
-        # Format: "startX, startY, endX, endY"
-        try:
-            parts = argument.replace(' ', '').split(',')
-            if len(parts) >= 4:
-                start_x = int(parts[0])
-                start_y = int(parts[1])
-                end_x = int(parts[2])
-                end_y = int(parts[3])
-                print(f"  -> Dragging from ({start_x}, {start_y}) to ({end_x}, {end_y})")
-                pyautogui.moveTo(start_x, start_y)
-                pyautogui.drag(end_x - start_x, end_y - start_y, duration=0.5)
-            else:
-                print(f"  -> Drag requires 4 coordinates")
-        except Exception as e:
-            print(f"  -> Drag error: {e}")
-    
-    elif action_type == 'hotkey':
-        # Argument is keys separated by +
-        if argument:
-            keys = [k.strip().lower() for k in argument.split('+')]
-            print(f"  -> Hotkey: {keys}")
-            pyautogui.hotkey(*keys)
-    
-    elif action_type == 'finish':
-        print(f"  -> Finish action received")
-        return 'finish'
-    
-    elif action_type == 'wait':
-        # Wait/pause action
-        try:
-            wait_time = float(argument) if argument else 1.0
-        except:
-            wait_time = 1.0
-        print(f"  -> Waiting {wait_time} seconds")
-        time.sleep(wait_time)
-    
-    else:
-        print(f"  -> Unknown action type: {action_type}")
-    
-    return None
-
+# ============================================================
+# API ENDPOINTS
+# ============================================================
+@app.get("/", response_model=StatusResponse)
+async def root():
+    """Root endpoint - returns service status"""
+    return await get_status()
 
 @app.get("/status", response_model=StatusResponse)
 async def get_status():
-    """Check if service is running and OAGI is available"""
+    """Check service status and availability"""
     return StatusResponse(
-        status="running" if not is_running else "busy",
-        oagi_available=OAGI_AVAILABLE
+        status="busy" if is_running else "ready",
+        oagi_available=OAGI_AVAILABLE,
+        analyzer_available=ANALYZER_AVAILABLE,
+        version=SERVICE_VERSION
     )
 
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for monitoring"""
+    return {
+        "status": "healthy",
+        "version": SERVICE_VERSION,
+        "oagi_available": OAGI_AVAILABLE,
+        "oagi_error": OAGI_IMPORT_ERROR if not OAGI_AVAILABLE else None,
+        "analyzer_available": ANALYZER_AVAILABLE,
+        "pyautogui_available": PYAUTOGUI_AVAILABLE,
+        "is_running": is_running,
+        "current_task": current_task[:50] + "..." if current_task and len(current_task) > 50 else current_task
+    }
 
 @app.post("/execute", response_model=TaskResponse)
 async def execute_task(request: TaskRequest):
-    """Execute a task using the appropriate OAGI agent based on mode"""
+    """
+    Main execution endpoint.
+    
+    Receives task requests from Lovable web app and executes them
+    using the OAGI SDK.
+    """
     global is_running, current_task
     
+    # Check OAGI availability
     if not OAGI_AVAILABLE:
         raise HTTPException(
-            status_code=500, 
-            detail="OAGI library not available. Please install with: pip install oagi"
+            status_code=500,
+            detail=f"OAGI SDK not available: {OAGI_IMPORT_ERROR}. Install with: pip install oagi"
         )
     
+    # Check if already running
     if is_running:
         raise HTTPException(
             status_code=409,
-            detail="Another task is currently running"
+            detail=f"Another task is running: {current_task}"
         )
     
     is_running = True
     current_task = request.task_description
+    analysis_report = None
+    
+    # Start analysis session if enabled
+    analyzer = None
+    if request.enable_analysis and ANALYZER_AVAILABLE:
+        analyzer = logger.start_analysis_session(f"task_{int(time.time())}")
     
     try:
+        logger.log(f"{'='*60}")
+        logger.log(f"EXECUTING TASK")
+        logger.log(f"{'='*60}")
+        logger.log(f"Task: {request.task_description}")
+        logger.log(f"Mode: {request.mode}")
+        logger.log(f"Model: {request.model}")
+        logger.log(f"Max Steps: {request.max_steps}")
+        logger.log(f"Start URL: {request.start_url}")
+        
         # Set API key
         os.environ["OAGI_API_KEY"] = request.api_key
         
-        # ========================================
-        # AUTO-OPEN BROWSER IF start_url PROVIDED
-        # ========================================
+        # Open browser if URL provided
         if request.start_url:
             open_browser_with_url(request.start_url)
         
         # Route based on mode
         mode = request.mode.lower()
         
-        if mode in ['direct', 'actor', 'thinker']:
-            # Direct execution - use Actor with step loop
-            return await execute_direct_mode(request)
+        if mode in ['actor', 'thinker', 'direct']:
+            result = await execute_with_default_agent(request, analyzer)
+        elif mode == 'tasker' and request.todos:
+            result = await execute_with_tasker_agent(request, analyzer)
         else:
-            # Tasker mode - use TaskerAgent.execute()
-            return await execute_tasker_mode(request)
+            # Default to actor mode
+            result = await execute_with_default_agent(request, analyzer)
+        
+        # Add analysis report path if available
+        if analyzer:
+            analysis_report = logger.end_analysis_session()
+            result.analysis_report = analysis_report
+        
+        logger.log(f"Task completed: success={result.success}")
+        return result
         
     except Exception as e:
-        print(f"Error executing task: {e}")
+        logger.log(f"Task failed with error: {e}", "ERROR")
         import traceback
-        traceback.print_exc()
+        logger.log(traceback.format_exc(), "ERROR")
+        
+        # End analysis session on error
+        if analyzer:
+            analysis_report = logger.end_analysis_session()
+        
         return TaskResponse(
             success=False,
             message="Task failed with error",
-            completed_todos=0,
-            total_todos=len(request.todos),
-            error=str(e)
+            error=str(e),
+            analysis_report=analysis_report
         )
-        
+    
     finally:
         is_running = False
         current_task = None
 
-
-async def execute_direct_mode(request: TaskRequest) -> TaskResponse:
-    """Execute using Actor with step loop (for Actor/Thinker modes)"""
+@app.post("/stop")
+async def stop_task():
+    """Stop the currently running task"""
+    global is_running, current_task
     
-    print(f"\n{'='*50}")
-    print(f"[Direct Mode] Executing: {request.task_description}")
-    print(f"Model: {request.model}")
-    print(f"Max Steps: {request.max_steps}")
-    print(f"{'='*50}\n")
+    if not is_running:
+        return {"status": "no task running"}
+    
+    # Note: This doesn't actually interrupt the SDK execution
+    # It just marks the task as stopped for the next check
+    is_running = False
+    stopped_task = current_task
+    current_task = None
+    
+    logger.log(f"Task stop requested: {stopped_task}")
+    
+    return {"status": "stop requested", "task": stopped_task}
+
+# ============================================================
+# EXECUTION METHODS - Using Official SDK Patterns
+# ============================================================
+
+async def execute_with_default_agent(
+    request: TaskRequest, 
+    analyzer: Optional[LuxAnalyzer] = None
+) -> TaskResponse:
+    """
+    Execute using AsyncDefaultAgent.
+    
+    This is the recommended approach from the official OAGI SDK.
+    The SDK internally handles:
+    - Screenshot capture
+    - API communication
+    - Action parsing and execution
+    - Step loop management
+    - Error handling
+    """
+    
+    logger.log("Using AsyncDefaultAgent execution")
+    
+    # Configure PyAutoGUI behavior
+    pyautogui_config = PyautoguiConfig(
+        drag_duration=request.drag_duration,
+        scroll_amount=request.scroll_amount,
+        wait_duration=request.wait_duration,
+        action_pause=request.action_pause,
+    )
+    
+    # Determine model
+    model = request.model
+    if request.mode == 'thinker' and 'thinker' not in model:
+        model = 'lux-thinker-1'
+    elif request.mode == 'actor' and 'actor' not in model:
+        model = 'lux-actor-1'
+    
+    logger.log(f"Model: {model}")
+    logger.log(f"Config: pause={pyautogui_config.action_pause}s, scroll={pyautogui_config.scroll_amount}")
     
     try:
-        # Determine model based on mode
-        model = request.model
-        if request.mode == 'thinker' and 'thinker' not in model:
-            model = 'lux-thinker-1'
-        elif request.mode == 'actor' and 'actor' not in model:
-            model = 'lux-actor-1'
-        
-        # Create Actor
-        actor = Actor(
+        # Create agent
+        agent = AsyncDefaultAgent(
             api_key=request.api_key,
-            model=model
+            max_steps=request.max_steps,
+            model=model,
+            step_delay=request.step_delay
         )
         
-        # Initialize task with max_steps
-        actor.init_task(
-            task_desc=request.task_description,
-            max_steps=request.max_steps
+        # Create handlers
+        action_handler = AsyncPyautoguiActionHandler(config=pyautogui_config)
+        screenshot_maker = AsyncScreenshotMaker()
+        
+        # If analyzer is active, wrap handlers to capture data
+        if analyzer:
+            action_handler = AnalyzingActionHandler(action_handler, analyzer)
+        
+        logger.log("Starting agent.execute()...")
+        
+        # Execute using SDK - This is the key simplification!
+        # The SDK handles the entire loop internally
+        completed = await agent.execute(
+            instruction=request.task_description,
+            action_handler=action_handler,
+            image_provider=screenshot_maker,
         )
         
-        # Execute using step loop with pyautogui
-        print("Starting Actor step loop...")
-        steps_executed = 0
-        success = False
-        
-        for step_num in range(request.max_steps):
-            # Take screenshot using pyautogui
-            screenshot_bytes = take_screenshot_bytes()
-            
-            # Get next step from Actor
-            step_result = actor.step(screenshot_bytes)
-            
-            print(f"\nStep {step_num + 1}:")
-            if hasattr(step_result, 'reason'):
-                # Print first 100 chars of reason
-                reason_short = step_result.reason[:100] + "..." if len(step_result.reason) > 100 else step_result.reason
-                print(f"  Reason: {reason_short}")
-            
-            # Check if done via stop flag
-            if hasattr(step_result, 'stop') and step_result.stop:
-                print("  -> Task signaled STOP")
-                success = True
-                break
-            
-            # Execute actions if present
-            if hasattr(step_result, 'actions') and step_result.actions:
-                for action in step_result.actions:
-                    result = execute_action(action)
-                    if result == 'finish':
-                        success = True
-                        break
-                
-                if success:
-                    break
-            
-            steps_executed += 1
-            
-            # Small delay between steps
-            await asyncio.sleep(0.3)
-        
-        # Cleanup
-        actor.close()
-        
-        print(f"\n{'='*50}")
-        print(f"Direct task {'COMPLETED' if success else 'reached max steps'}")
-        print(f"Steps executed: {steps_executed}")
-        print(f"{'='*50}\n")
+        logger.log(f"Agent execution finished: completed={completed}")
         
         return TaskResponse(
-            success=success,
-            message=f"Task {'completed' if success else 'reached max steps'} after {steps_executed} steps",
-            completed_todos=1 if success else 0,
+            success=completed,
+            message="Task completed successfully" if completed else "Task reached max steps without completion",
+            completed_todos=1 if completed else 0,
             total_todos=1,
-            execution_summary={"steps_executed": steps_executed}
+            execution_summary={
+                "model": model,
+                "max_steps": request.max_steps,
+                "step_delay": request.step_delay,
+                "completed": completed
+            }
         )
         
     except Exception as e:
-        print(f"Direct mode error: {e}")
+        logger.log(f"Agent execution error: {e}", "ERROR")
         raise
 
 
-async def execute_tasker_mode(request: TaskRequest) -> TaskResponse:
-    """Execute using TaskerAgent.execute() with todos"""
+async def execute_with_tasker_agent(
+    request: TaskRequest,
+    analyzer: Optional[LuxAnalyzer] = None
+) -> TaskResponse:
+    """
+    Execute using TaskerAgent for structured workflows.
     
-    print(f"\n{'='*50}")
-    print(f"[Tasker Mode] Executing: {request.task_description}")
-    print(f"Todos: {len(request.todos)}")
-    for i, todo in enumerate(request.todos):
-        print(f"  {i+1}. {todo}")
-    print(f"Model: {request.model}")
-    print(f"Max Steps: {request.max_steps}")
-    print(f"Reflection Interval: {request.reflection_interval}")
-    print(f"{'='*50}\n")
+    TaskerAgent is designed for when you have a list of specific
+    steps (todos) that need to be executed in order.
+    """
+    
+    logger.log("Using TaskerAgent execution")
+    logger.log(f"Todos: {len(request.todos)} items")
+    
+    if not request.todos:
+        return TaskResponse(
+            success=False,
+            message="Tasker mode requires 'todos' list",
+            error="No todos provided"
+        )
+    
+    # Configure PyAutoGUI
+    pyautogui_config = PyautoguiConfig(
+        drag_duration=request.drag_duration,
+        scroll_amount=request.scroll_amount,
+        wait_duration=request.wait_duration,
+        action_pause=request.action_pause,
+    )
     
     try:
         # Create TaskerAgent
         tasker = TaskerAgent(
             api_key=request.api_key,
-            model=request.model,
-            max_steps=request.max_steps,
-            reflection_interval=request.reflection_interval
+            base_url=os.getenv("OAGI_BASE_URL", "https://api.agiopen.org"),
         )
         
         # Set task with todos
@@ -652,90 +677,372 @@ async def execute_tasker_mode(request: TaskRequest) -> TaskResponse:
             todos=request.todos
         )
         
-        # Create handlers (these are used internally by execute())
-        action_handler = AsyncPyautoguiActionHandler()
-        image_provider = AsyncScreenshotMaker()
+        # Create handlers
+        action_handler = AsyncPyautoguiActionHandler(config=pyautogui_config)
+        screenshot_maker = AsyncScreenshotMaker()
         
-        # Execute using TaskerAgent's built-in execute method
-        print("Starting TaskerAgent execution...")
-        success = await tasker.execute(
-            instruction=request.task_description,
-            action_handler=action_handler,
-            image_provider=image_provider
-        )
+        if analyzer:
+            action_handler = AnalyzingActionHandler(action_handler, analyzer)
         
-        # Get results
-        completed = len(request.todos) if success else 0
+        # Execute todos
+        completed_count = 0
         
-        # Try to get actual completion from memory
-        try:
-            memory = tasker.get_memory()
-            if memory and hasattr(memory, 'todos'):
-                completed = sum(1 for t in memory.todos if getattr(t, 'status', '').lower() == 'completed')
-        except:
-            pass
+        for i, todo in enumerate(request.todos):
+            logger.log(f"Executing todo {i+1}/{len(request.todos)}: {todo[:50]}...")
+            
+            try:
+                success = await tasker.execute_todo(
+                    todo_index=i,
+                    action_handler=action_handler,
+                    image_provider=screenshot_maker,
+                    max_steps=request.max_steps
+                )
+                
+                if success:
+                    completed_count += 1
+                    logger.log(f"Todo {i+1} completed")
+                else:
+                    logger.log(f"Todo {i+1} incomplete", "WARNING")
+                    
+            except Exception as e:
+                logger.log(f"Todo {i+1} error: {e}", "ERROR")
         
-        print(f"\n{'='*50}")
-        print(f"Task {'COMPLETED' if success else 'FAILED'}")
-        print(f"Completed {completed}/{len(request.todos)} todos")
-        print(f"{'='*50}\n")
+        all_completed = completed_count == len(request.todos)
         
         return TaskResponse(
-            success=success,
-            message="Task completed successfully" if success else "Task failed",
-            completed_todos=completed,
-            total_todos=len(request.todos)
+            success=all_completed,
+            message=f"Completed {completed_count}/{len(request.todos)} todos",
+            completed_todos=completed_count,
+            total_todos=len(request.todos),
+            execution_summary={
+                "completed_todos": completed_count,
+                "total_todos": len(request.todos),
+                "todos": request.todos
+            }
         )
         
     except Exception as e:
-        print(f"Tasker mode error: {e}")
+        logger.log(f"Tasker execution error: {e}", "ERROR")
         raise
 
+# ============================================================
+# ANALYZING ACTION HANDLER WRAPPER (with full logging)
+# ============================================================
 
-@app.post("/stop")
-async def stop_task():
-    """Stop the currently running task"""
-    global is_running, current_task
+class AnalyzingActionHandler:
+    """
+    Wrapper around AsyncPyautoguiActionHandler that logs actions
+    to the LuxAnalyzer with screenshots before/after each action.
     
-    if not is_running:
-        return {"message": "No task running"}
+    This provides the same detailed logging as v4.x debug system.
+    """
     
-    # TODO: Implement graceful stop
-    is_running = False
-    current_task = None
+    def __init__(self, handler: AsyncPyautoguiActionHandler, analyzer: LuxAnalyzer):
+        self.handler = handler
+        self.analyzer = analyzer
+        self.action_counter = 0
     
-    return {"message": "Task stop requested"}
+    async def __call__(self, actions):
+        """Execute actions while logging with screenshots"""
+        results = []
+        
+        for action in actions:
+            self.action_counter += 1
+            
+            # Extract action details
+            action_type = str(action.type.value) if hasattr(action.type, 'value') else str(action.type)
+            argument = str(action.argument) if hasattr(action, 'argument') else ""
+            
+            debug_log(f"{'='*60}", "INFO")
+            debug_log(f"ACTION #{self.action_counter}: {action_type.upper()}", "INFO")
+            debug_log(f"{'='*60}", "INFO")
+            debug_log(f"Argument: {argument}", "INFO")
+            
+            # Get screen info
+            screen_info = debug_screen_info()
+            debug_log(f"Screen: {screen_info['width']}x{screen_info['height']} (scale Y: {screen_info['scale_y']:.3f})", "DEBUG")
+            
+            # Screenshot BEFORE action
+            screenshot_before = debug_screenshot(f"action_{self.action_counter}_before")
+            
+            # Get mouse position BEFORE
+            mouse_before = debug_mouse_position()
+            debug_log(f"Mouse position before: {mouse_before}", "DEBUG")
+            
+            # Log to analyzer based on action type
+            logged_action = None
+            
+            if action_type == 'click':
+                try:
+                    coords = argument.replace(' ', '').split(',')
+                    x, y = int(coords[0]), int(coords[1])
+                    
+                    # Calculate percentages for analysis
+                    x_pct = (x / screen_info['width']) * 100
+                    y_pct = (y / screen_info['height']) * 100
+                    
+                    debug_log(f"Target coordinates: ({x}, {y})", "INFO")
+                    debug_log(f"As percentage: X={x_pct:.1f}%, Y={y_pct:.1f}%", "INFO")
+                    
+                    # Log to analyzer with screenshot
+                    logged_action = self.analyzer.log_action(
+                        action_type='click',
+                        x=x,
+                        y=y,
+                        metadata={
+                            'raw_argument': argument,
+                            'x_percent': x_pct,
+                            'y_percent': y_pct,
+                            'mouse_before': mouse_before,
+                            'screenshot_before': screenshot_before,
+                            'screen_info': screen_info
+                        },
+                        capture_screenshots=True
+                    )
+                except Exception as e:
+                    debug_log(f"Click parse error: {e}", "ERROR")
+            
+            elif action_type == 'type':
+                debug_log(f"Text to type: '{argument}'", "INFO")
+                debug_log(f"Text length: {len(argument)} characters", "INFO")
+                
+                logged_action = self.analyzer.log_action(
+                    action_type='type',
+                    text=argument,
+                    metadata={
+                        'raw_argument': argument,
+                        'text_length': len(argument),
+                        'mouse_position': mouse_before,
+                        'screenshot_before': screenshot_before
+                    },
+                    capture_screenshots=True
+                )
+            
+            elif action_type == 'scroll':
+                debug_log(f"Scroll amount: {argument}", "INFO")
+                
+                logged_action = self.analyzer.log_action(
+                    action_type='scroll',
+                    scroll_amount=argument,
+                    metadata={
+                        'raw_argument': argument,
+                        'mouse_position': mouse_before
+                    },
+                    capture_screenshots=True
+                )
+            
+            elif action_type == 'hotkey':
+                debug_log(f"Hotkey: {argument}", "INFO")
+                
+                logged_action = self.analyzer.log_action(
+                    action_type='hotkey',
+                    keys=argument.split('+') if '+' in argument else [argument],
+                    metadata={'raw_argument': argument},
+                    capture_screenshots=True
+                )
+            
+            else:
+                debug_log(f"Other action type: {action_type} with arg: {argument}", "INFO")
+        
+        # Execute all actions with original handler
+        debug_log(f"Executing {len(actions)} action(s) via SDK handler...", "INFO")
+        start_time = time.time()
+        
+        try:
+            result = await self.handler(actions)
+            execution_time = (time.time() - start_time) * 1000
+            debug_log(f"✅ Actions executed in {execution_time:.2f}ms", "INFO")
+            
+            # Screenshot AFTER all actions
+            screenshot_after = debug_screenshot(f"action_batch_after")
+            
+            # Get mouse position AFTER
+            mouse_after = debug_mouse_position()
+            debug_log(f"Mouse position after: {mouse_after}", "DEBUG")
+            
+            # Mark last logged action as complete
+            if logged_action:
+                self.analyzer.mark_action_complete(logged_action, success=True)
+            
+            return result
+            
+        except Exception as e:
+            debug_log(f"❌ Action execution failed: {e}", "ERROR")
+            
+            # Capture error screenshot
+            debug_screenshot(f"action_error")
+            
+            if logged_action:
+                self.analyzer.mark_action_complete(logged_action, success=False, error_message=str(e))
+            
+            raise
 
+# ============================================================
+# MANUAL CONTROL ENDPOINT (for debugging)
+# ============================================================
 
-@app.get("/")
-async def root():
-    """Root endpoint with service info"""
+@app.post("/execute_step")
+async def execute_single_step(request: dict):
+    """
+    Execute a single step for debugging purposes.
+    
+    Allows step-by-step execution to inspect LUX responses.
+    """
+    if not OAGI_AVAILABLE:
+        raise HTTPException(status_code=500, detail="OAGI SDK not available")
+    
+    api_key = request.get("api_key")
+    instruction = request.get("instruction")
+    model = request.get("model", "lux-actor-1")
+    
+    if not api_key or not instruction:
+        raise HTTPException(status_code=400, detail="api_key and instruction required")
+    
+    try:
+        async with AsyncActor(api_key=api_key, model=model) as actor:
+            await actor.init_task(instruction)
+            
+            screenshot_maker = AsyncScreenshotMaker()
+            image = await screenshot_maker()
+            
+            step = await actor.step(image)
+            
+            # Parse actions for response
+            actions_data = []
+            for action in (step.actions or []):
+                action_type = str(action.type.value) if hasattr(action.type, 'value') else str(action.type)
+                actions_data.append({
+                    "type": action_type,
+                    "argument": str(action.argument) if hasattr(action, 'argument') else None
+                })
+            
+            return {
+                "stop": step.stop if hasattr(step, 'stop') else False,
+                "reason": step.reason if hasattr(step, 'reason') else None,
+                "actions": actions_data,
+                "action_count": len(actions_data)
+            }
+            
+    except Exception as e:
+        logger.log(f"Single step error: {e}", "ERROR")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ============================================================
+# ANALYSIS ENDPOINTS
+# ============================================================
+
+@app.get("/analysis/sessions")
+async def list_analysis_sessions():
+    """List available analysis sessions"""
+    sessions = []
+    
+    if ANALYSIS_DIR.exists():
+        for session_dir in ANALYSIS_DIR.iterdir():
+            if session_dir.is_dir():
+                report_path = session_dir / "report.html"
+                sessions.append({
+                    "name": session_dir.name,
+                    "path": str(session_dir),
+                    "has_report": report_path.exists(),
+                    "report_path": str(report_path) if report_path.exists() else None
+                })
+    
+    return {"sessions": sessions}
+
+@app.get("/analysis/latest")
+async def get_latest_analysis():
+    """Get the latest analysis session"""
+    if not ANALYSIS_DIR.exists():
+        return {"error": "No analysis sessions found"}
+    
+    sessions = sorted(ANALYSIS_DIR.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True)
+    
+    if not sessions:
+        return {"error": "No analysis sessions found"}
+    
+    latest = sessions[0]
+    report_path = latest / "report.html"
+    
     return {
-        "service": "Tasker Service",
-        "version": "4.1.0",
-        "oagi_available": OAGI_AVAILABLE,
-        "supported_modes": ["actor", "thinker", "tasker", "direct"],
-        "features": ["kb_compliant", "windows_unicode_input", "debug_logging", "screenshots"],
-        "endpoints": [
-            "GET /status - Check service status",
-            "POST /execute - Execute a task",
-            "POST /stop - Stop current task"
-        ]
+        "session": latest.name,
+        "path": str(latest),
+        "has_report": report_path.exists(),
+        "report_path": str(report_path) if report_path.exists() else None
     }
 
+@app.get("/debug/screen")
+async def get_screen_debug_info():
+    """
+    Get screen and mouse debug information.
+    Useful for debugging coordinate issues.
+    """
+    screen_info = debug_screen_info()
+    mouse_pos = debug_mouse_position()
+    
+    # Calculate where LUX reference coords would map to
+    lux_ref_x = int(mouse_pos[0] * 1920 / screen_info['width'])
+    lux_ref_y = int(mouse_pos[1] * 1080 / screen_info['height'])
+    
+    return {
+        "screen": screen_info,
+        "current_mouse": {
+            "x": mouse_pos[0],
+            "y": mouse_pos[1],
+            "x_percent": (mouse_pos[0] / screen_info['width']) * 100,
+            "y_percent": (mouse_pos[1] / screen_info['height']) * 100
+        },
+        "lux_reference": {
+            "width": 1920,
+            "height": 1080,
+            "current_mouse_in_lux_ref": {"x": lux_ref_x, "y": lux_ref_y}
+        },
+        "debug_dirs": {
+            "logs": str(DEBUG_LOGS_DIR),
+            "screenshots": str(DEBUG_SCREENSHOTS_DIR),
+            "analysis": str(ANALYSIS_DIR)
+        }
+    }
+
+@app.post("/debug/screenshot")
+async def capture_debug_screenshot(label: str = "manual"):
+    """
+    Capture a debug screenshot manually.
+    Useful for testing screenshot capture.
+    """
+    path = debug_screenshot(f"manual_{label}")
+    
+    if path:
+        return {"success": True, "path": path}
+    else:
+        return {"success": False, "error": "Screenshot failed"}
+
+# ============================================================
+# MAIN
+# ============================================================
 
 if __name__ == "__main__":
     import uvicorn
     
-    print("\n" + "=" * 50)
-    print("  TASKER SERVICE v4.1 (KB-Pure + Debug)")
-    print("  Supports: Actor | Thinker | Tasker modes")
-    print("  + Windows Unicode + Debug Logging")
-    print("=" * 50 + "\n")
+    print("\n" + "="*60)
+    print(f"  TASKER SERVICE v{SERVICE_VERSION}")
+    print("  Official OAGI SDK + LUX Analyzer")
+    print("="*60)
+    print(f"  OAGI SDK:  {'✅ Available' if OAGI_AVAILABLE else '❌ Not available'}")
+    print(f"  Analyzer:  {'✅ Available' if ANALYZER_AVAILABLE else '➖ Optional'}")
+    print(f"  PyAutoGUI: {'✅ Available' if PYAUTOGUI_AVAILABLE else '❌ Not available'}")
+    print("="*60)
+    print(f"  Endpoint: http://127.0.0.1:{SERVICE_PORT}")
+    print(f"  Docs:     http://127.0.0.1:{SERVICE_PORT}/docs")
+    print("="*60 + "\n")
+    
+    if not OAGI_AVAILABLE:
+        print("⚠️  WARNING: OAGI SDK not available!")
+        print("   Install with: pip install oagi")
+        print("")
     
     uvicorn.run(
-        app, 
-        host="127.0.0.1", 
-        port=8765,
+        app,
+        host="127.0.0.1",
+        port=SERVICE_PORT,
         log_level="info"
     )
