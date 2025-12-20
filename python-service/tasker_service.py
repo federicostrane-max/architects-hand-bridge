@@ -1,6 +1,6 @@
 """
-Tasker Service v5.0 - Official OAGI SDK + LUX Analyzer
-======================================================
+Tasker Service v5.1 - Official OAGI SDK + LUX Analyzer + Resolution Fix
+========================================================================
 
 A FastAPI service that bridges the Lovable web app with local LUX execution.
 
@@ -10,8 +10,16 @@ Key Features:
 - Supports Actor, Thinker, and Tasker modes
 - Automatic browser launch with dedicated Chrome profile
 - Comprehensive logging and screenshot capture
+- **NEW v5.1**: ResizedScreenshotMaker - resizes screenshots to 1920x1080 before
+  sending to Lux (required because Lux is trained on 1920x1080 resolution)
 
 Based on: https://github.com/agiopen-org/oagi-python
+
+Resolution Fix:
+    Lux is trained on 1920x1080 resolution (confirmed in KB/README.md).
+    If your screen is different (e.g., 1920x1200), screenshots must be 
+    RESIZED to 1920x1080 before sending to Lux, then coordinates from 
+    Lux must be SCALED back to your actual screen resolution.
 
 Usage:
     python tasker_service.py
@@ -68,6 +76,17 @@ except ImportError as e:
     print("   Install with: pip install oagi")
 
 # ============================================================
+# PIL - Required for screenshot resizing
+# ============================================================
+PIL_AVAILABLE = False
+try:
+    from PIL import Image
+    PIL_AVAILABLE = True
+    print("✅ PIL loaded successfully")
+except ImportError:
+    print("⚠️ PIL not available - install with: pip install Pillow")
+
+# ============================================================
 # LUX ANALYZER - For debugging coordinate issues
 # ============================================================
 ANALYZER_AVAILABLE = False
@@ -92,7 +111,7 @@ except ImportError:
 # ============================================================
 # CONFIGURATION
 # ============================================================
-SERVICE_VERSION = "5.0"
+SERVICE_VERSION = "5.1"
 SERVICE_PORT = 8765
 DEBUG_LOGS_DIR = Path("debug_logs")
 ANALYSIS_DIR = Path("lux_analysis")
@@ -100,6 +119,14 @@ ANALYSIS_DIR = Path("lux_analysis")
 # Create directories
 DEBUG_LOGS_DIR.mkdir(exist_ok=True)
 ANALYSIS_DIR.mkdir(exist_ok=True)
+
+# ============================================================
+# LUX RESOLUTION CONSTANTS (from KB/README.md)
+# ============================================================
+# "The required screen resolution for the virtual machine is 1920x1080"
+# "we did make some hardcode related to this resolution"
+LUX_REF_WIDTH = 1920
+LUX_REF_HEIGHT = 1080
 
 # ============================================================
 # LOGGING SYSTEM
@@ -205,10 +232,11 @@ def debug_screen_info() -> dict:
         return {
             "width": w,
             "height": h,
-            "lux_ref_width": 1920,
-            "lux_ref_height": 1080,
-            "scale_x": w / 1920,
-            "scale_y": h / 1080,
+            "lux_ref_width": LUX_REF_WIDTH,
+            "lux_ref_height": LUX_REF_HEIGHT,
+            "scale_x": w / LUX_REF_WIDTH,
+            "scale_y": h / LUX_REF_HEIGHT,
+            "needs_resize": (w != LUX_REF_WIDTH or h != LUX_REF_HEIGHT),
             "source": "pyautogui"
         }
     except Exception:
@@ -242,6 +270,11 @@ class TaskRequest(BaseModel):
     # coordinates need to be scaled. Set to True to auto-scale.
     enable_scaling: bool = True
     
+    # NEW v5.1: Screenshot resize
+    # If True, screenshots are resized to 1920x1080 before sending to Lux
+    # This is REQUIRED for non-1080p screens because Lux is trained on 1080p
+    enable_screenshot_resize: bool = True
+    
     class Config:
         json_schema_extra = {
             "example": {
@@ -252,7 +285,8 @@ class TaskRequest(BaseModel):
                 "max_steps": 20,
                 "start_url": "https://www.booking.com",
                 "enable_analysis": True,
-                "enable_scaling": True
+                "enable_scaling": True,
+                "enable_screenshot_resize": True
             }
         }
 
@@ -281,7 +315,16 @@ async def lifespan(app: FastAPI):
     """Startup and shutdown events"""
     logger.log(f"Tasker Service v{SERVICE_VERSION} starting...")
     logger.log(f"OAGI SDK: {'Available' if OAGI_AVAILABLE else 'Not available'}")
+    logger.log(f"PIL: {'Available' if PIL_AVAILABLE else 'Not available'}")
     logger.log(f"Analyzer: {'Available' if ANALYZER_AVAILABLE else 'Not available'}")
+    
+    # Log screen info
+    screen_info = debug_screen_info()
+    logger.log(f"Screen: {screen_info['width']}x{screen_info['height']}")
+    logger.log(f"Lux reference: {LUX_REF_WIDTH}x{LUX_REF_HEIGHT}")
+    if screen_info.get('needs_resize'):
+        logger.log(f"⚠️ Screenshot resize REQUIRED (screen != 1080p)")
+    
     yield
     logger.log("Tasker Service shutting down...")
 
@@ -436,15 +479,20 @@ async def get_status():
 @app.get("/health")
 async def health_check():
     """Health check endpoint for monitoring"""
+    screen_info = debug_screen_info()
     return {
         "status": "healthy",
         "version": SERVICE_VERSION,
         "oagi_available": OAGI_AVAILABLE,
         "oagi_error": OAGI_IMPORT_ERROR if not OAGI_AVAILABLE else None,
+        "pil_available": PIL_AVAILABLE,
         "analyzer_available": ANALYZER_AVAILABLE,
         "pyautogui_available": PYAUTOGUI_AVAILABLE,
         "is_running": is_running,
-        "current_task": current_task[:50] + "..." if current_task and len(current_task) > 50 else current_task
+        "current_task": current_task[:50] + "..." if current_task and len(current_task) > 50 else current_task,
+        "screen": screen_info,
+        "lux_resolution": f"{LUX_REF_WIDTH}x{LUX_REF_HEIGHT}",
+        "screenshot_resize_needed": screen_info.get('needs_resize', False)
     }
 
 @app.post("/execute", response_model=TaskResponse)
@@ -489,6 +537,8 @@ async def execute_task(request: TaskRequest):
         logger.log(f"Model: {request.model}")
         logger.log(f"Max Steps: {request.max_steps}")
         logger.log(f"Start URL: {request.start_url}")
+        logger.log(f"Screenshot Resize: {request.enable_screenshot_resize}")
+        logger.log(f"Coordinate Scaling: {request.enable_scaling}")
         
         # Set API key
         os.environ["OAGI_API_KEY"] = request.api_key
@@ -555,6 +605,112 @@ async def stop_task():
     return {"status": "stop requested", "task": stopped_task}
 
 # ============================================================
+# RESIZED SCREENSHOT MAKER - NEW in v5.1
+# ============================================================
+# This is the KEY FIX for non-1080p screens!
+# Lux is trained on 1920x1080, so we must resize screenshots before sending.
+
+class ResizedScreenshotMaker:
+    """
+    Screenshot maker that resizes to 1920x1080 for Lux.
+    
+    From KB/README.md:
+    "The required screen resolution for the virtual machine is 1920x1080"
+    "we did make some hardcode related to this resolution"
+    
+    If your screen is different (e.g., 1920x1200), screenshots must be
+    RESIZED to 1920x1080 before sending to Lux. Then coordinates returned
+    by Lux must be SCALED back to your actual screen resolution.
+    
+    Flow:
+        Screen (1920x1200) → Resize (1920x1080) → Lux → Coords (1080p) → Scale (1200p) → Click
+    """
+    
+    def __init__(self):
+        self.base_maker = AsyncScreenshotMaker()
+        
+        # Get actual screen size
+        if PYAUTOGUI_AVAILABLE:
+            self.screen_width, self.screen_height = pyautogui.size()
+        else:
+            self.screen_width, self.screen_height = LUX_REF_WIDTH, LUX_REF_HEIGHT
+        
+        self.needs_resize = (self.screen_width != LUX_REF_WIDTH or 
+                            self.screen_height != LUX_REF_HEIGHT)
+        
+        if self.needs_resize:
+            debug_log(f"📸 ResizedScreenshotMaker initialized:", "INFO")
+            debug_log(f"   Screen: {self.screen_width}x{self.screen_height}", "INFO")
+            debug_log(f"   Lux expects: {LUX_REF_WIDTH}x{LUX_REF_HEIGHT}", "INFO")
+            debug_log(f"   Will resize screenshots before sending to Lux", "INFO")
+        else:
+            debug_log(f"📸 Screen is already {LUX_REF_WIDTH}x{LUX_REF_HEIGHT} - no resize needed", "INFO")
+    
+    async def __call__(self):
+        """Capture screenshot and resize to 1920x1080 for Lux"""
+        # Capture original screenshot using SDK
+        screenshot = await self.base_maker()
+        
+        # If already correct size, return as-is
+        if not self.needs_resize:
+            return screenshot
+        
+        # Check if PIL is available
+        if not PIL_AVAILABLE:
+            debug_log("⚠️ PIL not available - cannot resize screenshot!", "WARNING")
+            debug_log("   Install with: pip install Pillow", "WARNING")
+            return screenshot
+        
+        try:
+            # Convert to PIL Image
+            pil_image = screenshot.to_pil()
+            original_size = pil_image.size
+            
+            # Resize to Lux reference resolution using high-quality LANCZOS
+            resized = pil_image.resize((LUX_REF_WIDTH, LUX_REF_HEIGHT), Image.LANCZOS)
+            
+            debug_log(f"📸 Screenshot resized: {original_size[0]}x{original_size[1]} → {LUX_REF_WIDTH}x{LUX_REF_HEIGHT}", "INFO")
+            
+            # Convert back to OAGI format
+            return PILImage(resized)
+            
+        except Exception as e:
+            debug_log(f"⚠️ Screenshot resize failed: {e}", "ERROR")
+            debug_log("   Returning original screenshot", "WARNING")
+            return screenshot
+
+# ============================================================
+# COORDINATE SCALING FUNCTIONS
+# ============================================================
+
+def scale_coordinates(x: int, y: int, screen_width: int, screen_height: int) -> tuple:
+    """
+    Scale coordinates from LUX reference (1920x1080) to actual screen resolution.
+    
+    This is the OUTPUT scaling - after Lux returns coordinates, we scale them
+    to match the actual screen resolution.
+    
+    Args:
+        x, y: Original coordinates from LUX (in 1920x1080 space)
+        screen_width, screen_height: Actual screen resolution
+        
+    Returns:
+        (x_scaled, y_scaled): Coordinates adjusted for actual screen
+        
+    Example:
+        Screen: 1920x1200
+        Lux returns: (670, 397) for 1080p
+        Scaled result: (670, 441) for 1200p
+    """
+    # Scale X (usually 1.0 if width is 1920)
+    x_scaled = int(x * screen_width / LUX_REF_WIDTH)
+    
+    # Scale Y (important for 1920x1200 screens: 1200/1080 = 1.111)
+    y_scaled = int(y * screen_height / LUX_REF_HEIGHT)
+    
+    return x_scaled, y_scaled
+
+# ============================================================
 # EXECUTION METHODS - Using Official SDK Patterns
 # ============================================================
 
@@ -593,7 +749,8 @@ async def execute_with_default_agent(
     
     logger.log(f"Model: {model}")
     logger.log(f"Config: pause={pyautogui_config.action_pause}s, scroll={pyautogui_config.scroll_amount}")
-    logger.log(f"Scaling: {'ENABLED' if request.enable_scaling else 'disabled'}")
+    logger.log(f"Screenshot Resize: {'ENABLED' if request.enable_screenshot_resize else 'disabled'}")
+    logger.log(f"Coordinate Scaling: {'ENABLED' if request.enable_scaling else 'disabled'}")
     
     try:
         # Create agent
@@ -606,7 +763,17 @@ async def execute_with_default_agent(
         
         # Create handlers
         action_handler = AsyncPyautoguiActionHandler(config=pyautogui_config)
-        screenshot_maker = AsyncScreenshotMaker()
+        
+        # =========================================================
+        # SCREENSHOT MAKER - KEY CHANGE IN v5.1
+        # =========================================================
+        # Use ResizedScreenshotMaker to resize screenshots to 1920x1080
+        # This is REQUIRED for non-1080p screens!
+        if request.enable_screenshot_resize:
+            screenshot_maker = ResizedScreenshotMaker()
+        else:
+            screenshot_maker = AsyncScreenshotMaker()
+            logger.log("⚠️ Screenshot resize DISABLED - coordinates may be incorrect on non-1080p screens!", "WARNING")
         
         # Wrap handler based on options:
         # - If analysis enabled: use AnalyzingActionHandler (includes scaling)
@@ -643,6 +810,8 @@ async def execute_with_default_agent(
                 "model": model,
                 "max_steps": request.max_steps,
                 "step_delay": request.step_delay,
+                "screenshot_resize": request.enable_screenshot_resize,
+                "coordinate_scaling": request.enable_scaling,
                 "completed": completed
             }
         )
@@ -696,7 +865,15 @@ async def execute_with_tasker_agent(
         
         # Create handlers
         action_handler = AsyncPyautoguiActionHandler(config=pyautogui_config)
-        screenshot_maker = AsyncScreenshotMaker()
+        
+        # =========================================================
+        # SCREENSHOT MAKER - KEY CHANGE IN v5.1
+        # =========================================================
+        if request.enable_screenshot_resize:
+            screenshot_maker = ResizedScreenshotMaker()
+        else:
+            screenshot_maker = AsyncScreenshotMaker()
+            logger.log("⚠️ Screenshot resize DISABLED - coordinates may be incorrect!", "WARNING")
         
         # Wrap handler based on options:
         if analyzer:
@@ -742,41 +919,15 @@ async def execute_with_tasker_agent(
             execution_summary={
                 "completed_todos": completed_count,
                 "total_todos": len(request.todos),
-                "todos": request.todos
+                "todos": request.todos,
+                "screenshot_resize": request.enable_screenshot_resize,
+                "coordinate_scaling": request.enable_scaling
             }
         )
         
     except Exception as e:
         logger.log(f"Tasker execution error: {e}", "ERROR")
         raise
-
-# ============================================================
-# RESOLUTION SCALING CONFIGURATION
-# ============================================================
-# LUX models are trained on 1920x1080 resolution.
-# If your screen is different, coordinates need to be scaled.
-
-LUX_REF_WIDTH = 1920
-LUX_REF_HEIGHT = 1080
-
-def scale_coordinates(x: int, y: int, screen_width: int, screen_height: int) -> tuple:
-    """
-    Scale coordinates from LUX reference (1920x1080) to actual screen resolution.
-    
-    Args:
-        x, y: Original coordinates from LUX (in 1920x1080 space)
-        screen_width, screen_height: Actual screen resolution
-        
-    Returns:
-        (x_scaled, y_scaled): Coordinates adjusted for actual screen
-    """
-    # Scale X (usually 1.0 if width is 1920)
-    x_scaled = int(x * screen_width / LUX_REF_WIDTH)
-    
-    # Scale Y (important for 1920x1200 screens: 1200/1080 = 1.111)
-    y_scaled = int(y * screen_height / LUX_REF_HEIGHT)
-    
-    return x_scaled, y_scaled
 
 # ============================================================
 # SCALING ACTION HANDLER (lightweight, no logging)
@@ -788,6 +939,12 @@ class ScalingActionHandler:
     Use this when enable_scaling=True but enable_analysis=False.
     
     For full logging with scaling, use AnalyzingActionHandler instead.
+    
+    NOTE: With ResizedScreenshotMaker, the flow is:
+        1. Screenshot (1920x1200) → Resize (1920x1080) → Lux
+        2. Lux returns coordinates for 1080p
+        3. This handler scales coordinates: 1080p → 1200p
+        4. Click at scaled coordinates
     """
     
     def __init__(self, handler: AsyncPyautoguiActionHandler):
@@ -797,7 +954,7 @@ class ScalingActionHandler:
         if PYAUTOGUI_AVAILABLE:
             self.screen_width, self.screen_height = pyautogui.size()
         else:
-            self.screen_width, self.screen_height = 1920, 1080
+            self.screen_width, self.screen_height = LUX_REF_WIDTH, LUX_REF_HEIGHT
         
         self.scale_x = self.screen_width / LUX_REF_WIDTH
         self.scale_y = self.screen_height / LUX_REF_HEIGHT
@@ -849,6 +1006,12 @@ class AnalyzingActionHandler:
     3. Provides detailed debug logging
     
     This fixes the coordinate mismatch on non-1080p screens!
+    
+    NOTE: With ResizedScreenshotMaker, the complete flow is:
+        1. Screenshot (1920x1200) → Resize (1920x1080) → Lux
+        2. Lux "sees" a 1080p image and returns coordinates for 1080p
+        3. This handler scales coordinates: 1080p → 1200p
+        4. Click at scaled coordinates on actual screen
     """
     
     def __init__(self, handler: AsyncPyautoguiActionHandler, analyzer: LuxAnalyzer, enable_scaling: bool = True):
@@ -861,7 +1024,7 @@ class AnalyzingActionHandler:
         if PYAUTOGUI_AVAILABLE:
             self.screen_width, self.screen_height = pyautogui.size()
         else:
-            self.screen_width, self.screen_height = 1920, 1080
+            self.screen_width, self.screen_height = LUX_REF_WIDTH, LUX_REF_HEIGHT
         
         # Calculate scale factors
         self.scale_x = self.screen_width / LUX_REF_WIDTH
@@ -1084,6 +1247,7 @@ async def execute_single_step(request: dict):
     api_key = request.get("api_key")
     instruction = request.get("instruction")
     model = request.get("model", "lux-actor-1")
+    enable_resize = request.get("enable_screenshot_resize", True)
     
     if not api_key or not instruction:
         raise HTTPException(status_code=400, detail="api_key and instruction required")
@@ -1092,7 +1256,12 @@ async def execute_single_step(request: dict):
         async with AsyncActor(api_key=api_key, model=model) as actor:
             await actor.init_task(instruction)
             
-            screenshot_maker = AsyncScreenshotMaker()
+            # Use ResizedScreenshotMaker if enabled
+            if enable_resize:
+                screenshot_maker = ResizedScreenshotMaker()
+            else:
+                screenshot_maker = AsyncScreenshotMaker()
+            
             image = await screenshot_maker()
             
             step = await actor.step(image)
@@ -1110,7 +1279,8 @@ async def execute_single_step(request: dict):
                 "stop": step.stop if hasattr(step, 'stop') else False,
                 "reason": step.reason if hasattr(step, 'reason') else None,
                 "actions": actions_data,
-                "action_count": len(actions_data)
+                "action_count": len(actions_data),
+                "screenshot_resized": enable_resize
             }
             
     except Exception as e:
@@ -1170,8 +1340,8 @@ async def get_screen_debug_info():
     mouse_pos = debug_mouse_position()
     
     # Calculate where LUX reference coords would map to
-    lux_ref_x = int(mouse_pos[0] * 1920 / screen_info['width'])
-    lux_ref_y = int(mouse_pos[1] * 1080 / screen_info['height'])
+    lux_ref_x = int(mouse_pos[0] * LUX_REF_WIDTH / screen_info['width'])
+    lux_ref_y = int(mouse_pos[1] * LUX_REF_HEIGHT / screen_info['height'])
     
     return {
         "screen": screen_info,
@@ -1182,9 +1352,13 @@ async def get_screen_debug_info():
             "y_percent": (mouse_pos[1] / screen_info['height']) * 100
         },
         "lux_reference": {
-            "width": 1920,
-            "height": 1080,
+            "width": LUX_REF_WIDTH,
+            "height": LUX_REF_HEIGHT,
             "current_mouse_in_lux_ref": {"x": lux_ref_x, "y": lux_ref_y}
+        },
+        "resolution_fix": {
+            "screenshot_resize": "Enabled (screenshots resized to 1920x1080 before Lux)",
+            "coordinate_scaling": f"Enabled (Y scaled by {screen_info['scale_y']:.3f})"
         },
         "debug_dirs": {
             "logs": str(DEBUG_LOGS_DIR),
@@ -1206,6 +1380,47 @@ async def capture_debug_screenshot(label: str = "manual"):
     else:
         return {"success": False, "error": "Screenshot failed"}
 
+@app.post("/debug/test_resize")
+async def test_screenshot_resize():
+    """
+    Test the screenshot resize functionality.
+    Captures a screenshot, resizes it to 1920x1080, and saves both versions.
+    """
+    if not PYAUTOGUI_AVAILABLE:
+        return {"success": False, "error": "PyAutoGUI not available"}
+    
+    if not PIL_AVAILABLE:
+        return {"success": False, "error": "PIL not available"}
+    
+    try:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Capture original
+        original = pyautogui.screenshot()
+        original_path = DEBUG_SCREENSHOTS_DIR / f"resize_test_{timestamp}_original.png"
+        original.save(original_path)
+        
+        # Resize to 1080p
+        resized = original.resize((LUX_REF_WIDTH, LUX_REF_HEIGHT), Image.LANCZOS)
+        resized_path = DEBUG_SCREENSHOTS_DIR / f"resize_test_{timestamp}_resized_1080p.png"
+        resized.save(resized_path)
+        
+        return {
+            "success": True,
+            "original": {
+                "path": str(original_path),
+                "size": f"{original.width}x{original.height}"
+            },
+            "resized": {
+                "path": str(resized_path),
+                "size": f"{resized.width}x{resized.height}"
+            },
+            "message": "Compare both images to verify resize quality"
+        }
+        
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
 # ============================================================
 # MAIN
 # ============================================================
@@ -1213,13 +1428,24 @@ async def capture_debug_screenshot(label: str = "manual"):
 if __name__ == "__main__":
     import uvicorn
     
+    screen_info = debug_screen_info()
+    
     print("\n" + "="*60)
     print(f"  TASKER SERVICE v{SERVICE_VERSION}")
-    print("  Official OAGI SDK + LUX Analyzer")
+    print("  Official OAGI SDK + LUX Analyzer + Resolution Fix")
     print("="*60)
     print(f"  OAGI SDK:  {'✅ Available' if OAGI_AVAILABLE else '❌ Not available'}")
+    print(f"  PIL:       {'✅ Available' if PIL_AVAILABLE else '❌ Not available'}")
     print(f"  Analyzer:  {'✅ Available' if ANALYZER_AVAILABLE else '➖ Optional'}")
     print(f"  PyAutoGUI: {'✅ Available' if PYAUTOGUI_AVAILABLE else '❌ Not available'}")
+    print("="*60)
+    print(f"  Screen:    {screen_info['width']}x{screen_info['height']}")
+    print(f"  Lux Ref:   {LUX_REF_WIDTH}x{LUX_REF_HEIGHT}")
+    if screen_info.get('needs_resize'):
+        print(f"  ⚠️  Screenshot resize: REQUIRED (screen != 1080p)")
+        print(f"  📐 Scale factors: X={screen_info['scale_x']:.3f}, Y={screen_info['scale_y']:.3f}")
+    else:
+        print(f"  ✅ Screen matches Lux reference - no resize needed")
     print("="*60)
     print(f"  Endpoint: http://127.0.0.1:{SERVICE_PORT}")
     print(f"  Docs:     http://127.0.0.1:{SERVICE_PORT}/docs")
@@ -1228,6 +1454,11 @@ if __name__ == "__main__":
     if not OAGI_AVAILABLE:
         print("⚠️  WARNING: OAGI SDK not available!")
         print("   Install with: pip install oagi")
+        print("")
+    
+    if not PIL_AVAILABLE:
+        print("⚠️  WARNING: PIL not available - screenshot resize won't work!")
+        print("   Install with: pip install Pillow")
         print("")
     
     uvicorn.run(
