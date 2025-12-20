@@ -926,6 +926,54 @@ async def test_coordinate_scaling(lux_x: int = 290, lux_y: int = 272):
     }
 
 # ============================================================
+# DEBUG: TEST MOUSE MOVEMENT
+# ============================================================
+@app.post("/debug/test_mouse")
+async def test_mouse_movement():
+    """Test if PyAutoGUI can move the mouse from within the service"""
+    if not PYAUTOGUI_AVAILABLE:
+        return {"error": "PyAutoGUI not available"}
+    
+    import time
+    
+    # Get current position
+    start_pos = pyautogui.position()
+    logger.log(f"🖱️ TEST MOUSE - Start position: {start_pos}")
+    
+    # Move to 500, 500
+    logger.log(f"🖱️ Moving to (500, 500)...")
+    pyautogui.moveTo(500, 500)
+    time.sleep(0.3)
+    
+    # Get new position
+    after_move = pyautogui.position()
+    logger.log(f"🖱️ After moveTo: {after_move}")
+    
+    # Click
+    logger.log(f"🖱️ Clicking at (500, 500)...")
+    pyautogui.click(500, 500)
+    time.sleep(0.2)
+    
+    # Move to 800, 400
+    logger.log(f"🖱️ Moving to (800, 400)...")
+    pyautogui.moveTo(800, 400)
+    time.sleep(0.3)
+    
+    final_pos = pyautogui.position()
+    logger.log(f"🖱️ Final position: {final_pos}")
+    
+    mouse_moved = (start_pos[0] != after_move[0]) or (start_pos[1] != after_move[1])
+    logger.log(f"🖱️ Mouse moved: {mouse_moved}")
+    
+    return {
+        "start": {"x": start_pos[0], "y": start_pos[1]},
+        "after_move_to_500_500": {"x": after_move[0], "y": after_move[1]},
+        "final_800_400": {"x": final_pos[0], "y": final_pos[1]},
+        "mouse_moved": mouse_moved,
+        "success": mouse_moved
+    }
+
+# ============================================================
 # MAIN
 # ============================================================
 if __name__ == "__main__":
