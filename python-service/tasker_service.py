@@ -1,8 +1,11 @@
 """
-Tasker Service v5.3.0 - SDK Resolution Fix (1260x700)
-=====================================================
+Tasker Service v5.4.0 - Max Steps Fix + Clipboard Typing
+=========================================================
 
-CHANGE: Using SDK-recommended 1260x700 resolution instead of 1920x1080
+CHANGES from v5.3.0:
+- FIX: max_steps now correctly passed to AsyncActor (was hardcoded to 20)
+- FIX: Typing uses clipboard (Ctrl+V) instead of typewrite() for Italian keyboard support
+- Supports @ and special characters that don't work with typewrite()
 
 From oagi-python SDK README:
     config = ImageConfig(
@@ -73,8 +76,17 @@ except ImportError:
     PYAUTOGUI_AVAILABLE = False
     print("⚠️ PyAutoGUI not available")
 
+# Pyperclip for clipboard operations
+PYPERCLIP_AVAILABLE = False
+try:
+    import pyperclip
+    PYPERCLIP_AVAILABLE = True
+    print("✅ Pyperclip loaded")
+except ImportError:
+    print("⚠️ Pyperclip not available - typing may not work with special chars")
+
 # Configuration
-SERVICE_VERSION = "5.3.0"
+SERVICE_VERSION = "5.4.0"
 SERVICE_PORT = 8765
 DEBUG_LOGS_DIR = Path("debug_logs")
 ANALYSIS_DIR = Path("lux_analysis")
@@ -84,18 +96,6 @@ ANALYSIS_DIR.mkdir(exist_ok=True)
 # ============================================================
 # LUX RESOLUTION - FROM SDK ImageConfig EXAMPLE
 # ============================================================
-# The SDK recommends 1260x700 for optimal Lux coordinate detection.
-# This is different from the OSWorld training resolution (1920x1080).
-# 
-# SDK Example:
-#   config = ImageConfig(format="JPEG", quality=85, width=1260, height=700)
-#
-# Flow:
-#   1. Capture screenshot at real resolution (e.g., 1920x1200)
-#   2. Resize to 1260x700 for Lux API
-#   3. Lux returns coordinates relative to 1260x700
-#   4. Scale coordinates back to real screen resolution
-
 LUX_REF_WIDTH = 1260
 LUX_REF_HEIGHT = 700
 
@@ -196,7 +196,7 @@ class ExecutionHistory:
 </head>
 <body>
     <div class="header">
-        <h1>🤖 LUX Execution Report v5.3.0</h1>
+        <h1>🤖 LUX Execution Report v{SERVICE_VERSION}</h1>
         <div><strong>Task:</strong> {self.task_description}</div>
         <div><strong>Duration:</strong> {duration:.1f}s | <strong>Status:</strong> {"✅ Completed" if self.completed else "❌ Not Completed"}</div>
     </div>
@@ -311,11 +311,43 @@ def debug_screen_info() -> dict:
             "width": w, "height": h,
             "lux_ref_width": LUX_REF_WIDTH, "lux_ref_height": LUX_REF_HEIGHT,
             "scale_x": w / LUX_REF_WIDTH, "scale_y": h / LUX_REF_HEIGHT,
-            "needs_resize": True,  # Always resize to SDK resolution
+            "needs_resize": True,
             "source": "pyautogui"
         }
     except:
         return {"width": 1920, "height": 1080, "source": "error"}
+
+# ============================================================
+# CLIPBOARD TYPING - For Italian keyboard support
+# ============================================================
+def type_via_clipboard(text: str):
+    """
+    Type text using clipboard (Ctrl+V) instead of typewrite().
+    This supports special characters like @ on Italian keyboards.
+    """
+    if PYPERCLIP_AVAILABLE:
+        # Save current clipboard
+        try:
+            old_clipboard = pyperclip.paste()
+        except:
+            old_clipboard = ""
+        
+        try:
+            # Copy text to clipboard and paste
+            pyperclip.copy(text)
+            time.sleep(0.05)
+            pyautogui.hotkey('ctrl', 'v')
+            time.sleep(0.1)
+        finally:
+            # Restore old clipboard (optional, comment out if not needed)
+            try:
+                pyperclip.copy(old_clipboard)
+            except:
+                pass
+    else:
+        # Fallback to typewrite if pyperclip not available
+        # This won't work well with special chars on non-US keyboards
+        pyautogui.typewrite(text, interval=0.05)
 
 # ============================================================
 # PYDANTIC MODELS
@@ -334,7 +366,7 @@ class TaskRequest(BaseModel):
     action_pause: float = 0.1
     step_delay: float = 0.3
     enable_analysis: bool = True
-    enable_scaling: bool = False  # Use SDK handler by default - it works!
+    enable_scaling: bool = False
     enable_screenshot_resize: bool = True
 
 class TaskResponse(BaseModel):
@@ -362,6 +394,7 @@ async def lifespan(app: FastAPI):
     screen_info = debug_screen_info()
     logger.log(f"Screen: {screen_info['width']}x{screen_info['height']}")
     logger.log(f"SDK Resolution: {LUX_REF_WIDTH}x{LUX_REF_HEIGHT}")
+    logger.log(f"Clipboard typing: {'✅ Enabled' if PYPERCLIP_AVAILABLE else '❌ Disabled'}")
     yield
     logger.log("Shutting down...")
 
@@ -427,6 +460,7 @@ async def health_check():
         "pil_available": PIL_AVAILABLE,
         "analyzer_available": ANALYZER_AVAILABLE,
         "pyautogui_available": PYAUTOGUI_AVAILABLE,
+        "pyperclip_available": PYPERCLIP_AVAILABLE,
         "is_running": is_running,
         "current_task": current_task,
         "screen": screen_info,
@@ -458,6 +492,7 @@ async def execute_task(request: TaskRequest):
         logger.log(f"SDK Resolution: {LUX_REF_WIDTH}x{LUX_REF_HEIGHT}")
         logger.log(f"Screenshot Resize: {request.enable_screenshot_resize}")
         logger.log(f"Coordinate Scaling: {request.enable_scaling}")
+        logger.log(f"Clipboard Typing: {PYPERCLIP_AVAILABLE}")
         
         os.environ["OAGI_API_KEY"] = request.api_key
         
@@ -496,22 +531,6 @@ async def stop_task():
 class ResizedScreenshotMaker:
     """
     Screenshot maker that resizes to 1260x700 for Lux API.
-    
-    From SDK (oagi-python) ImageConfig example:
-        config = ImageConfig(
-            format="JPEG",
-            quality=85,
-            width=1260,
-            height=700
-        )
-    
-    This resolution is optimized for Lux coordinate detection.
-    
-    Flow:
-        1. Capture screenshot at real resolution (e.g., 1920x1200)
-        2. Resize to 1260x700 for Lux API
-        3. Lux returns coordinates relative to 1260x700
-        4. Scale coordinates back to real screen resolution
     """
     
     def __init__(self):
@@ -520,10 +539,9 @@ class ResizedScreenshotMaker:
         else:
             self.screen_width, self.screen_height = 1920, 1080
         
-        # Always resize since SDK expects 1260x700
         self.needs_resize = True
         
-        debug_log(f"📸 ResizedScreenshotMaker (SDK v5.3.0):")
+        debug_log(f"📸 ResizedScreenshotMaker (SDK v{SERVICE_VERSION}):")
         debug_log(f"   Screen: {self.screen_width}x{self.screen_height}")
         debug_log(f"   Lux SDK expects: {LUX_REF_WIDTH}x{LUX_REF_HEIGHT}")
         debug_log(f"   Scale factors: X={self.screen_width/LUX_REF_WIDTH:.3f}, Y={self.screen_height/LUX_REF_HEIGHT:.3f}")
@@ -537,39 +555,111 @@ class ResizedScreenshotMaker:
             return await base_maker()
         
         try:
-            # Capture screenshot directly with pyautogui
             pil_screenshot = pyautogui.screenshot()
             original_size = pil_screenshot.size
             
-            # Resize to SDK reference resolution (1260x700)
             resized = pil_screenshot.resize((LUX_REF_WIDTH, LUX_REF_HEIGHT), Image.LANCZOS)
             
             debug_log(f"📸 Screenshot: {original_size[0]}x{original_size[1]} → {LUX_REF_WIDTH}x{LUX_REF_HEIGHT}")
             
-            # Wrap in PILImage for OAGI SDK
             return PILImage(resized)
             
         except Exception as e:
             debug_log(f"⚠️ Screenshot resize failed: {e}", "ERROR")
-            # Fallback to standard maker
             base_maker = AsyncScreenshotMaker()
             return await base_maker()
 
 def scale_coordinates(x: int, y: int, screen_width: int, screen_height: int) -> tuple:
     """
     Scale coordinates from Lux SDK reference (1260x700) to actual screen.
-    
-    Lux returns coordinates relative to 1260x700.
-    We need to scale them to the actual screen resolution.
-    
-    Example:
-        Lux says click at (290, 272) on 1260x700
-        Screen is 1920x1200
-        Scale to: (290 * 1920/1260, 272 * 1200/700) = (442, 466)
     """
     x_scaled = int(x * screen_width / LUX_REF_WIDTH)
     y_scaled = int(y * screen_height / LUX_REF_HEIGHT)
     return x_scaled, y_scaled
+
+# ============================================================
+# CUSTOM ACTION HANDLER - With Clipboard Typing
+# ============================================================
+class ClipboardActionHandler:
+    """
+    Custom action handler that uses clipboard for typing.
+    This supports special characters like @ on Italian keyboards.
+    """
+    
+    def __init__(self, config: PyautoguiConfig = None):
+        self.config = config or PyautoguiConfig()
+    
+    async def __call__(self, actions):
+        """Execute actions with clipboard-based typing"""
+        for action in actions:
+            action_type = str(action.type.value) if hasattr(action.type, "value") else str(action.type)
+            argument = str(action.argument) if hasattr(action, "argument") else ""
+            
+            if action_type.lower() == "click":
+                try:
+                    coords = argument.replace(" ", "").split(",")
+                    x, y = int(coords[0]), int(coords[1])
+                    pyautogui.click(x, y)
+                    time.sleep(self.config.action_pause)
+                except Exception as e:
+                    debug_log(f"Click error: {e}", "ERROR")
+            
+            elif action_type.lower() == "left_double":
+                try:
+                    coords = argument.replace(" ", "").split(",")
+                    x, y = int(coords[0]), int(coords[1])
+                    pyautogui.doubleClick(x, y)
+                    time.sleep(self.config.action_pause)
+                except Exception as e:
+                    debug_log(f"Double-click error: {e}", "ERROR")
+            
+            elif action_type.lower() == "type":
+                debug_log(f"⌨️ Typing via clipboard: '{argument[:50]}...'")
+                type_via_clipboard(argument)
+                time.sleep(self.config.action_pause)
+            
+            elif action_type.lower() == "hotkey":
+                keys = argument.lower().replace(" ", "").split("+")
+                pyautogui.hotkey(*keys)
+                time.sleep(self.config.action_pause)
+            
+            elif action_type.lower() == "scroll":
+                try:
+                    # Parse scroll format: "x,y,direction" or just amount
+                    parts = argument.replace(" ", "").split(",")
+                    if len(parts) >= 3:
+                        x, y = int(parts[0]), int(parts[1])
+                        direction = parts[2].lower()
+                        scroll_amount = -self.config.scroll_amount if direction == "down" else self.config.scroll_amount
+                        pyautogui.scroll(scroll_amount, x=x, y=y)
+                    else:
+                        scroll_amount = int(argument) if argument.lstrip('-').isdigit() else self.config.scroll_amount
+                        pyautogui.scroll(scroll_amount)
+                except Exception as e:
+                    debug_log(f"Scroll error: {e}", "ERROR")
+                    pyautogui.scroll(-3)
+                time.sleep(self.config.action_pause)
+            
+            elif action_type.lower() == "drag":
+                try:
+                    parts = argument.replace(" ", "").split(",")
+                    if len(parts) >= 4:
+                        x1, y1, x2, y2 = int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
+                        pyautogui.moveTo(x1, y1)
+                        pyautogui.drag(x2 - x1, y2 - y1, duration=self.config.drag_duration)
+                except Exception as e:
+                    debug_log(f"Drag error: {e}", "ERROR")
+                time.sleep(self.config.action_pause)
+            
+            elif action_type.lower() == "wait":
+                try:
+                    wait_time = float(argument) if argument else self.config.wait_duration
+                except:
+                    wait_time = self.config.wait_duration
+                time.sleep(wait_time)
+            
+            else:
+                debug_log(f"Unknown action type: {action_type}", "WARNING")
 
 # ============================================================
 # MANUAL CONTROL EXECUTION - Captures Reasoning
@@ -607,15 +697,18 @@ async def execute_with_manual_control(request: TaskRequest) -> tuple[TaskRespons
         wait_duration=request.wait_duration, 
         action_pause=request.action_pause
     )
-    base_action_handler = AsyncPyautoguiActionHandler(config=pyautogui_config)
+    
+    # Use custom clipboard handler for typing support
+    action_handler = ClipboardActionHandler(config=pyautogui_config)
     
     history = ExecutionHistory(request.task_description)
     completed = False
     
     try:
-        async with AsyncActor(api_key=request.api_key, model=model) as actor:
+        # FIX: Pass max_steps to AsyncActor!
+        async with AsyncActor(api_key=request.api_key, model=model, max_steps=request.max_steps) as actor:
             await actor.init_task(request.task_description)
-            logger.log(f"Task initialized")
+            logger.log(f"Task initialized with max_steps={request.max_steps}")
             
             for step_num in range(1, request.max_steps + 1):
                 step_record = StepRecord(step_num)
@@ -661,11 +754,6 @@ async def execute_with_manual_control(request: TaskRequest) -> tuple[TaskRespons
                             coords = argument.replace(" ", "").split(",")
                             x_lux, y_lux = int(coords[0]), int(coords[1])
                             action_data["lux_coords"] = {"x": x_lux, "y": y_lux}
-                            
-                            if request.enable_scaling:
-                                x_scaled, y_scaled = scale_coordinates(x_lux, y_lux, screen_width, screen_height)
-                                action_data["scaled_coords"] = {"x": x_scaled, "y": y_scaled}
-                                logger.log(f"   🎯 Click: LUX ({x_lux}, {y_lux}) on {LUX_REF_WIDTH}x{LUX_REF_HEIGHT} → Screen ({x_scaled}, {y_scaled})")
                         except Exception as e:
                             logger.log(f"   ⚠️ Parse error: {e}", "WARNING")
                     elif action_type == "type":
@@ -679,60 +767,9 @@ async def execute_with_manual_control(request: TaskRequest) -> tuple[TaskRespons
                     
                     step_record.actions.append(action_data)
                 
-                # Execute actions
+                # Execute actions using custom handler with clipboard typing
                 try:
-                    if request.enable_scaling and PYAUTOGUI_AVAILABLE:
-                        logger.log(f"   🔧 Executing {len(actions)} actions with scaling...")
-                        
-                        # Run actions in a thread to avoid async interference
-                        def execute_actions_sync():
-                            for action in actions:
-                                action_type = str(action.type.value) if hasattr(action.type, "value") else str(action.type)
-                                argument = str(action.argument) if hasattr(action, "argument") else ""
-                                
-                                print(f">>> [THREAD] Action: {action_type}")
-                                
-                                if action_type.lower() == "click":
-                                    coords = argument.replace(" ", "").split(",")
-                                    x_lux, y_lux = int(coords[0]), int(coords[1])
-                                    x_scaled, y_scaled = scale_coordinates(x_lux, y_lux, screen_width, screen_height)
-                                    print(f">>> [THREAD] Moving to ({x_scaled}, {y_scaled})")
-                                    pyautogui.moveTo(x_scaled, y_scaled)
-                                    time.sleep(0.1)
-                                    print(f">>> [THREAD] Clicking")
-                                    pyautogui.click()
-                                    time.sleep(0.3)
-                                    print(f">>> [THREAD] Click done")
-                                
-                                elif action_type.lower() == "type":
-                                    print(f">>> [THREAD] Typing: '{argument}'")
-                                    pyautogui.click()  # Ensure focus
-                                    time.sleep(0.1)
-                                    pyautogui.typewrite(argument, interval=0.05)
-                                    time.sleep(0.2)
-                                    print(f">>> [THREAD] Type done")
-                                
-                                elif action_type.lower() == "hotkey":
-                                    keys = argument.lower().replace(" ", "").split("+")
-                                    pyautogui.hotkey(*keys)
-                                    time.sleep(0.1)
-                                
-                                elif action_type.lower() == "scroll":
-                                    try:
-                                        scroll_amount = int(argument)
-                                        pyautogui.scroll(scroll_amount)
-                                    except:
-                                        pyautogui.scroll(-3 if "down" in argument.lower() else 3)
-                                    time.sleep(0.1)
-                        
-                        # Execute in thread and wait
-                        import concurrent.futures
-                        with concurrent.futures.ThreadPoolExecutor() as executor:
-                            future = executor.submit(execute_actions_sync)
-                            future.result()  # Wait for completion
-                    else:
-                        await base_action_handler(actions)
-                    
+                    await action_handler(actions)
                     step_record.success = True
                     logger.log(f"✅ Step {step_num} executed")
                     
@@ -768,7 +805,8 @@ async def execute_with_manual_control(request: TaskRequest) -> tuple[TaskRespons
                 "completed": completed,
                 "lux_resolution": f"{LUX_REF_WIDTH}x{LUX_REF_HEIGHT}",
                 "screen_resolution": f"{screen_width}x{screen_height}",
-                "scale_factors": {"x": scale_x, "y": scale_y}
+                "scale_factors": {"x": scale_x, "y": scale_y},
+                "clipboard_typing": PYPERCLIP_AVAILABLE
             }
         ), execution_report
         
@@ -795,7 +833,9 @@ async def execute_single_step(request: dict):
     if not api_key or not instruction:
         raise HTTPException(status_code=400, detail="api_key and instruction required")
     
-    async with AsyncActor(api_key=api_key, model=request.get("model", "lux-actor-1")) as actor:
+    max_steps = request.get("max_steps", 20)
+    
+    async with AsyncActor(api_key=api_key, model=request.get("model", "lux-actor-1"), max_steps=max_steps) as actor:
         await actor.init_task(instruction)
         screenshot_maker = ResizedScreenshotMaker()
         image = await screenshot_maker()
@@ -847,6 +887,7 @@ async def get_screen_debug_info():
     """Get screen info with SDK resolution"""
     info = debug_screen_info()
     info["lux_resolution"] = f"{LUX_REF_WIDTH}x{LUX_REF_HEIGHT}"
+    info["clipboard_typing"] = PYPERCLIP_AVAILABLE
     return info
 
 @app.post("/debug/screenshot")
@@ -862,12 +903,10 @@ async def test_screenshot_resize():
         return {"error": "PIL or PyAutoGUI not available"}
     
     try:
-        # Capture original
         original = pyautogui.screenshot()
         original_path = DEBUG_SCREENSHOTS_DIR / "test_original.png"
         original.save(original_path)
         
-        # Resize to SDK resolution
         resized = original.resize((LUX_REF_WIDTH, LUX_REF_HEIGHT), Image.LANCZOS)
         resized_path = DEBUG_SCREENSHOTS_DIR / "test_resized_sdk.png"
         resized.save(resized_path)
@@ -906,36 +945,26 @@ async def test_coordinate_scaling(lux_x: int = 290, lux_y: int = 272):
         "explanation": f"LUX ({lux_x}, {lux_y}) on {LUX_REF_WIDTH}x{LUX_REF_HEIGHT} → ({x_scaled}, {y_scaled}) on {screen_width}x{screen_height}"
     }
 
-# ============================================================
-# DEBUG: TEST MOUSE MOVEMENT
-# ============================================================
 @app.post("/debug/test_mouse")
 async def test_mouse_movement():
     """Test if PyAutoGUI can move the mouse from within the service"""
     if not PYAUTOGUI_AVAILABLE:
         return {"error": "PyAutoGUI not available"}
     
-    import time
-    
-    # Get current position
     start_pos = pyautogui.position()
     logger.log(f"🖱️ TEST MOUSE - Start position: {start_pos}")
     
-    # Move to 500, 500
     logger.log(f"🖱️ Moving to (500, 500)...")
     pyautogui.moveTo(500, 500)
     time.sleep(0.3)
     
-    # Get new position
     after_move = pyautogui.position()
     logger.log(f"🖱️ After moveTo: {after_move}")
     
-    # Click
     logger.log(f"🖱️ Clicking at (500, 500)...")
     pyautogui.click(500, 500)
     time.sleep(0.2)
     
-    # Move to 800, 400
     logger.log(f"🖱️ Moving to (800, 400)...")
     pyautogui.moveTo(800, 400)
     time.sleep(0.3)
@@ -954,16 +983,11 @@ async def test_mouse_movement():
         "success": mouse_moved
     }
 
-# ============================================================
-# DEBUG: TEST CLICK AT COORDINATES
-# ============================================================
 @app.post("/debug/test_click_at")
 async def test_click_at_coordinates(lux_x: int = 500, lux_y: int = 350):
-    """Test click at scaled coordinates - simulates what Lux would do"""
+    """Test click at scaled coordinates"""
     if not PYAUTOGUI_AVAILABLE:
         return {"error": "PyAutoGUI not available"}
-    
-    import time
     
     screen_width, screen_height = pyautogui.size()
     x_scaled, y_scaled = scale_coordinates(lux_x, lux_y, screen_width, screen_height)
@@ -972,11 +996,9 @@ async def test_click_at_coordinates(lux_x: int = 500, lux_y: int = 350):
     logger.log(f"📐 Scaled to: ({x_scaled}, {y_scaled}) on {screen_width}x{screen_height}")
     logger.log(f"🖱️ Clicking...")
     
-    # Move to position first (so you can see where it goes)
     pyautogui.moveTo(x_scaled, y_scaled)
     time.sleep(0.3)
     
-    # Click
     pyautogui.click(x_scaled, y_scaled)
     time.sleep(0.2)
     
@@ -989,44 +1011,37 @@ async def test_click_at_coordinates(lux_x: int = 500, lux_y: int = 350):
     }
 
 @app.post("/debug/test_type")
-async def test_type_text(text: str = "test123"):
-    """Test typing text"""
+async def test_type_text(text: str = "test@example.com"):
+    """Test typing text via clipboard (supports @ and special chars)"""
     if not PYAUTOGUI_AVAILABLE:
         return {"error": "PyAutoGUI not available"}
     
-    import time
+    logger.log(f"⌨️ TEST TYPE - Typing via clipboard: '{text}'")
     
-    logger.log(f"⌨️ TEST TYPE - Typing: '{text}'")
-    
-    # Type with small interval
-    pyautogui.typewrite(text, interval=0.05)
-    time.sleep(0.2)
+    type_via_clipboard(text)
     
     return {
         "typed": text,
+        "method": "clipboard" if PYPERCLIP_AVAILABLE else "typewrite",
         "success": True
     }
 
 @app.post("/debug/test_click_and_type")
-async def test_click_and_type(lux_x: int = 630, lux_y: int = 350, text: str = "test"):
-    """Click and type in one action - prevents focus loss"""
+async def test_click_and_type(lux_x: int = 630, lux_y: int = 350, text: str = "test@example.com"):
+    """Click and type in one action using clipboard"""
     if not PYAUTOGUI_AVAILABLE:
         return {"error": "PyAutoGUI not available"}
-    
-    import time
     
     screen_width, screen_height = pyautogui.size()
     x_scaled, y_scaled = scale_coordinates(lux_x, lux_y, screen_width, screen_height)
     
     logger.log(f"🎯 CLICK+TYPE - LUX ({lux_x}, {lux_y}) → Screen ({x_scaled}, {y_scaled})")
-    logger.log(f"⌨️ Will type: '{text}'")
+    logger.log(f"⌨️ Will type via clipboard: '{text}'")
     
-    # Click
     pyautogui.click(x_scaled, y_scaled)
     time.sleep(0.3)
     
-    # Type immediately after click
-    pyautogui.typewrite(text, interval=0.05)
+    type_via_clipboard(text)
     
     logger.log(f"✅ Click+Type completed")
     
@@ -1034,6 +1049,7 @@ async def test_click_and_type(lux_x: int = 630, lux_y: int = 350, text: str = "t
         "lux_coords": {"x": lux_x, "y": lux_y},
         "clicked_at": {"x": x_scaled, "y": y_scaled},
         "typed": text,
+        "method": "clipboard" if PYPERCLIP_AVAILABLE else "typewrite",
         "success": True
     }
 
@@ -1048,9 +1064,10 @@ if __name__ == "__main__":
     print(f"  TASKER SERVICE v{SERVICE_VERSION}")
     print(f"  SDK Resolution: {LUX_REF_WIDTH}x{LUX_REF_HEIGHT}")
     print(f"{'='*60}")
-    print(f"  OAGI: {'✅' if OAGI_AVAILABLE else '❌'}  PIL: {'✅' if PIL_AVAILABLE else '❌'}  PyAutoGUI: {'✅' if PYAUTOGUI_AVAILABLE else '❌'}")
+    print(f"  OAGI: {'✅' if OAGI_AVAILABLE else '❌'}  PIL: {'✅' if PIL_AVAILABLE else '❌'}  PyAutoGUI: {'✅' if PYAUTOGUI_AVAILABLE else '❌'}  Pyperclip: {'✅' if PYPERCLIP_AVAILABLE else '❌'}")
     print(f"  Screen: {screen_info['width']}x{screen_info['height']}")
     print(f"  Scale: X={screen_info['scale_x']:.3f}, Y={screen_info['scale_y']:.3f}")
+    print(f"  Clipboard Typing: {'✅ Enabled' if PYPERCLIP_AVAILABLE else '❌ Disabled (install pyperclip)'}")
     print(f"{'='*60}")
     print(f"  http://127.0.0.1:{SERVICE_PORT}")
     print(f"  Reports: {ANALYSIS_DIR}/execution_<timestamp>/")
