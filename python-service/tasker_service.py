@@ -705,9 +705,9 @@ async def execute_with_manual_control(request: TaskRequest) -> tuple[TaskRespons
     completed = False
     
     try:
-        # FIX: Pass max_steps to AsyncActor!
-        async with AsyncActor(api_key=request.api_key, model=model, max_steps=request.max_steps) as actor:
-            await actor.init_task(request.task_description)
+        # FIX: Pass max_steps to init_task(), not constructor!
+        async with AsyncActor(api_key=request.api_key, model=model) as actor:
+            await actor.init_task(request.task_description, max_steps=request.max_steps)
             logger.log(f"Task initialized with max_steps={request.max_steps}")
             
             for step_num in range(1, request.max_steps + 1):
@@ -835,8 +835,8 @@ async def execute_single_step(request: dict):
     
     max_steps = request.get("max_steps", 20)
     
-    async with AsyncActor(api_key=api_key, model=request.get("model", "lux-actor-1"), max_steps=max_steps) as actor:
-        await actor.init_task(instruction)
+    async with AsyncActor(api_key=api_key, model=request.get("model", "lux-actor-1")) as actor:
+        await actor.init_task(instruction, max_steps=max_steps)
         screenshot_maker = ResizedScreenshotMaker()
         image = await screenshot_maker()
         step = await actor.step(image)
