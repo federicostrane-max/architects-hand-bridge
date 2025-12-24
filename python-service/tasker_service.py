@@ -1,11 +1,11 @@
 """
-Tasker Service v5.4.0 - Max Steps Fix + Clipboard Typing
+Tasker Service v5.4.1 - SDK Handler + Clipboard Typing
 =========================================================
 
-CHANGES from v5.3.0:
-- FIX: max_steps now correctly passed to AsyncActor (was hardcoded to 20)
-- FIX: Typing uses clipboard (Ctrl+V) instead of typewrite() for Italian keyboard support
-- Supports @ and special characters that don't work with typewrite()
+CHANGES from v5.4.0:
+- FIX: Restored SDK's AsyncPyautoguiActionHandler (coordinates work correctly)
+- FIX: Clipboard typing now intercepts only 'type' actions
+- FIX: Added stop check in execution loop (call POST /stop to abort)
 
 From oagi-python SDK README:
     config = ImageConfig(
@@ -86,7 +86,7 @@ except ImportError:
     print("⚠️ Pyperclip not available - typing may not work with special chars")
 
 # Configuration
-SERVICE_VERSION = "5.4.0"
+SERVICE_VERSION = "5.4.1"
 SERVICE_PORT = 8765
 DEBUG_LOGS_DIR = Path("debug_logs")
 ANALYSIS_DIR = Path("lux_analysis")
@@ -578,88 +578,25 @@ def scale_coordinates(x: int, y: int, screen_width: int, screen_height: int) -> 
     return x_scaled, y_scaled
 
 # ============================================================
-# CUSTOM ACTION HANDLER - With Clipboard Typing
+# CLIPBOARD TYPING WRAPPER - Intercepts type actions
 # ============================================================
-class ClipboardActionHandler:
+async def execute_actions_with_clipboard_typing(actions, sdk_handler):
     """
-    Custom action handler that uses clipboard for typing.
-    This supports special characters like @ on Italian keyboards.
+    Execute actions using SDK handler, but intercept 'type' actions
+    to use clipboard (Ctrl+V) instead of typewrite() for Italian keyboard support.
     """
-    
-    def __init__(self, config: PyautoguiConfig = None):
-        self.config = config or PyautoguiConfig()
-    
-    async def __call__(self, actions):
-        """Execute actions with clipboard-based typing"""
-        for action in actions:
-            action_type = str(action.type.value) if hasattr(action.type, "value") else str(action.type)
-            argument = str(action.argument) if hasattr(action, "argument") else ""
-            
-            if action_type.lower() == "click":
-                try:
-                    coords = argument.replace(" ", "").split(",")
-                    x, y = int(coords[0]), int(coords[1])
-                    pyautogui.click(x, y)
-                    time.sleep(self.config.action_pause)
-                except Exception as e:
-                    debug_log(f"Click error: {e}", "ERROR")
-            
-            elif action_type.lower() == "left_double":
-                try:
-                    coords = argument.replace(" ", "").split(",")
-                    x, y = int(coords[0]), int(coords[1])
-                    pyautogui.doubleClick(x, y)
-                    time.sleep(self.config.action_pause)
-                except Exception as e:
-                    debug_log(f"Double-click error: {e}", "ERROR")
-            
-            elif action_type.lower() == "type":
-                debug_log(f"⌨️ Typing via clipboard: '{argument[:50]}...'")
-                type_via_clipboard(argument)
-                time.sleep(self.config.action_pause)
-            
-            elif action_type.lower() == "hotkey":
-                keys = argument.lower().replace(" ", "").split("+")
-                pyautogui.hotkey(*keys)
-                time.sleep(self.config.action_pause)
-            
-            elif action_type.lower() == "scroll":
-                try:
-                    # Parse scroll format: "x,y,direction" or just amount
-                    parts = argument.replace(" ", "").split(",")
-                    if len(parts) >= 3:
-                        x, y = int(parts[0]), int(parts[1])
-                        direction = parts[2].lower()
-                        scroll_amount = -self.config.scroll_amount if direction == "down" else self.config.scroll_amount
-                        pyautogui.scroll(scroll_amount, x=x, y=y)
-                    else:
-                        scroll_amount = int(argument) if argument.lstrip('-').isdigit() else self.config.scroll_amount
-                        pyautogui.scroll(scroll_amount)
-                except Exception as e:
-                    debug_log(f"Scroll error: {e}", "ERROR")
-                    pyautogui.scroll(-3)
-                time.sleep(self.config.action_pause)
-            
-            elif action_type.lower() == "drag":
-                try:
-                    parts = argument.replace(" ", "").split(",")
-                    if len(parts) >= 4:
-                        x1, y1, x2, y2 = int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
-                        pyautogui.moveTo(x1, y1)
-                        pyautogui.drag(x2 - x1, y2 - y1, duration=self.config.drag_duration)
-                except Exception as e:
-                    debug_log(f"Drag error: {e}", "ERROR")
-                time.sleep(self.config.action_pause)
-            
-            elif action_type.lower() == "wait":
-                try:
-                    wait_time = float(argument) if argument else self.config.wait_duration
-                except:
-                    wait_time = self.config.wait_duration
-                time.sleep(wait_time)
-            
-            else:
-                debug_log(f"Unknown action type: {action_type}", "WARNING")
+    for action in actions:
+        action_type = str(action.type.value) if hasattr(action.type, "value") else str(action.type)
+        argument = str(action.argument) if hasattr(action, "argument") else ""
+        
+        if action_type.lower() == "type":
+            # Intercept type actions - use clipboard instead of SDK
+            debug_log(f"⌨️ Typing via clipboard: '{argument[:50]}...'")
+            type_via_clipboard(argument)
+            time.sleep(0.1)
+        else:
+            # All other actions - use SDK handler
+            await sdk_handler([action])
 
 # ============================================================
 # MANUAL CONTROL EXECUTION - Captures Reasoning
@@ -698,11 +635,12 @@ async def execute_with_manual_control(request: TaskRequest) -> tuple[TaskRespons
         action_pause=request.action_pause
     )
     
-    # Use custom clipboard handler for typing support
-    action_handler = ClipboardActionHandler(config=pyautogui_config)
+    # Use SDK's action handler (handles coordinates correctly)
+    action_handler = AsyncPyautoguiActionHandler(config=pyautogui_config, enable_scaling=False)
     
     history = ExecutionHistory(request.task_description)
     completed = False
+    stopped = False
     
     try:
         # FIX: Pass max_steps to init_task(), not constructor!
@@ -711,6 +649,12 @@ async def execute_with_manual_control(request: TaskRequest) -> tuple[TaskRespons
             logger.log(f"Task initialized with max_steps={request.max_steps}")
             
             for step_num in range(1, request.max_steps + 1):
+                # Check if stop requested
+                if not is_running:
+                    logger.log("🛑 Stop requested - aborting execution")
+                    stopped = True
+                    break
+                
                 step_record = StepRecord(step_num)
                 logger.log(f"{'='*50}")
                 logger.log(f"STEP {step_num}/{request.max_steps}")
@@ -767,9 +711,9 @@ async def execute_with_manual_control(request: TaskRequest) -> tuple[TaskRespons
                     
                     step_record.actions.append(action_data)
                 
-                # Execute actions using custom handler with clipboard typing
+                # Execute actions using SDK handler with clipboard typing intercept
                 try:
-                    await action_handler(actions)
+                    await execute_actions_with_clipboard_typing(actions, action_handler)
                     step_record.success = True
                     logger.log(f"✅ Step {step_num} executed")
                     
@@ -794,15 +738,23 @@ async def execute_with_manual_control(request: TaskRequest) -> tuple[TaskRespons
         execution_report = history.generate_report(report_dir)
         logger.log(f"📊 Report: {execution_report}")
         
+        if stopped:
+            message = "Stopped by user"
+        elif completed:
+            message = "Completed"
+        else:
+            message = "Max steps reached"
+        
         return TaskResponse(
             success=completed,
-            message="Completed" if completed else "Max steps reached",
+            message=message,
             completed_todos=1 if completed else 0,
             total_todos=1,
             execution_summary={
                 "model": model, 
                 "steps": len(history.steps), 
                 "completed": completed,
+                "stopped": stopped,
                 "lux_resolution": f"{LUX_REF_WIDTH}x{LUX_REF_HEIGHT}",
                 "screen_resolution": f"{screen_width}x{screen_height}",
                 "scale_factors": {"x": scale_x, "y": scale_y},
