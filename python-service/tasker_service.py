@@ -636,7 +636,7 @@ async def execute_with_manual_control(request: TaskRequest) -> tuple[TaskRespons
     )
     
     # Use SDK's action handler (handles coordinates correctly)
-    action_handler = AsyncPyautoguiActionHandler(config=pyautogui_config, enable_scaling=False)
+    action_handler = AsyncPyautoguiActionHandler(config=pyautogui_config)
     
     history = ExecutionHistory(request.task_description)
     completed = False
