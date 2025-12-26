@@ -1,12 +1,38 @@
 """
-Tasker Service v5.6.1 - Fixed TaskerAgent API
+Tasker Service v5.7.2 - Official Pattern from oagi-lux-samples
 =========================================================
 
-CHANGES from v5.6.0:
-- FIX: TaskerAgent uses .run() not .step() (API correction)
-- FIX: TaskerAgent requires action_handler and screenshot_maker in constructor
-- ADD: Custom ClipboardActionHandler for Italian keyboard support
-- ADD: SyncScreenshotMaker wrapper for TaskerAgent (sync, not async)
+CHANGES from v5.7.1:
+- FIX: TaskerAgent constructor accepts model, max_steps, temperature, step_observer
+- Pattern verified from official oagi-lux-samples/amazon_scraping.py
+
+CORRECT PATTERN (from oagi-lux-samples):
+    observer = AsyncAgentObserver()
+    image_provider = AsyncScreenshotMaker()
+    action_handler = AsyncPyautoguiActionHandler()
+    
+    tasker = TaskerAgent(
+        api_key=os.getenv("OAGI_API_KEY"),
+        base_url="https://api.agiopen.org",
+        model="lux-actor-1",
+        max_steps=24,
+        temperature=0.0,
+        step_observer=observer,
+    )
+    tasker.set_task(task=instruction, todos=todos)
+    success = await tasker.execute(
+        instruction="",
+        action_handler=action_handler,
+        image_provider=image_provider,
+    )
+    memory = tasker.get_memory()
+
+image_provider interface:
+    async def __call__(self) -> Image  # Capture screenshot
+    # Image must have: read() -> bytes
+
+action_handler interface:
+    async def __call__(self, actions: list[Action]) -> None
 
 From oagi-python SDK README:
     config = ImageConfig(
@@ -20,6 +46,7 @@ This is the resolution Lux API expects for optimal coordinate detection.
 """
 
 import asyncio
+import io
 import os
 import sys
 import subprocess
@@ -38,6 +65,7 @@ from pydantic import BaseModel
 # OAGI SDK
 OAGI_AVAILABLE = False
 OAGI_IMPORT_ERROR = None
+ASYNC_AGENT_OBSERVER_AVAILABLE = False
 
 try:
     from oagi import (
@@ -50,6 +78,14 @@ try:
 except ImportError as e:
     OAGI_IMPORT_ERROR = str(e)
     print(f"❌ OAGI SDK failed: {e}")
+
+# Try to import AsyncAgentObserver (may be in different location)
+try:
+    from oagi.agent.observer import AsyncAgentObserver
+    ASYNC_AGENT_OBSERVER_AVAILABLE = True
+    print("✅ AsyncAgentObserver loaded")
+except ImportError:
+    print("ℹ️ AsyncAgentObserver not available (optional)")
 
 # PIL
 PIL_AVAILABLE = False
@@ -87,7 +123,7 @@ except ImportError:
     print("⚠️ Pyperclip not available - typing may not work with special chars")
 
 # Configuration
-SERVICE_VERSION = "5.6.1"
+SERVICE_VERSION = "5.7.2"
 SERVICE_PORT = 8765
 DEBUG_LOGS_DIR = Path("debug_logs")
 ANALYSIS_DIR = Path("lux_analysis")
@@ -574,12 +610,52 @@ async def stop_task():
     return {"status": "stopped", "task": stopped}
 
 # ============================================================
+# LUX IMAGE WRAPPER - Implements read() interface
+# ============================================================
+class LuxImage:
+    """
+    Image wrapper that implements the oagi Image protocol.
+    The Image protocol requires a `read() -> bytes` method.
+    
+    Based on KernelImage from kernel-oagi repository.
+    """
+    
+    def __init__(self, data: bytes, width: int = None, height: int = None):
+        self._data = data
+        self._width = width
+        self._height = height
+    
+    def read(self) -> bytes:
+        """Read the image data as bytes."""
+        return self._data
+    
+    @classmethod
+    def from_pil(cls, pil_image, format: str = "JPEG", quality: int = 85) -> "LuxImage":
+        """Create LuxImage from PIL Image."""
+        buffer = io.BytesIO()
+        
+        # Convert RGBA to RGB if needed for JPEG
+        if pil_image.mode == "RGBA":
+            rgb_image = Image.new("RGB", pil_image.size, (255, 255, 255))
+            rgb_image.paste(pil_image, mask=pil_image.split()[3])
+            pil_image = rgb_image
+        
+        pil_image.save(buffer, format=format, quality=quality)
+        return cls(buffer.getvalue(), pil_image.width, pil_image.height)
+
+
+# ============================================================
 # RESIZED SCREENSHOT MAKER - SDK RESOLUTION (1260x700)
 # ============================================================
 class ResizedScreenshotMaker:
     """
     Screenshot maker that resizes to 1260x700 for Lux API.
-    ASYNC version for AsyncActor.
+    
+    Implements the AsyncImageProvider protocol:
+    - __call__() -> Image: Capture and return a new screenshot
+    - last_image() -> Image: Return the last captured screenshot
+    
+    Image returned has read() -> bytes method.
     """
     
     def __init__(self):
@@ -588,14 +664,14 @@ class ResizedScreenshotMaker:
         else:
             self.screen_width, self.screen_height = 1920, 1080
         
-        self.needs_resize = True
+        self._last_image: LuxImage = None
         
         debug_log(f"📸 ResizedScreenshotMaker (SDK v{SERVICE_VERSION}):")
         debug_log(f"   Screen: {self.screen_width}x{self.screen_height}")
         debug_log(f"   Lux SDK expects: {LUX_REF_WIDTH}x{LUX_REF_HEIGHT}")
         debug_log(f"   Scale factors: X={self.screen_width/LUX_REF_WIDTH:.3f}, Y={self.screen_height/LUX_REF_HEIGHT:.3f}")
     
-    async def __call__(self):
+    async def __call__(self) -> LuxImage:
         """Capture screenshot and resize to 1260x700 for Lux"""
         
         if not PIL_AVAILABLE or not PYAUTOGUI_AVAILABLE:
@@ -607,22 +683,38 @@ class ResizedScreenshotMaker:
             pil_screenshot = pyautogui.screenshot()
             original_size = pil_screenshot.size
             
+            # Resize to Lux expected resolution
             resized = pil_screenshot.resize((LUX_REF_WIDTH, LUX_REF_HEIGHT), Image.LANCZOS)
             
             debug_log(f"📸 Screenshot: {original_size[0]}x{original_size[1]} → {LUX_REF_WIDTH}x{LUX_REF_HEIGHT}")
             
-            return PILImage(resized)
+            # Create LuxImage with read() method
+            image = LuxImage.from_pil(resized)
+            
+            # Cache for last_image()
+            self._last_image = image
+            
+            return image
             
         except Exception as e:
             debug_log(f"⚠️ Screenshot resize failed: {e}", "ERROR")
             base_maker = AsyncScreenshotMaker()
             return await base_maker()
+    
+    async def last_image(self) -> LuxImage:
+        """
+        Return the last captured screenshot.
+        If no screenshot has been taken yet, takes a new one.
+        """
+        if self._last_image is None:
+            return await self()
+        return self._last_image
 
 
 class SyncResizedScreenshotMaker:
     """
     Screenshot maker that resizes to 1260x700 for Lux API.
-    SYNC version for TaskerAgent.
+    SYNC version (kept for reference, TaskerAgent uses async).
     """
     
     def __init__(self):
@@ -650,7 +742,7 @@ class SyncResizedScreenshotMaker:
             
             debug_log(f"📸 Screenshot: {original_size[0]}x{original_size[1]} → {LUX_REF_WIDTH}x{LUX_REF_HEIGHT}")
             
-            return PILImage(resized)
+            return LuxImage.from_pil(resized)
             
         except Exception as e:
             debug_log(f"⚠️ Screenshot resize failed: {e}", "ERROR")
@@ -717,12 +809,31 @@ async def execute_actions_with_clipboard_typing(actions, sdk_handler):
             await sdk_handler([action])
 
 # ============================================================
-# TASKER MODE EXECUTION - Uses TaskerAgent with .run()
+# TASKER MODE EXECUTION - Uses TaskerAgent with .execute()
 # ============================================================
 async def execute_with_tasker(request: TaskRequest) -> tuple[TaskResponse, Optional[str]]:
-    """Execute using TaskerAgent with todos list"""
+    """
+    Execute using TaskerAgent with todos list.
+    
+    CORRECT PATTERN (from oagi-lux-samples/amazon_scraping.py):
+        observer = AsyncAgentObserver()
+        image_provider = AsyncScreenshotMaker()
+        action_handler = AsyncPyautoguiActionHandler()
+        
+        tasker = TaskerAgent(
+            api_key=...,
+            base_url="https://api.agiopen.org",
+            model="lux-actor-1",
+            max_steps=24,
+            temperature=0.0,
+            step_observer=observer,
+        )
+        tasker.set_task(task=..., todos=[...])
+        success = await tasker.execute(instruction="", action_handler=..., image_provider=...)
+        memory = tasker.get_memory()
+    """
     logger.log("=" * 50)
-    logger.log("TASKER MODE EXECUTION")
+    logger.log("TASKER MODE EXECUTION (v5.7.2)")
     logger.log("=" * 50)
     
     todos = request.todos or []
@@ -743,7 +854,7 @@ async def execute_with_tasker(request: TaskRequest) -> tuple[TaskResponse, Optio
     history = ExecutionHistory(request.task_description, todos)
     
     try:
-        # Create custom components for TaskerAgent
+        # Create action handler with PyAutoGUI config
         pyautogui_config = PyautoguiConfig(
             drag_duration=request.drag_duration,
             scroll_amount=request.scroll_amount,
@@ -751,23 +862,44 @@ async def execute_with_tasker(request: TaskRequest) -> tuple[TaskResponse, Optio
             action_pause=request.action_pause
         )
         
-        # Create screenshot maker (SYNC for TaskerAgent)
-        screenshot_maker = SyncResizedScreenshotMaker() if request.enable_screenshot_resize else None
+        # Create observer (optional - for step tracking)
+        observer = None
+        if ASYNC_AGENT_OBSERVER_AVAILABLE:
+            observer = AsyncAgentObserver()
+            logger.log("📊 AsyncAgentObserver enabled for step tracking")
         
-        # Create action handler with clipboard support (SYNC for TaskerAgent)
-        action_handler = ClipboardActionHandler(config=pyautogui_config)
+        # Create image provider
+        # Use custom ResizedScreenshotMaker or SDK default
+        if request.enable_screenshot_resize:
+            image_provider = ResizedScreenshotMaker()
+            logger.log(f"📸 Using ResizedScreenshotMaker ({LUX_REF_WIDTH}x{LUX_REF_HEIGHT})")
+        else:
+            image_provider = AsyncScreenshotMaker()
+            logger.log("📸 Using SDK AsyncScreenshotMaker (default resolution)")
         
-        logger.log(f"Creating TaskerAgent with model=lux-actor-1, max_steps={request.max_steps_per_todo}")
+        # Create action handler
+        action_handler = AsyncPyautoguiActionHandler(config=pyautogui_config)
+        logger.log("🎮 Using AsyncPyautoguiActionHandler")
         
-        # Create TaskerAgent with custom handlers
-        tasker = TaskerAgent(
-            api_key=request.api_key,
-            model="lux-actor-1",  # Tasker always uses actor model
-            max_steps=request.max_steps_per_todo,
-            temperature=request.temperature,
-            action_handler=action_handler,
-            screenshot_maker=screenshot_maker
-        )
+        logger.log(f"Creating TaskerAgent with:")
+        logger.log(f"  model: lux-actor-1")
+        logger.log(f"  max_steps: {request.max_steps_per_todo}")
+        logger.log(f"  temperature: {request.temperature}")
+        
+        # Create TaskerAgent with FULL constructor (from amazon_scraping.py)
+        tasker_kwargs = {
+            "api_key": request.api_key,
+            "base_url": "https://api.agiopen.org",
+            "model": "lux-actor-1",
+            "max_steps": request.max_steps_per_todo,
+            "temperature": request.temperature,
+        }
+        
+        # Add observer if available
+        if observer:
+            tasker_kwargs["step_observer"] = observer
+        
+        tasker = TaskerAgent(**tasker_kwargs)
         
         # Set task and todos
         tasker.set_task(
@@ -775,59 +907,86 @@ async def execute_with_tasker(request: TaskRequest) -> tuple[TaskResponse, Optio
             todos=todos
         )
         
-        logger.log("TaskerAgent configured, starting execution with .run()...")
+        logger.log("TaskerAgent configured, starting execution...")
         
-        # Run TaskerAgent - this is SYNCHRONOUS, so run in executor
-        loop = asyncio.get_event_loop()
+        # Execute TaskerAgent
+        success = await tasker.execute(
+            instruction="",  # Empty - task already set via set_task()
+            action_handler=action_handler,
+            image_provider=image_provider
+        )
         
-        def run_tasker():
-            """Run tasker in sync context"""
+        # Get memory for todo status (if available)
+        completed_todos = 0
+        todo_statuses = []
+        try:
+            memory = tasker.get_memory()
+            if memory:
+                logger.log(f"📋 Task execution summary: {memory.task_execution_summary}")
+                
+                # Count completed todos
+                for i, todo_mem in enumerate(memory.todos):
+                    status = todo_mem.status.value if hasattr(todo_mem.status, 'value') else str(todo_mem.status)
+                    todo_statuses.append({"index": i, "description": todo_mem.description, "status": status})
+                    if status == "completed":
+                        completed_todos += 1
+                    logger.log(f"  [{i}] {status}: {todo_mem.description[:50]}...")
+        except Exception as mem_err:
+            logger.log(f"⚠️ Could not get memory: {mem_err}", "WARNING")
+            # Fallback: assume all completed if success
+            completed_todos = len(todos) if success else 0
+        
+        # Export observer history if available
+        observer_report = None
+        if observer:
             try:
-                tasker.run()
-                return True, None
-            except Exception as e:
-                return False, str(e)
+                report_dir = ANALYSIS_DIR / f"tasker_{int(time.time())}"
+                report_dir.mkdir(parents=True, exist_ok=True)
+                observer_file = report_dir / "observer_history.html"
+                observer.export("html", str(observer_file))
+                observer_report = str(observer_file)
+                logger.log(f"📊 Observer report: {observer_report}")
+            except Exception as obs_err:
+                logger.log(f"⚠️ Could not export observer: {obs_err}", "WARNING")
         
-        # Execute in thread pool to not block event loop
-        success, error = await loop.run_in_executor(None, run_tasker)
-        
-        if error:
-            logger.log(f"TaskerAgent error: {error}", "ERROR")
-            history.finish(False, error, completed_todos=0)
+        # Update history
+        if success:
+            logger.log(f"✅ TaskerAgent completed: {completed_todos}/{len(todos)} todos")
+            history.finish(True, completed_todos=completed_todos)
         else:
-            logger.log("TaskerAgent completed successfully")
-            # TaskerAgent doesn't expose which todos completed, assume all if success
-            history.finish(True, completed_todos=len(todos))
+            logger.log("❌ TaskerAgent returned False", "WARNING")
+            history.finish(False, "TaskerAgent returned failure", completed_todos=completed_todos)
         
-        # Generate report
+        # Generate our report
         report_dir = ANALYSIS_DIR / f"tasker_{int(time.time())}"
         execution_report = history.generate_report(report_dir)
         logger.log(f"📊 Report: {execution_report}")
         
-        completed_todos = len(todos) if success else 0
-        
         if success:
-            message = f"All {len(todos)} todos completed"
+            message = f"Completed {completed_todos}/{len(todos)} todos"
         else:
-            message = f"Failed: {error}"
+            message = f"Failed - completed {completed_todos}/{len(todos)} todos"
         
         return TaskResponse(
             success=success,
             message=message,
             completed_todos=completed_todos,
             total_todos=len(todos),
-            error=error,
+            error=None if success else "Execution returned failure",
             execution_summary={
                 "mode": "tasker",
                 "model": "lux-actor-1",
                 "todos": todos,
+                "todo_statuses": todo_statuses,
                 "completed_todos": completed_todos,
                 "total_todos": len(todos),
                 "max_steps_per_todo": request.max_steps_per_todo,
+                "temperature": request.temperature,
                 "lux_resolution": f"{LUX_REF_WIDTH}x{LUX_REF_HEIGHT}",
                 "screen_resolution": f"{screen_width}x{screen_height}",
                 "scale_factors": {"x": scale_x, "y": scale_y},
-                "clipboard_typing": PYPERCLIP_AVAILABLE
+                "screenshot_resize": request.enable_screenshot_resize,
+                "observer_report": observer_report
             }
         ), execution_report
         
