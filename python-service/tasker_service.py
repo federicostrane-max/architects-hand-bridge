@@ -1,11 +1,13 @@
 """
-Tasker Service v5.5.0 - Aligned with Official Lux API
+Tasker Service v5.6.0 - Full TaskerAgent Support
 =========================================================
 
-CHANGES from v5.4.1:
-- RENAME: max_steps → max_steps_per_todo (aligned with official examples)
-- CHANGE: Default from 20 → 24 (as per cvs_tasker.py, amazon_scraping.py)
-- ALIGNED: Field names match web app database schema (lux_tasks table)
+CHANGES from v5.5.0:
+- ADD: TaskerAgent support for mode='tasker' with todos
+- ADD: execute_with_tasker() function for Tasker mode execution
+- ADD: Validation - tasker mode requires todos, fails if empty
+- FIX: Mode routing - actor/thinker use AsyncActor, tasker uses TaskerAgent
+- ADD: Per-todo progress tracking and reporting
 
 From oagi-python SDK README:
     config = ImageConfig(
@@ -86,7 +88,7 @@ except ImportError:
     print("⚠️ Pyperclip not available - typing may not work with special chars")
 
 # Configuration
-SERVICE_VERSION = "5.5.0"
+SERVICE_VERSION = "5.6.0"
 SERVICE_PORT = 8765
 DEBUG_LOGS_DIR = Path("debug_logs")
 ANALYSIS_DIR = Path("lux_analysis")
@@ -103,8 +105,9 @@ LUX_REF_HEIGHT = 700
 # STEP HISTORY - Stores reasoning and actions
 # ============================================================
 class StepRecord:
-    def __init__(self, step_num: int):
+    def __init__(self, step_num: int, todo_index: Optional[int] = None):
         self.step_num = step_num
+        self.todo_index = todo_index
         self.timestamp = datetime.now().isoformat()
         self.reasoning: Optional[str] = None
         self.actions: List[Dict] = []
@@ -116,7 +119,9 @@ class StepRecord:
     
     def to_dict(self) -> Dict:
         return {
-            "step_num": self.step_num, "timestamp": self.timestamp,
+            "step_num": self.step_num, 
+            "todo_index": self.todo_index,
+            "timestamp": self.timestamp,
             "reasoning": self.reasoning, "actions": self.actions,
             "screenshot_before": self.screenshot_before,
             "screenshot_after": self.screenshot_after,
@@ -124,30 +129,36 @@ class StepRecord:
         }
 
 class ExecutionHistory:
-    def __init__(self, task_description: str):
+    def __init__(self, task_description: str, todos: Optional[List[str]] = None):
         self.task_description = task_description
+        self.todos = todos or []
         self.start_time = datetime.now()
         self.end_time: Optional[datetime] = None
         self.steps: List[StepRecord] = []
         self.completed: bool = False
         self.final_error: Optional[str] = None
+        self.completed_todos: int = 0
     
     def add_step(self, step: StepRecord):
         self.steps.append(step)
     
-    def finish(self, completed: bool, error: Optional[str] = None):
+    def finish(self, completed: bool, error: Optional[str] = None, completed_todos: int = 0):
         self.end_time = datetime.now()
         self.completed = completed
         self.final_error = error
+        self.completed_todos = completed_todos
     
     def to_dict(self) -> Dict:
         return {
             "task_description": self.task_description,
+            "todos": self.todos,
             "start_time": self.start_time.isoformat(),
             "end_time": self.end_time.isoformat() if self.end_time else None,
             "duration_seconds": (self.end_time - self.start_time).total_seconds() if self.end_time else None,
             "total_steps": len(self.steps),
             "completed": self.completed,
+            "completed_todos": self.completed_todos,
+            "total_todos": len(self.todos),
             "final_error": self.final_error,
             "steps": [s.to_dict() for s in self.steps]
         }
@@ -165,6 +176,15 @@ class ExecutionHistory:
         
         duration = (self.end_time - self.start_time).total_seconds() if self.end_time else 0
         
+        # Todos section
+        todos_html = ""
+        if self.todos:
+            todos_html = "<div class='todos-section'><h3>📋 Todos</h3><ol>"
+            for i, todo in enumerate(self.todos):
+                status = "✅" if i < self.completed_todos else "❌"
+                todos_html += f"<li>{status} {todo}</li>"
+            todos_html += "</ol></div>"
+        
         html = f'''<!DOCTYPE html>
 <html>
 <head>
@@ -173,8 +193,12 @@ class ExecutionHistory:
         body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif; margin: 20px; background: #f5f5f5; }}
         .header {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; border-radius: 10px; margin-bottom: 20px; }}
         .header h1 {{ margin: 0 0 10px 0; }}
+        .todos-section {{ background: white; border-radius: 10px; padding: 20px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
+        .todos-section ol {{ margin: 10px 0; padding-left: 20px; }}
+        .todos-section li {{ margin: 8px 0; padding: 8px; background: #f8f9fa; border-radius: 4px; }}
         .step {{ background: white; border-radius: 10px; padding: 20px; margin-bottom: 15px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
         .step-num {{ background: #667eea; color: white; padding: 5px 15px; border-radius: 20px; font-weight: bold; }}
+        .todo-badge {{ background: #28a745; color: white; padding: 3px 10px; border-radius: 10px; font-size: 12px; margin-left: 10px; }}
         .reasoning {{ background: #e8f4f8; padding: 15px; border-radius: 8px; margin: 15px 0; border-left: 4px solid #667eea; }}
         .reasoning-label {{ font-weight: bold; color: #667eea; }}
         .action {{ background: #f8f9fa; padding: 12px; border-radius: 6px; margin-bottom: 8px; font-family: monospace; }}
@@ -199,6 +223,7 @@ class ExecutionHistory:
         <h1>🤖 LUX Execution Report v{SERVICE_VERSION}</h1>
         <div><strong>Task:</strong> {self.task_description}</div>
         <div><strong>Duration:</strong> {duration:.1f}s | <strong>Status:</strong> {"✅ Completed" if self.completed else "❌ Not Completed"}</div>
+        {"<div><strong>Todos:</strong> " + str(self.completed_todos) + "/" + str(len(self.todos)) + " completed</div>" if self.todos else ""}
     </div>
     <div class="sdk-note">
         📐 <strong>SDK Resolution:</strong> Using <strong>{LUX_REF_WIDTH}×{LUX_REF_HEIGHT}</strong> as per SDK ImageConfig recommendation
@@ -207,13 +232,15 @@ class ExecutionHistory:
         🖥️ <strong>Screen:</strong> {screen_width}×{screen_height} | 
         <strong>Scale:</strong> X={scale_x:.3f}, Y={scale_y:.3f}
     </div>
+    {todos_html}
 '''
         
         for step in self.steps:
             step_class = "success" if step.success else "error"
+            todo_badge = f'<span class="todo-badge">Todo {step.todo_index + 1}</span>' if step.todo_index is not None else ""
             html += f'''
     <div class="step {step_class}">
-        <span class="step-num">Step {step.step_num}</span>
+        <span class="step-num">Step {step.step_num}</span>{todo_badge}
         <div class="reasoning">
             <div class="reasoning-label">🧠 LUX Reasoning:</div>
             {step.reasoning or "<em>No reasoning</em>"}
@@ -248,6 +275,7 @@ class ExecutionHistory:
         <div class="stat"><div class="stat-value">{len(self.steps)}</div><div class="stat-label">Steps</div></div>
         <div class="stat"><div class="stat-value">{sum(len(s.actions) for s in self.steps)}</div><div class="stat-label">Actions</div></div>
         <div class="stat"><div class="stat-value">{duration:.1f}s</div><div class="stat-label">Duration</div></div>
+        {"<div class='stat'><div class='stat-value'>" + str(self.completed_todos) + "/" + str(len(self.todos)) + "</div><div class='stat-label'>Todos</div></div>" if self.todos else ""}
         <div class="stat"><div class="stat-value">{"✅" if self.completed else "❌"}</div><div class="stat-label">Completed</div></div>
     </div>
 </body>
@@ -335,9 +363,9 @@ def type_via_clipboard(text: str):
         try:
             # Copy text to clipboard and paste
             pyperclip.copy(text)
-            time.sleep(0.05)
+            time.sleep(0.1)  # Increased from 0.05
             pyautogui.hotkey('ctrl', 'v')
-            time.sleep(0.1)
+            time.sleep(0.15)  # Increased from 0.1
         finally:
             # Restore old clipboard (optional, comment out if not needed)
             try:
@@ -355,11 +383,12 @@ def type_via_clipboard(text: str):
 class TaskRequest(BaseModel):
     api_key: str
     task_description: str
-    mode: str = "actor"
+    mode: str = "actor"  # "actor", "thinker", or "tasker"
     model: str = "lux-actor-1"
-    max_steps_per_todo: int = 24  # ✅ Aligned with official examples (cvs_tasker.py, amazon_scraping.py)
+    max_steps_per_todo: int = 24
+    temperature: float = 0.0
     start_url: Optional[str] = None
-    todos: Optional[List[str]] = None
+    todos: Optional[List[str]] = None  # Required for tasker mode
     drag_duration: float = 0.5
     scroll_amount: int = 30
     wait_duration: float = 1.0
@@ -395,6 +424,7 @@ async def lifespan(app: FastAPI):
     logger.log(f"Screen: {screen_info['width']}x{screen_info['height']}")
     logger.log(f"SDK Resolution: {LUX_REF_WIDTH}x{LUX_REF_HEIGHT}")
     logger.log(f"Clipboard typing: {'✅ Enabled' if PYPERCLIP_AVAILABLE else '❌ Disabled'}")
+    logger.log(f"Supported modes: actor, thinker, tasker")
     yield
     logger.log("Shutting down...")
 
@@ -464,12 +494,13 @@ async def health_check():
         "is_running": is_running,
         "current_task": current_task,
         "screen": screen_info,
-        "lux_resolution": f"{LUX_REF_WIDTH}x{LUX_REF_HEIGHT}"
+        "lux_resolution": f"{LUX_REF_WIDTH}x{LUX_REF_HEIGHT}",
+        "supported_modes": ["actor", "thinker", "tasker"]
     }
 
 @app.post("/execute", response_model=TaskResponse)
 async def execute_task(request: TaskRequest):
-    """Main execution endpoint"""
+    """Main execution endpoint - routes to appropriate executor based on mode"""
     global is_running, current_task
     
     if not OAGI_AVAILABLE:
@@ -488,7 +519,9 @@ async def execute_task(request: TaskRequest):
         logger.log(f"Mode: {request.mode}")
         logger.log(f"Model: {request.model}")
         logger.log(f"Max Steps Per Todo: {request.max_steps_per_todo}")
+        logger.log(f"Temperature: {request.temperature}")
         logger.log(f"Start URL: {request.start_url}")
+        logger.log(f"Todos: {len(request.todos) if request.todos else 0}")
         logger.log(f"SDK Resolution: {LUX_REF_WIDTH}x{LUX_REF_HEIGHT}")
         logger.log(f"Screenshot Resize: {request.enable_screenshot_resize}")
         logger.log(f"Coordinate Scaling: {request.enable_scaling}")
@@ -499,12 +532,28 @@ async def execute_task(request: TaskRequest):
         if request.start_url:
             open_browser_with_url(request.start_url)
         
-        result, execution_report = await execute_with_manual_control(request)
+        # Route to appropriate executor based on mode
+        if request.mode == "tasker":
+            # Tasker mode - requires todos
+            if not request.todos or len(request.todos) == 0:
+                raise HTTPException(
+                    status_code=400, 
+                    detail="Tasker mode requires todos list. Got empty or null todos."
+                )
+            logger.log(f"🎯 Using TASKER mode with {len(request.todos)} todos")
+            result, execution_report = await execute_with_tasker(request)
+        else:
+            # Actor or Thinker mode - uses AsyncActor
+            logger.log(f"🎯 Using {'THINKER' if request.mode == 'thinker' else 'ACTOR'} mode")
+            result, execution_report = await execute_with_actor(request)
+        
         result.execution_report = execution_report
         
         logger.log(f"Task completed: success={result.success}")
         return result
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.log(f"Error: {e}", "ERROR")
         import traceback
@@ -599,11 +648,215 @@ async def execute_actions_with_clipboard_typing(actions, sdk_handler):
             await sdk_handler([action])
 
 # ============================================================
-# MANUAL CONTROL EXECUTION - Captures Reasoning
+# TASKER MODE EXECUTION - Uses TaskerAgent with todos
 # ============================================================
-async def execute_with_manual_control(request: TaskRequest) -> tuple[TaskResponse, Optional[str]]:
-    """Execute with manual step control to capture reasoning"""
-    logger.log("Manual Control execution with reasoning capture")
+async def execute_with_tasker(request: TaskRequest) -> tuple[TaskResponse, Optional[str]]:
+    """Execute using TaskerAgent with todos list"""
+    logger.log("=" * 50)
+    logger.log("TASKER MODE EXECUTION")
+    logger.log("=" * 50)
+    
+    todos = request.todos or []
+    logger.log(f"Task: {request.task_description}")
+    logger.log(f"Todos: {len(todos)}")
+    for i, todo in enumerate(todos):
+        logger.log(f"  [{i}] {todo[:80]}...")
+    
+    # Screen info
+    if PYAUTOGUI_AVAILABLE:
+        screen_width, screen_height = pyautogui.size()
+    else:
+        screen_width, screen_height = 1920, 1080
+    
+    scale_x = screen_width / LUX_REF_WIDTH
+    scale_y = screen_height / LUX_REF_HEIGHT
+    
+    history = ExecutionHistory(request.task_description, todos)
+    completed_todos = 0
+    
+    try:
+        # Create TaskerAgent
+        # Note: TaskerAgent is synchronous, we run it in executor
+        logger.log(f"Creating TaskerAgent with model={request.model}, max_steps={request.max_steps_per_todo}")
+        
+        tasker = TaskerAgent(
+            api_key=request.api_key,
+            model="lux-actor-1",  # Tasker always uses actor model
+            max_steps=request.max_steps_per_todo,
+            temperature=request.temperature
+        )
+        
+        # Set task and todos
+        tasker.set_task(
+            task=request.task_description,
+            todos=todos
+        )
+        
+        logger.log("TaskerAgent configured, starting execution...")
+        
+        # Create custom action handler for clipboard typing
+        pyautogui_config = PyautoguiConfig(
+            drag_duration=request.drag_duration,
+            scroll_amount=request.scroll_amount,
+            wait_duration=request.wait_duration,
+            action_pause=request.action_pause
+        )
+        
+        # Create screenshot maker
+        screenshot_maker = ResizedScreenshotMaker() if request.enable_screenshot_resize else AsyncScreenshotMaker()
+        action_handler = AsyncPyautoguiActionHandler(config=pyautogui_config)
+        
+        # Execute each todo
+        global_step = 0
+        for todo_idx, todo in enumerate(todos):
+            if not is_running:
+                logger.log("🛑 Stop requested - aborting execution")
+                break
+            
+            logger.log(f"{'='*50}")
+            logger.log(f"TODO {todo_idx + 1}/{len(todos)}: {todo[:60]}...")
+            logger.log(f"{'='*50}")
+            
+            todo_completed = False
+            
+            # Execute steps for this todo
+            for step_in_todo in range(1, request.max_steps_per_todo + 1):
+                if not is_running:
+                    break
+                
+                global_step += 1
+                step_record = StepRecord(global_step, todo_idx)
+                
+                logger.log(f"  Step {step_in_todo}/{request.max_steps_per_todo} (global: {global_step})")
+                
+                # Screenshot before
+                step_record.screenshot_before = debug_screenshot(f"todo{todo_idx}_step{step_in_todo}_before")
+                
+                # Get image
+                image = await screenshot_maker()
+                
+                # Get next action from tasker
+                try:
+                    # TaskerAgent.step() returns the next action
+                    step_result = tasker.step(image)
+                    
+                    # Capture reasoning
+                    reasoning = getattr(step_result, "reason", None) or getattr(step_result, "reasoning", None)
+                    step_record.reasoning = reasoning
+                    logger.log(f"    🧠 REASONING: {reasoning}")
+                    
+                    # Check if todo is done
+                    if getattr(step_result, "stop", False):
+                        logger.log(f"    ✅ Todo {todo_idx + 1} completed")
+                        step_record.stop = True
+                        step_record.success = True
+                        history.add_step(step_record)
+                        todo_completed = True
+                        completed_todos += 1
+                        break
+                    
+                    # Process and execute actions
+                    actions = getattr(step_result, "actions", []) or []
+                    logger.log(f"    📋 Actions: {len(actions)}")
+                    
+                    for action in actions:
+                        action_type = str(action.type.value) if hasattr(action.type, "value") else str(action.type)
+                        argument = str(action.argument) if hasattr(action, "argument") else ""
+                        
+                        action_data = {"type": action_type, "argument": argument, "lux_coords": None, "scaled_coords": None}
+                        
+                        if action_type == "click" and argument:
+                            try:
+                                coords = argument.replace(" ", "").split(",")
+                                x_lux, y_lux = int(coords[0]), int(coords[1])
+                                action_data["lux_coords"] = {"x": x_lux, "y": y_lux}
+                            except:
+                                pass
+                        
+                        step_record.actions.append(action_data)
+                        logger.log(f"      {action_type}: {argument[:50]}")
+                    
+                    # Execute actions
+                    await execute_actions_with_clipboard_typing(actions, action_handler)
+                    step_record.success = True
+                    
+                except Exception as e:
+                    step_record.error = str(e)
+                    logger.log(f"    ❌ Step error: {e}", "ERROR")
+                
+                # Screenshot after
+                step_record.screenshot_after = debug_screenshot(f"todo{todo_idx}_step{step_in_todo}_after")
+                history.add_step(step_record)
+                
+                # Delay between steps
+                if request.step_delay > 0:
+                    await asyncio.sleep(request.step_delay)
+            
+            if not todo_completed:
+                logger.log(f"    ⚠️ Todo {todo_idx + 1} did not complete within {request.max_steps_per_todo} steps")
+        
+        # Determine completion status
+        all_completed = completed_todos == len(todos)
+        
+        # Generate report
+        history.finish(all_completed, completed_todos=completed_todos)
+        report_dir = ANALYSIS_DIR / f"tasker_{int(time.time())}"
+        execution_report = history.generate_report(report_dir)
+        logger.log(f"📊 Report: {execution_report}")
+        
+        if all_completed:
+            message = f"All {len(todos)} todos completed"
+        elif completed_todos > 0:
+            message = f"Partial: {completed_todos}/{len(todos)} todos completed"
+        else:
+            message = "No todos completed"
+        
+        return TaskResponse(
+            success=all_completed,
+            message=message,
+            completed_todos=completed_todos,
+            total_todos=len(todos),
+            execution_summary={
+                "mode": "tasker",
+                "model": "lux-actor-1",
+                "todos": todos,
+                "completed_todos": completed_todos,
+                "total_todos": len(todos),
+                "total_steps": global_step,
+                "max_steps_per_todo": request.max_steps_per_todo,
+                "lux_resolution": f"{LUX_REF_WIDTH}x{LUX_REF_HEIGHT}",
+                "screen_resolution": f"{screen_width}x{screen_height}",
+                "scale_factors": {"x": scale_x, "y": scale_y},
+                "clipboard_typing": PYPERCLIP_AVAILABLE
+            }
+        ), execution_report
+        
+    except Exception as e:
+        logger.log(f"Tasker execution error: {e}", "ERROR")
+        import traceback
+        logger.log(traceback.format_exc(), "ERROR")
+        
+        history.finish(False, str(e), completed_todos=completed_todos)
+        try:
+            report_dir = ANALYSIS_DIR / f"tasker_{int(time.time())}"
+            execution_report = history.generate_report(report_dir)
+        except:
+            execution_report = None
+        
+        return TaskResponse(
+            success=False,
+            message=f"Error: {str(e)}",
+            completed_todos=completed_todos,
+            total_todos=len(todos),
+            error=str(e)
+        ), execution_report
+
+# ============================================================
+# ACTOR/THINKER MODE EXECUTION - Uses AsyncActor
+# ============================================================
+async def execute_with_actor(request: TaskRequest) -> tuple[TaskResponse, Optional[str]]:
+    """Execute with AsyncActor for actor/thinker modes"""
+    logger.log("Actor/Thinker mode execution with reasoning capture")
     
     # Determine model
     model = request.model
@@ -751,6 +1004,7 @@ async def execute_with_manual_control(request: TaskRequest) -> tuple[TaskRespons
             completed_todos=1 if completed else 0,
             total_todos=1,
             execution_summary={
+                "mode": request.mode,
                 "model": model, 
                 "steps": len(history.steps), 
                 "completed": completed,
@@ -1023,8 +1277,13 @@ if __name__ == "__main__":
     print(f"  Scale: X={screen_info['scale_x']:.3f}, Y={screen_info['scale_y']:.3f}")
     print(f"  Clipboard Typing: {'✅ Enabled' if PYPERCLIP_AVAILABLE else '❌ Disabled (install pyperclip)'}")
     print(f"{'='*60}")
+    print(f"  SUPPORTED MODES:")
+    print(f"    • actor   - AsyncActor for single-goal tasks")
+    print(f"    • thinker - AsyncActor with lux-thinker-1 model")
+    print(f"    • tasker  - TaskerAgent with structured todos")
+    print(f"{'='*60}")
     print(f"  http://127.0.0.1:{SERVICE_PORT}")
-    print(f"  Reports: {ANALYSIS_DIR}/execution_<timestamp>/")
+    print(f"  Reports: {ANALYSIS_DIR}/")
     print(f"{'='*60}\n")
     
     uvicorn.run(app, host="127.0.0.1", port=SERVICE_PORT, log_level="info")
