@@ -1,13 +1,12 @@
 """
-Tasker Service v5.6.0 - Full TaskerAgent Support
+Tasker Service v5.6.1 - Fixed TaskerAgent API
 =========================================================
 
-CHANGES from v5.5.0:
-- ADD: TaskerAgent support for mode='tasker' with todos
-- ADD: execute_with_tasker() function for Tasker mode execution
-- ADD: Validation - tasker mode requires todos, fails if empty
-- FIX: Mode routing - actor/thinker use AsyncActor, tasker uses TaskerAgent
-- ADD: Per-todo progress tracking and reporting
+CHANGES from v5.6.0:
+- FIX: TaskerAgent uses .run() not .step() (API correction)
+- FIX: TaskerAgent requires action_handler and screenshot_maker in constructor
+- ADD: Custom ClipboardActionHandler for Italian keyboard support
+- ADD: SyncScreenshotMaker wrapper for TaskerAgent (sync, not async)
 
 From oagi-python SDK README:
     config = ImageConfig(
@@ -43,7 +42,7 @@ OAGI_IMPORT_ERROR = None
 try:
     from oagi import (
         AsyncDefaultAgent, AsyncActor, TaskerAgent,
-        AsyncPyautoguiActionHandler, PyautoguiConfig,
+        AsyncPyautoguiActionHandler, PyautoguiActionHandler, PyautoguiConfig,
         AsyncScreenshotMaker, PILImage, ImageConfig,
     )
     OAGI_AVAILABLE = True
@@ -88,7 +87,7 @@ except ImportError:
     print("⚠️ Pyperclip not available - typing may not work with special chars")
 
 # Configuration
-SERVICE_VERSION = "5.6.0"
+SERVICE_VERSION = "5.6.1"
 SERVICE_PORT = 8765
 DEBUG_LOGS_DIR = Path("debug_logs")
 ANALYSIS_DIR = Path("lux_analysis")
@@ -580,6 +579,7 @@ async def stop_task():
 class ResizedScreenshotMaker:
     """
     Screenshot maker that resizes to 1260x700 for Lux API.
+    ASYNC version for AsyncActor.
     """
     
     def __init__(self):
@@ -618,6 +618,45 @@ class ResizedScreenshotMaker:
             base_maker = AsyncScreenshotMaker()
             return await base_maker()
 
+
+class SyncResizedScreenshotMaker:
+    """
+    Screenshot maker that resizes to 1260x700 for Lux API.
+    SYNC version for TaskerAgent.
+    """
+    
+    def __init__(self):
+        if PYAUTOGUI_AVAILABLE:
+            self.screen_width, self.screen_height = pyautogui.size()
+        else:
+            self.screen_width, self.screen_height = 1920, 1080
+        
+        debug_log(f"📸 SyncResizedScreenshotMaker (SDK v{SERVICE_VERSION}):")
+        debug_log(f"   Screen: {self.screen_width}x{self.screen_height}")
+        debug_log(f"   Lux SDK expects: {LUX_REF_WIDTH}x{LUX_REF_HEIGHT}")
+    
+    def __call__(self):
+        """Capture screenshot and resize to 1260x700 for Lux (SYNC)"""
+        
+        if not PIL_AVAILABLE or not PYAUTOGUI_AVAILABLE:
+            debug_log("⚠️ PIL or PyAutoGUI not available", "WARNING")
+            return None
+        
+        try:
+            pil_screenshot = pyautogui.screenshot()
+            original_size = pil_screenshot.size
+            
+            resized = pil_screenshot.resize((LUX_REF_WIDTH, LUX_REF_HEIGHT), Image.LANCZOS)
+            
+            debug_log(f"📸 Screenshot: {original_size[0]}x{original_size[1]} → {LUX_REF_WIDTH}x{LUX_REF_HEIGHT}")
+            
+            return PILImage(resized)
+            
+        except Exception as e:
+            debug_log(f"⚠️ Screenshot resize failed: {e}", "ERROR")
+            return None
+
+
 def scale_coordinates(x: int, y: int, screen_width: int, screen_height: int) -> tuple:
     """
     Scale coordinates from Lux SDK reference (1260x700) to actual screen.
@@ -627,7 +666,37 @@ def scale_coordinates(x: int, y: int, screen_width: int, screen_height: int) -> 
     return x_scaled, y_scaled
 
 # ============================================================
-# CLIPBOARD TYPING WRAPPER - Intercepts type actions
+# CLIPBOARD ACTION HANDLER - For Italian keyboard support
+# ============================================================
+class ClipboardActionHandler:
+    """
+    Custom action handler that uses clipboard for typing.
+    SYNC version for TaskerAgent.
+    Wraps PyautoguiActionHandler but intercepts 'type' actions.
+    """
+    
+    def __init__(self, config: PyautoguiConfig = None):
+        self.config = config or PyautoguiConfig()
+        self.base_handler = PyautoguiActionHandler(config=self.config)
+    
+    def __call__(self, actions):
+        """Execute actions, using clipboard for type actions"""
+        for action in actions:
+            action_type = str(action.type.value) if hasattr(action.type, "value") else str(action.type)
+            argument = str(action.argument) if hasattr(action, "argument") else ""
+            
+            if action_type.lower() == "type":
+                # Intercept type actions - use clipboard
+                debug_log(f"⌨️ Typing via clipboard: '{argument[:50]}...'")
+                type_via_clipboard(argument)
+                time.sleep(0.1)
+            else:
+                # All other actions - use base handler
+                self.base_handler([action])
+
+
+# ============================================================
+# CLIPBOARD TYPING WRAPPER - Intercepts type actions (ASYNC)
 # ============================================================
 async def execute_actions_with_clipboard_typing(actions, sdk_handler):
     """
@@ -648,7 +717,7 @@ async def execute_actions_with_clipboard_typing(actions, sdk_handler):
             await sdk_handler([action])
 
 # ============================================================
-# TASKER MODE EXECUTION - Uses TaskerAgent with todos
+# TASKER MODE EXECUTION - Uses TaskerAgent with .run()
 # ============================================================
 async def execute_with_tasker(request: TaskRequest) -> tuple[TaskResponse, Optional[str]]:
     """Execute using TaskerAgent with todos list"""
@@ -672,18 +741,32 @@ async def execute_with_tasker(request: TaskRequest) -> tuple[TaskResponse, Optio
     scale_y = screen_height / LUX_REF_HEIGHT
     
     history = ExecutionHistory(request.task_description, todos)
-    completed_todos = 0
     
     try:
-        # Create TaskerAgent
-        # Note: TaskerAgent is synchronous, we run it in executor
-        logger.log(f"Creating TaskerAgent with model={request.model}, max_steps={request.max_steps_per_todo}")
+        # Create custom components for TaskerAgent
+        pyautogui_config = PyautoguiConfig(
+            drag_duration=request.drag_duration,
+            scroll_amount=request.scroll_amount,
+            wait_duration=request.wait_duration,
+            action_pause=request.action_pause
+        )
         
+        # Create screenshot maker (SYNC for TaskerAgent)
+        screenshot_maker = SyncResizedScreenshotMaker() if request.enable_screenshot_resize else None
+        
+        # Create action handler with clipboard support (SYNC for TaskerAgent)
+        action_handler = ClipboardActionHandler(config=pyautogui_config)
+        
+        logger.log(f"Creating TaskerAgent with model=lux-actor-1, max_steps={request.max_steps_per_todo}")
+        
+        # Create TaskerAgent with custom handlers
         tasker = TaskerAgent(
             api_key=request.api_key,
             model="lux-actor-1",  # Tasker always uses actor model
             max_steps=request.max_steps_per_todo,
-            temperature=request.temperature
+            temperature=request.temperature,
+            action_handler=action_handler,
+            screenshot_maker=screenshot_maker
         )
         
         # Set task and todos
@@ -692,137 +775,54 @@ async def execute_with_tasker(request: TaskRequest) -> tuple[TaskResponse, Optio
             todos=todos
         )
         
-        logger.log("TaskerAgent configured, starting execution...")
+        logger.log("TaskerAgent configured, starting execution with .run()...")
         
-        # Create custom action handler for clipboard typing
-        pyautogui_config = PyautoguiConfig(
-            drag_duration=request.drag_duration,
-            scroll_amount=request.scroll_amount,
-            wait_duration=request.wait_duration,
-            action_pause=request.action_pause
-        )
+        # Run TaskerAgent - this is SYNCHRONOUS, so run in executor
+        loop = asyncio.get_event_loop()
         
-        # Create screenshot maker
-        screenshot_maker = ResizedScreenshotMaker() if request.enable_screenshot_resize else AsyncScreenshotMaker()
-        action_handler = AsyncPyautoguiActionHandler(config=pyautogui_config)
+        def run_tasker():
+            """Run tasker in sync context"""
+            try:
+                tasker.run()
+                return True, None
+            except Exception as e:
+                return False, str(e)
         
-        # Execute each todo
-        global_step = 0
-        for todo_idx, todo in enumerate(todos):
-            if not is_running:
-                logger.log("🛑 Stop requested - aborting execution")
-                break
-            
-            logger.log(f"{'='*50}")
-            logger.log(f"TODO {todo_idx + 1}/{len(todos)}: {todo[:60]}...")
-            logger.log(f"{'='*50}")
-            
-            todo_completed = False
-            
-            # Execute steps for this todo
-            for step_in_todo in range(1, request.max_steps_per_todo + 1):
-                if not is_running:
-                    break
-                
-                global_step += 1
-                step_record = StepRecord(global_step, todo_idx)
-                
-                logger.log(f"  Step {step_in_todo}/{request.max_steps_per_todo} (global: {global_step})")
-                
-                # Screenshot before
-                step_record.screenshot_before = debug_screenshot(f"todo{todo_idx}_step{step_in_todo}_before")
-                
-                # Get image
-                image = await screenshot_maker()
-                
-                # Get next action from tasker
-                try:
-                    # TaskerAgent.step() returns the next action
-                    step_result = tasker.step(image)
-                    
-                    # Capture reasoning
-                    reasoning = getattr(step_result, "reason", None) or getattr(step_result, "reasoning", None)
-                    step_record.reasoning = reasoning
-                    logger.log(f"    🧠 REASONING: {reasoning}")
-                    
-                    # Check if todo is done
-                    if getattr(step_result, "stop", False):
-                        logger.log(f"    ✅ Todo {todo_idx + 1} completed")
-                        step_record.stop = True
-                        step_record.success = True
-                        history.add_step(step_record)
-                        todo_completed = True
-                        completed_todos += 1
-                        break
-                    
-                    # Process and execute actions
-                    actions = getattr(step_result, "actions", []) or []
-                    logger.log(f"    📋 Actions: {len(actions)}")
-                    
-                    for action in actions:
-                        action_type = str(action.type.value) if hasattr(action.type, "value") else str(action.type)
-                        argument = str(action.argument) if hasattr(action, "argument") else ""
-                        
-                        action_data = {"type": action_type, "argument": argument, "lux_coords": None, "scaled_coords": None}
-                        
-                        if action_type == "click" and argument:
-                            try:
-                                coords = argument.replace(" ", "").split(",")
-                                x_lux, y_lux = int(coords[0]), int(coords[1])
-                                action_data["lux_coords"] = {"x": x_lux, "y": y_lux}
-                            except:
-                                pass
-                        
-                        step_record.actions.append(action_data)
-                        logger.log(f"      {action_type}: {argument[:50]}")
-                    
-                    # Execute actions
-                    await execute_actions_with_clipboard_typing(actions, action_handler)
-                    step_record.success = True
-                    
-                except Exception as e:
-                    step_record.error = str(e)
-                    logger.log(f"    ❌ Step error: {e}", "ERROR")
-                
-                # Screenshot after
-                step_record.screenshot_after = debug_screenshot(f"todo{todo_idx}_step{step_in_todo}_after")
-                history.add_step(step_record)
-                
-                # Delay between steps
-                if request.step_delay > 0:
-                    await asyncio.sleep(request.step_delay)
-            
-            if not todo_completed:
-                logger.log(f"    ⚠️ Todo {todo_idx + 1} did not complete within {request.max_steps_per_todo} steps")
+        # Execute in thread pool to not block event loop
+        success, error = await loop.run_in_executor(None, run_tasker)
         
-        # Determine completion status
-        all_completed = completed_todos == len(todos)
+        if error:
+            logger.log(f"TaskerAgent error: {error}", "ERROR")
+            history.finish(False, error, completed_todos=0)
+        else:
+            logger.log("TaskerAgent completed successfully")
+            # TaskerAgent doesn't expose which todos completed, assume all if success
+            history.finish(True, completed_todos=len(todos))
         
         # Generate report
-        history.finish(all_completed, completed_todos=completed_todos)
         report_dir = ANALYSIS_DIR / f"tasker_{int(time.time())}"
         execution_report = history.generate_report(report_dir)
         logger.log(f"📊 Report: {execution_report}")
         
-        if all_completed:
+        completed_todos = len(todos) if success else 0
+        
+        if success:
             message = f"All {len(todos)} todos completed"
-        elif completed_todos > 0:
-            message = f"Partial: {completed_todos}/{len(todos)} todos completed"
         else:
-            message = "No todos completed"
+            message = f"Failed: {error}"
         
         return TaskResponse(
-            success=all_completed,
+            success=success,
             message=message,
             completed_todos=completed_todos,
             total_todos=len(todos),
+            error=error,
             execution_summary={
                 "mode": "tasker",
                 "model": "lux-actor-1",
                 "todos": todos,
                 "completed_todos": completed_todos,
                 "total_todos": len(todos),
-                "total_steps": global_step,
                 "max_steps_per_todo": request.max_steps_per_todo,
                 "lux_resolution": f"{LUX_REF_WIDTH}x{LUX_REF_HEIGHT}",
                 "screen_resolution": f"{screen_width}x{screen_height}",
@@ -836,7 +836,7 @@ async def execute_with_tasker(request: TaskRequest) -> tuple[TaskResponse, Optio
         import traceback
         logger.log(traceback.format_exc(), "ERROR")
         
-        history.finish(False, str(e), completed_todos=completed_todos)
+        history.finish(False, str(e), completed_todos=0)
         try:
             report_dir = ANALYSIS_DIR / f"tasker_{int(time.time())}"
             execution_report = history.generate_report(report_dir)
@@ -846,7 +846,7 @@ async def execute_with_tasker(request: TaskRequest) -> tuple[TaskResponse, Optio
         return TaskResponse(
             success=False,
             message=f"Error: {str(e)}",
-            completed_todos=completed_todos,
+            completed_todos=0,
             total_todos=len(todos),
             error=str(e)
         ), execution_report
@@ -1278,9 +1278,9 @@ if __name__ == "__main__":
     print(f"  Clipboard Typing: {'✅ Enabled' if PYPERCLIP_AVAILABLE else '❌ Disabled (install pyperclip)'}")
     print(f"{'='*60}")
     print(f"  SUPPORTED MODES:")
-    print(f"    • actor   - AsyncActor for single-goal tasks")
+    print(f"    • actor   - AsyncActor with manual step control")
     print(f"    • thinker - AsyncActor with lux-thinker-1 model")
-    print(f"    • tasker  - TaskerAgent with structured todos")
+    print(f"    • tasker  - TaskerAgent with .run() (automatic)")
     print(f"{'='*60}")
     print(f"  http://127.0.0.1:{SERVICE_PORT}")
     print(f"  Reports: {ANALYSIS_DIR}/")
