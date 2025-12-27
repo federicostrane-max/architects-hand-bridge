@@ -884,7 +884,7 @@ async def execute_with_tasker(request: TaskRequest) -> tuple[TaskResponse, Optio
         logger.log(f"Creating TaskerAgent with:")
         logger.log(f"  model: lux-actor-1")
         logger.log(f"  max_steps: {request.max_steps_per_todo}")
-        logger.log(f"  temperature: {request.temperature}")
+        logger.log(f"  temperature: 0.0 (forced for tasker mode)")
         
         # Create TaskerAgent with FULL constructor (from amazon_scraping.py)
         tasker_kwargs = {
@@ -892,7 +892,7 @@ async def execute_with_tasker(request: TaskRequest) -> tuple[TaskResponse, Optio
             "base_url": "https://api.agiopen.org",
             "model": "lux-actor-1",
             "max_steps": request.max_steps_per_todo,
-            "temperature": request.temperature,
+            "temperature": 0.0,  # FORZATO A 0.0 per evitare loop infiniti
         }
         
         # Add observer if available
@@ -981,7 +981,7 @@ async def execute_with_tasker(request: TaskRequest) -> tuple[TaskResponse, Optio
                 "completed_todos": completed_todos,
                 "total_todos": len(todos),
                 "max_steps_per_todo": request.max_steps_per_todo,
-                "temperature": request.temperature,
+                "temperature": 0.0,  # Report actual temperature used
                 "lux_resolution": f"{LUX_REF_WIDTH}x{LUX_REF_HEIGHT}",
                 "screen_resolution": f"{screen_width}x{screen_height}",
                 "scale_factors": {"x": scale_x, "y": scale_y},
@@ -1169,6 +1169,7 @@ async def execute_with_actor(request: TaskRequest) -> tuple[TaskResponse, Option
                 "completed": completed,
                 "stopped": stopped,
                 "max_steps_per_todo": request.max_steps_per_todo,
+                "temperature": request.temperature,  # Use original temperature for actor/thinker
                 "lux_resolution": f"{LUX_REF_WIDTH}x{LUX_REF_HEIGHT}",
                 "screen_resolution": f"{screen_width}x{screen_height}",
                 "scale_factors": {"x": scale_x, "y": scale_y},
