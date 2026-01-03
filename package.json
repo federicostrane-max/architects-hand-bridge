@@ -16,6 +16,7 @@
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.39.0",
+    "node-fetch": "^2.7.0",
     "playwright": "^1.40.0"
   },
   "build": {
@@ -36,7 +37,9 @@
       {
         "from": "node_modules/playwright/.local-browsers",
         "to": "playwright-browsers",
-        "filter": ["chromium*/**/*"]
+        "filter": [
+          "chromium*/**/*"
+        ]
       }
     ]
   }
