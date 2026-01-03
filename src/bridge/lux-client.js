@@ -1,250 +1,168 @@
 /**
- * Lux Client for Architect's Hand Bridge
- * Handles communication with Lux API and local Tasker Service
+ * Lux Client - v3.4
+ * Communicates with Python tasker_service.py
+ * Supports: Lux (actor/thinker/tasker) + Gemini Computer Use
+ * Compatible with tasker_service.py v5.9.0
  */
 
 const fetch = require('node-fetch');
 
 class LuxClient {
-  constructor() {
-    this.apiKey = null;
-    this.baseUrl = 'https://api.agiopen.org';
-    this.taskerServiceUrl = 'http://127.0.0.1:8765';
-    this.taskId = null;
-  }
+    constructor(baseUrl = 'http://127.0.0.1:8765') {
+        this.baseUrl = baseUrl;
+        this.timeout = 300000; // 5 minutes timeout for long tasks
+    }
 
-  /**
-   * Initialize the client
-   */
-  initialize(apiKey) {
-    this.apiKey = apiKey;
-    console.log('[Lux] API configured');
-  }
+    /**
+     * Check if tasker service is running and get its capabilities
+     */
+    async checkTaskerService() {
+        try {
+            const response = await fetch(`${this.baseUrl}/status`, {
+                method: 'GET',
+                timeout: 5000
+            });
 
-  /**
-   * Check if Tasker Service is available
-   */
-  async checkTaskerService() {
-    try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 2000);
-      
-      const response = await fetch(`${this.taskerServiceUrl}/status`, {
-        method: 'GET',
-        signal: controller.signal
-      });
-      
-      clearTimeout(timeout);
+            if (!response.ok) {
+                throw new Error(`Status check failed: ${response.status}`);
+            }
 
-      if (response.ok) {
-        const data = await response.json();
-        console.log(`[Lux] Tasker Service status: ${data.status}, OAGI: ${data.oagi_available}`);
-        return {
-          available: true,
-          status: data.status,
-          oagiAvailable: data.oagi_available
+            const data = await response.json();
+            
+            return {
+                status: data.status,
+                version: data.version,
+                oagiAvailable: data.oagi_available,
+                geminiAvailable: data.gemini_available,
+                modes: data.modes || []
+            };
+        } catch (error) {
+            throw new Error(`Tasker service unreachable: ${error.message}`);
+        }
+    }
+
+    /**
+     * Execute task with Lux Actor or Thinker mode
+     */
+    async executeDirectTask({ apiKey, instruction, mode = 'actor', maxSteps = 15, startUrl = null }) {
+        console.log(`📤 Sending ${mode} task to tasker service...`);
+
+        const payload = {
+            api_key: apiKey,
+            task_description: instruction,
+            mode: mode,
+            max_steps_per_todo: maxSteps
         };
-      }
-    } catch (error) {
-      console.log('[Lux] Tasker Service not available');
-    }
 
-    return {
-      available: false,
-      status: 'offline',
-      oagiAvailable: false
-    };
-  }
-
-  /**
-   * Execute a direct task (Actor or Thinker mode)
-   * Uses the Python Tasker Service which wraps OAGI
-   */
-  async executeDirectTask(params) {
-    const {
-      instruction,
-      model = 'lux-actor-1',
-      maxSteps = 30,
-      temperature = 0.1,
-      startUrl = null
-    } = params;
-
-    console.log(`[Lux] Executing direct task with model: ${model}`);
-    console.log(`[Lux] Instruction: ${instruction}`);
-    if (startUrl) {
-      console.log(`[Lux] Start URL: ${startUrl}`);
-    }
-
-    try {
-      // For direct tasks, we send a single todo with the full instruction
-      const response = await fetch(`${this.taskerServiceUrl}/execute`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          api_key: this.apiKey,
-          task_description: instruction,
-          todos: [instruction], // Single todo with full instruction
-          start_url: startUrl,
-          max_steps: maxSteps,
-          reflection_interval: maxSteps + 10, // Disable reflection for direct tasks
-          model: model,
-          temperature: temperature,
-          mode: 'direct' // Flag for direct execution
-        })
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`Tasker Service error: ${response.status} - ${errorText}`);
-      }
-
-      const result = await response.json();
-
-      return {
-        success: result.success,
-        message: result.message,
-        summary: result.execution_summary,
-        error: result.error
-      };
-
-    } catch (error) {
-      console.error('[Lux] Direct task error:', error.message);
-      return {
-        success: false,
-        message: 'Task failed with error',
-        error: error.message
-      };
-    }
-  }
-
-  /**
-   * Execute a Tasker task with todos
-   */
-  async executeTaskerTask(params) {
-    const {
-      taskDescription,
-      todos,
-      todoRecords = [],
-      model = 'lux-actor-1',
-      maxSteps = 60,
-      reflectionInterval = 20,
-      temperature = 0.1,
-      startUrl = null,
-      onTodoStart = null,
-      onTodoComplete = null
-    } = params;
-
-    console.log('[Lux] Delegating task to Python Tasker Service...');
-    console.log(`[Lux] Task: ${taskDescription}`);
-    console.log(`[Lux] Todos: ${todos.length}`);
-    if (startUrl) {
-      console.log(`[Lux] Start URL: ${startUrl}`);
-    }
-
-    try {
-      // Notify start of first todo
-      if (onTodoStart && todos.length > 0) {
-        await onTodoStart(0, todos[0]);
-      }
-
-      console.log('[Lux] Sending request to Tasker Service...');
-
-      const response = await fetch(`${this.taskerServiceUrl}/execute`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          api_key: this.apiKey,
-          task_description: taskDescription,
-          todos: todos,
-          start_url: startUrl,
-          max_steps: maxSteps,
-          reflection_interval: reflectionInterval,
-          model: model,
-          temperature: temperature,
-          mode: 'tasker'
-        })
-      });
-
-      console.log('[Lux] Tasker Service response received');
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`Tasker Service error: ${response.status} - ${errorText}`);
-      }
-
-      const result = await response.json();
-
-      console.log('[Lux] Tasker Service response:', JSON.stringify(result, null, 2));
-
-      // Notify completion of all todos based on result
-      if (onTodoComplete) {
-        for (let i = 0; i < todos.length; i++) {
-          const success = i < result.completed_todos;
-          await onTodoComplete(i, success, { message: result.message });
+        if (startUrl) {
+            payload.start_url = startUrl;
         }
-      }
 
-      return {
-        success: result.success,
-        message: result.message,
-        completedTodos: result.completed_todos,
-        totalTodos: result.total_todos,
-        error: result.error
-      };
-
-    } catch (error) {
-      console.error('[Lux] Request error:', error.message);
-
-      // Mark all todos as failed
-      if (onTodoComplete) {
-        for (let i = 0; i < todos.length; i++) {
-          await onTodoComplete(i, false, { message: error.message });
-        }
-      }
-
-      return {
-        success: false,
-        message: `Tasker Service request failed: ${error.message}`,
-        completedTodos: 0,
-        totalTodos: todos.length,
-        error: error.message
-      };
+        return await this._executeRequest(payload);
     }
-  }
 
-  /**
-   * Stop the current task
-   */
-  async stopTask() {
-    try {
-      const response = await fetch(`${this.taskerServiceUrl}/stop`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
+    /**
+     * Execute task with Lux TaskerAgent mode
+     */
+    async executeTaskerTask({ apiKey, instruction, maxSteps = 15, startUrl = null }) {
+        console.log('📤 Sending tasker task to service...');
+
+        const payload = {
+            api_key: apiKey,
+            task_description: instruction,
+            mode: 'tasker',
+            max_steps_per_todo: maxSteps
+        };
+
+        if (startUrl) {
+            payload.start_url = startUrl;
         }
-      });
 
-      if (response.ok) {
-        console.log('[Lux] Task stop requested');
-        return true;
-      }
-    } catch (error) {
-      console.error('[Lux] Error stopping task:', error.message);
+        return await this._executeRequest(payload);
     }
-    return false;
-  }
 
-  /**
-   * Check if API key is configured
-   */
-  isConfigured() {
-    return this.apiKey !== null;
-  }
+    /**
+     * Execute task with Gemini Computer Use
+     */
+    async executeGeminiTask({ apiKey, instruction, maxSteps = 15, startUrl = null }) {
+        console.log('📤 Sending Gemini Computer Use task to service...');
+
+        const payload = {
+            api_key: apiKey,
+            task_description: instruction,
+            mode: 'gemini',
+            max_steps_per_todo: maxSteps
+        };
+
+        if (startUrl) {
+            payload.start_url = startUrl;
+        }
+
+        return await this._executeRequest(payload);
+    }
+
+    /**
+     * Internal method to execute request to tasker service
+     */
+    async _executeRequest(payload) {
+        try {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), this.timeout);
+
+            const response = await fetch(`${this.baseUrl}/execute`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(payload),
+                signal: controller.signal
+            });
+
+            clearTimeout(timeoutId);
+
+            if (!response.ok) {
+                const errorData = await response.json().catch(() => ({}));
+                throw new Error(errorData.detail || `HTTP ${response.status}`);
+            }
+
+            const result = await response.json();
+            
+            console.log(`📥 Response received:`);
+            console.log(`   Success: ${result.success}`);
+            console.log(`   Steps: ${result.steps_executed}`);
+            console.log(`   Message: ${result.message?.substring(0, 100)}...`);
+
+            return result;
+
+        } catch (error) {
+            if (error.name === 'AbortError') {
+                throw new Error('Task execution timed out');
+            }
+            throw error;
+        }
+    }
+
+    /**
+     * Test Gemini API key
+     */
+    async testGeminiApiKey(apiKey) {
+        try {
+            const response = await fetch(
+                `${this.baseUrl}/debug/test_gemini?api_key=${encodeURIComponent(apiKey)}`,
+                {
+                    method: 'POST',
+                    timeout: 10000
+                }
+            );
+
+            return await response.json();
+        } catch (error) {
+            return {
+                success: false,
+                error: error.message
+            };
+        }
+    }
 }
 
-// Export singleton
-module.exports = new LuxClient();
+module.exports = LuxClient;
