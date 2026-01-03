@@ -102,6 +102,22 @@
       font-size: 20px;
     }
     
+    .card .description {
+      font-size: 12px;
+      color: #888;
+      margin-top: -10px;
+      margin-bottom: 15px;
+    }
+    
+    .card .description a {
+      color: #818cf8;
+      text-decoration: none;
+    }
+    
+    .card .description a:hover {
+      text-decoration: underline;
+    }
+    
     /* Form */
     .form-group {
       margin-bottom: 15px;
@@ -326,6 +342,26 @@
     .hidden {
       display: none !important;
     }
+    
+    /* Provider badges */
+    .provider-badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 11px;
+      font-weight: 600;
+      margin-left: 8px;
+    }
+    
+    .provider-badge.lux {
+      background: rgba(0, 212, 170, 0.2);
+      color: #00d4aa;
+    }
+    
+    .provider-badge.gemini {
+      background: rgba(66, 133, 244, 0.2);
+      color: #4285f4;
+    }
   </style>
 </head>
 <body>
@@ -333,7 +369,7 @@
     <!-- Header -->
     <div class="header">
       <h1>🏗️ Architect's Hand Bridge</h1>
-      <p class="subtitle">Desktop automation powered by OpenAGI Lux</p>
+      <p class="subtitle">Desktop automation powered by OpenAGI Lux + Google Gemini</p>
     </div>
     
     <!-- Tabs -->
@@ -439,11 +475,28 @@
       </div>
       
       <div class="card">
-        <h2><span class="icon">🤖</span> OpenAGI Configuration</h2>
+        <h2>
+          <span class="icon">🤖</span> OpenAGI Configuration
+          <span class="provider-badge lux">LUX</span>
+        </h2>
+        <p class="description">Get your API key from <a href="https://api.agiopen.org" target="_blank">api.agiopen.org</a></p>
         
         <div class="form-group">
           <label for="openagi-key">OpenAGI API Key</label>
           <input type="password" id="openagi-key" placeholder="your-openagi-api-key">
+        </div>
+      </div>
+      
+      <div class="card">
+        <h2>
+          <span class="icon">✨</span> Google Gemini Configuration
+          <span class="provider-badge gemini">GEMINI</span>
+        </h2>
+        <p class="description">Get your API key from <a href="https://aistudio.google.com/apikey" target="_blank">aistudio.google.com/apikey</a></p>
+        
+        <div class="form-group">
+          <label for="gemini-key">Gemini API Key</label>
+          <input type="password" id="gemini-key" placeholder="AIzaSy...">
         </div>
       </div>
       
@@ -507,6 +560,7 @@
       supabaseUrl: document.getElementById('supabase-url'),
       supabaseKey: document.getElementById('supabase-key'),
       openagiKey: document.getElementById('openagi-key'),
+      geminiKey: document.getElementById('gemini-key'),
       autoStartBridge: document.getElementById('auto-start-bridge'),
       btnSaveSettings: document.getElementById('btn-save-settings'),
       btnTestConnection: document.getElementById('btn-test-connection'),
@@ -665,6 +719,7 @@
         supabaseUrl: elements.supabaseUrl.value.trim(),
         supabaseAnonKey: elements.supabaseKey.value.trim(),
         openAgiApiKey: elements.openagiKey.value.trim(),
+        geminiApiKey: elements.geminiKey.value.trim(),
         autoStartBridge: elements.autoStartBridge.checked
       };
       
@@ -687,8 +742,11 @@
         if (result.supabase) msg.push('✓ Supabase configured');
         else msg.push('✗ Supabase not configured');
         
-        if (result.openAgi) msg.push('✓ OpenAGI configured');
-        else msg.push('✗ OpenAGI not configured');
+        if (result.openAgi) msg.push('✓ OpenAGI (Lux) configured');
+        else msg.push('✗ OpenAGI (Lux) not configured');
+        
+        if (result.gemini) msg.push('✓ Gemini configured');
+        else msg.push('✗ Gemini not configured');
         
         showMessage('settings', msg.join('<br>'), result.complete ? 'success' : 'info');
       } catch (e) {
@@ -732,7 +790,11 @@
       if (task) {
         elements.currentTask.classList.remove('hidden');
         elements.taskDescription.textContent = task.task_description;
-        elements.taskProgress.textContent = `Mode: ${task.lux_mode || 'actor'} | Status: ${task.status}`;
+        
+        // Show mode with badge
+        const modeText = task.lux_mode || 'actor';
+        const modeBadge = modeText === 'gemini' ? '🔵 Gemini' : '🟢 Lux';
+        elements.taskProgress.textContent = `Mode: ${modeBadge} (${modeText}) | Status: ${task.status}`;
       } else {
         elements.currentTask.classList.add('hidden');
       }
@@ -757,6 +819,8 @@
         console.log('Config loaded:', { 
           hasEmail: !!config.email, 
           hasPassword: !!config.password,
+          hasOpenAgi: !!config.openAgiApiKey,
+          hasGemini: !!config.geminiApiKey,
           rememberMe: config.rememberMe 
         });
         
@@ -778,6 +842,9 @@
         }
         if (config.openAgiApiKey) {
           elements.openagiKey.value = config.openAgiApiKey;
+        }
+        if (config.geminiApiKey) {
+          elements.geminiKey.value = config.geminiApiKey;
         }
         elements.autoStartBridge.checked = config.autoStartBridge || false;
         
