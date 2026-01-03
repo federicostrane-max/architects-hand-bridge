@@ -1,1449 +1,891 @@
 """
-Tasker Service v5.7.2 - Official Pattern from oagi-lux-samples
-=========================================================
+tasker_service.py - v5.9.0
+Multi-provider Computer Use service for The Architect's Hand
+Supports: Lux (actor/thinker/tasker) + Gemini Computer Use
 
-CHANGES from v5.7.1:
-- FIX: TaskerAgent constructor accepts model, max_steps, temperature, step_observer
-- Pattern verified from official oagi-lux-samples/amazon_scraping.py
-
-CORRECT PATTERN (from oagi-lux-samples):
-    observer = AsyncAgentObserver()
-    image_provider = AsyncScreenshotMaker()
-    action_handler = AsyncPyautoguiActionHandler()
-    
-    tasker = TaskerAgent(
-        api_key=os.getenv("OAGI_API_KEY"),
-        base_url="https://api.agiopen.org",
-        model="lux-actor-1",
-        max_steps=24,
-        temperature=0.0,
-        step_observer=observer,
-    )
-    tasker.set_task(task=instruction, todos=todos)
-    success = await tasker.execute(
-        instruction="",
-        action_handler=action_handler,
-        image_provider=image_provider,
-    )
-    memory = tasker.get_memory()
-
-image_provider interface:
-    async def __call__(self) -> Image  # Capture screenshot
-    # Image must have: read() -> bytes
-
-action_handler interface:
-    async def __call__(self, actions: list[Action]) -> None
-
-From oagi-python SDK README:
-    config = ImageConfig(
-        format="JPEG",
-        quality=85,
-        width=1260,
-        height=700
-    )
-
-This is the resolution Lux API expects for optimal coordinate detection.
+Based on official Google implementation:
+https://github.com/google-gemini/computer-use-preview
 """
 
 import asyncio
-import io
+import base64
+import json
 import os
 import sys
-import subprocess
 import time
 import webbrowser
-import json
-from typing import Optional, List, Dict, Any
 from datetime import datetime
 from pathlib import Path
+from typing import Optional, Literal, Union, Any, List
 from contextlib import asynccontextmanager
+import pyautogui
+import pyperclip
+from PIL import Image
+from io import BytesIO
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import uvicorn
 
-# OAGI SDK
+# ============================================================================
+# SDK IMPORTS
+# ============================================================================
+
+# Lux SDK
 OAGI_AVAILABLE = False
-OAGI_IMPORT_ERROR = None
-ASYNC_AGENT_OBSERVER_AVAILABLE = False
-
 try:
-    from oagi import (
-        AsyncDefaultAgent, AsyncActor, TaskerAgent,
-        AsyncPyautoguiActionHandler, PyautoguiActionHandler, PyautoguiConfig,
-        AsyncScreenshotMaker, PILImage, ImageConfig,
-    )
+    from oagilib import Client as OAGIClient
+    from oagilib.lux import AsyncActor
+    from oagilib.lux.agent import TaskerAgent
+    from oagilib.lux.screenshot import ResizedScreenshotMaker
     OAGI_AVAILABLE = True
     print("✅ OAGI SDK loaded")
 except ImportError as e:
-    OAGI_IMPORT_ERROR = str(e)
-    print(f"❌ OAGI SDK failed: {e}")
+    print(f"⚠️ OAGI SDK not available: {e}")
 
-# Try to import AsyncAgentObserver (may be in different location)
+# Gemini SDK
+GEMINI_AVAILABLE = False
 try:
-    from oagi.agent.observer import AsyncAgentObserver
-    ASYNC_AGENT_OBSERVER_AVAILABLE = True
-    print("✅ AsyncAgentObserver loaded")
-except ImportError:
-    print("ℹ️ AsyncAgentObserver not available (optional)")
+    from google import genai
+    from google.genai import types
+    from google.genai.types import (
+        Part,
+        GenerateContentConfig,
+        Content,
+        Candidate,
+        FunctionResponse,
+        FinishReason,
+    )
+    GEMINI_AVAILABLE = True
+    print("✅ Gemini SDK loaded")
+except ImportError as e:
+    print(f"⚠️ Gemini SDK not available: {e}")
 
-# PIL
-PIL_AVAILABLE = False
-try:
-    from PIL import Image
-    PIL_AVAILABLE = True
-    print("✅ PIL loaded")
-except ImportError:
-    print("⚠️ PIL not available")
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
 
-# LUX Analyzer
-ANALYZER_AVAILABLE = False
-try:
-    from lux_analyzer import LuxAnalyzer
-    ANALYZER_AVAILABLE = True
-    print("✅ LUX Analyzer loaded")
-except ImportError:
-    print("ℹ️ LUX Analyzer not available")
-
-# PyAutoGUI
-try:
-    import pyautogui
-    PYAUTOGUI_AVAILABLE = True
-except ImportError:
-    PYAUTOGUI_AVAILABLE = False
-    print("⚠️ PyAutoGUI not available")
-
-# Pyperclip for clipboard operations
-PYPERCLIP_AVAILABLE = False
-try:
-    import pyperclip
-    PYPERCLIP_AVAILABLE = True
-    print("✅ Pyperclip loaded")
-except ImportError:
-    print("⚠️ Pyperclip not available - typing may not work with special chars")
-
-# Configuration
-SERVICE_VERSION = "5.7.2"
-SERVICE_PORT = 8765
-DEBUG_LOGS_DIR = Path("debug_logs")
-ANALYSIS_DIR = Path("lux_analysis")
-DEBUG_LOGS_DIR.mkdir(exist_ok=True)
-ANALYSIS_DIR.mkdir(exist_ok=True)
-
-# ============================================================
-# LUX RESOLUTION - FROM SDK ImageConfig EXAMPLE
-# ============================================================
+# Lux configuration
 LUX_REF_WIDTH = 1260
 LUX_REF_HEIGHT = 700
 
-# ============================================================
-# STEP HISTORY - Stores reasoning and actions
-# ============================================================
-class StepRecord:
-    def __init__(self, step_num: int, todo_index: Optional[int] = None):
-        self.step_num = step_num
-        self.todo_index = todo_index
-        self.timestamp = datetime.now().isoformat()
-        self.reasoning: Optional[str] = None
-        self.actions: List[Dict] = []
-        self.screenshot_before: Optional[str] = None
-        self.screenshot_after: Optional[str] = None
-        self.success: bool = False
-        self.error: Optional[str] = None
-        self.stop: bool = False
-    
-    def to_dict(self) -> Dict:
-        return {
-            "step_num": self.step_num, 
-            "todo_index": self.todo_index,
-            "timestamp": self.timestamp,
-            "reasoning": self.reasoning, "actions": self.actions,
-            "screenshot_before": self.screenshot_before,
-            "screenshot_after": self.screenshot_after,
-            "success": self.success, "error": self.error, "stop": self.stop
-        }
+# Gemini configuration (from official Google repo)
+GEMINI_REF_WIDTH = 1440
+GEMINI_REF_HEIGHT = 900
+GEMINI_MODEL = "gemini-2.5-computer-use-preview-10-2025"
+MAX_RECENT_TURNS_WITH_SCREENSHOTS = 3
+
+# Predefined Computer Use functions (from official Google repo)
+PREDEFINED_COMPUTER_USE_FUNCTIONS = [
+    "open_web_browser",
+    "click_at",
+    "hover_at",
+    "type_text_at",
+    "scroll_document",
+    "scroll_at",
+    "wait_5_seconds",
+    "go_back",
+    "go_forward",
+    "search",
+    "navigate",
+    "key_combination",
+    "drag_and_drop",
+]
+
+# PyAutoGUI settings
+pyautogui.FAILSAFE = True
+pyautogui.PAUSE = 0.1
+
+# ============================================================================
+# MODELS
+# ============================================================================
+
+class ExecuteRequest(BaseModel):
+    api_key: str
+    task_description: str
+    mode: str = "actor"  # actor, thinker, tasker, gemini
+    max_steps_per_todo: int = 15
+    start_url: Optional[str] = None
+
+class StatusResponse(BaseModel):
+    status: str
+    version: str
+    oagi_available: bool
+    gemini_available: bool
+    modes: list
+
+class ExecuteResponse(BaseModel):
+    success: bool
+    message: str
+    steps_executed: int = 0
+    final_url: Optional[str] = None
+    report_path: Optional[str] = None
+    error: Optional[str] = None
+
+# ============================================================================
+# EXECUTION HISTORY (shared between Lux and Gemini)
+# ============================================================================
 
 class ExecutionHistory:
-    def __init__(self, task_description: str, todos: Optional[List[str]] = None):
+    """Records and exports execution history for both Lux and Gemini"""
+    
+    def __init__(self, task_description: str, mode: str):
         self.task_description = task_description
-        self.todos = todos or []
+        self.mode = mode
+        self.steps: List[dict] = []
         self.start_time = datetime.now()
         self.end_time: Optional[datetime] = None
-        self.steps: List[StepRecord] = []
-        self.completed: bool = False
-        self.final_error: Optional[str] = None
-        self.completed_todos: int = 0
-    
-    def add_step(self, step: StepRecord):
-        self.steps.append(step)
-    
-    def finish(self, completed: bool, error: Optional[str] = None, completed_todos: int = 0):
+        
+    def add_step(self, action: str, args: dict, screenshot_path: Optional[str] = None, reasoning: Optional[str] = None):
+        self.steps.append({
+            "step_number": len(self.steps) + 1,
+            "timestamp": datetime.now().isoformat(),
+            "action": action,
+            "args": args,
+            "screenshot": screenshot_path,
+            "reasoning": reasoning
+        })
+        
+    def finalize(self, success: bool, final_message: str):
         self.end_time = datetime.now()
-        self.completed = completed
-        self.final_error = error
-        self.completed_todos = completed_todos
-    
-    def to_dict(self) -> Dict:
-        return {
-            "task_description": self.task_description,
-            "todos": self.todos,
-            "start_time": self.start_time.isoformat(),
-            "end_time": self.end_time.isoformat() if self.end_time else None,
-            "duration_seconds": (self.end_time - self.start_time).total_seconds() if self.end_time else None,
-            "total_steps": len(self.steps),
-            "completed": self.completed,
-            "completed_todos": self.completed_todos,
-            "total_todos": len(self.todos),
-            "final_error": self.final_error,
-            "steps": [s.to_dict() for s in self.steps]
-        }
-    
+        self.success = success
+        self.final_message = final_message
+        
     def generate_report(self, output_dir: Path) -> str:
+        """Generate HTML report"""
         output_dir.mkdir(parents=True, exist_ok=True)
         
-        if PYAUTOGUI_AVAILABLE:
-            screen_width, screen_height = pyautogui.size()
-            scale_x = screen_width / LUX_REF_WIDTH
-            scale_y = screen_height / LUX_REF_HEIGHT
+        # Determine resolution based on mode
+        if self.mode == "gemini":
+            resolution = f"{GEMINI_REF_WIDTH}x{GEMINI_REF_HEIGHT}"
         else:
-            screen_width, screen_height = 1920, 1080
-            scale_x = scale_y = 1.0
+            resolution = f"{LUX_REF_WIDTH}x{LUX_REF_HEIGHT}"
         
         duration = (self.end_time - self.start_time).total_seconds() if self.end_time else 0
         
-        # Todos section
-        todos_html = ""
-        if self.todos:
-            todos_html = "<div class='todos-section'><h3>📋 Todos</h3><ol>"
-            for i, todo in enumerate(self.todos):
-                status = "✅" if i < self.completed_todos else "❌"
-                todos_html += f"<li>{status} {todo}</li>"
-            todos_html += "</ol></div>"
-        
-        html = f'''<!DOCTYPE html>
+        html = f"""<!DOCTYPE html>
 <html>
 <head>
-    <title>LUX Report - {self.task_description[:50]}</title>
+    <title>Execution Report - {self.mode.upper()}</title>
     <style>
-        body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif; margin: 20px; background: #f5f5f5; }}
-        .header {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; border-radius: 10px; margin-bottom: 20px; }}
-        .header h1 {{ margin: 0 0 10px 0; }}
-        .todos-section {{ background: white; border-radius: 10px; padding: 20px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
-        .todos-section ol {{ margin: 10px 0; padding-left: 20px; }}
-        .todos-section li {{ margin: 8px 0; padding: 8px; background: #f8f9fa; border-radius: 4px; }}
-        .step {{ background: white; border-radius: 10px; padding: 20px; margin-bottom: 15px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
-        .step-num {{ background: #667eea; color: white; padding: 5px 15px; border-radius: 20px; font-weight: bold; }}
-        .todo-badge {{ background: #28a745; color: white; padding: 3px 10px; border-radius: 10px; font-size: 12px; margin-left: 10px; }}
-        .reasoning {{ background: #e8f4f8; padding: 15px; border-radius: 8px; margin: 15px 0; border-left: 4px solid #667eea; }}
-        .reasoning-label {{ font-weight: bold; color: #667eea; }}
-        .action {{ background: #f8f9fa; padding: 12px; border-radius: 6px; margin-bottom: 8px; font-family: monospace; }}
-        .action-type {{ color: white; padding: 2px 8px; border-radius: 4px; font-size: 12px; margin-right: 10px; }}
-        .action-type.click {{ background: #007bff; }}
-        .action-type.type {{ background: #28a745; }}
-        .action-type.scroll {{ background: #ffc107; color: black; }}
-        .coords .original {{ color: #dc3545; }}
-        .coords .scaled {{ color: #28a745; font-weight: bold; }}
-        .success {{ border-left: 4px solid #28a745; }}
-        .error {{ border-left: 4px solid #dc3545; }}
-        .summary {{ background: white; border-radius: 10px; padding: 20px; margin-top: 20px; }}
-        .stat {{ display: inline-block; margin-right: 30px; }}
-        .stat-value {{ font-size: 24px; font-weight: bold; color: #667eea; }}
-        .stat-label {{ font-size: 12px; color: #888; }}
-        .screen-info {{ background: #fff3cd; padding: 10px 15px; border-radius: 6px; margin-bottom: 20px; }}
-        .sdk-note {{ background: #d4edda; padding: 10px 15px; border-radius: 6px; margin-bottom: 20px; border-left: 4px solid #28a745; }}
+        body {{ font-family: Arial, sans-serif; margin: 20px; background: #1a1a2e; color: #eee; }}
+        .header {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 20px; border-radius: 10px; margin-bottom: 20px; }}
+        .mode-badge {{ display: inline-block; padding: 5px 15px; border-radius: 20px; font-weight: bold; margin-left: 10px; }}
+        .mode-gemini {{ background: #4285f4; }}
+        .mode-lux {{ background: #00d4aa; }}
+        .step {{ background: #16213e; padding: 15px; margin: 10px 0; border-radius: 8px; border-left: 4px solid #667eea; }}
+        .step-header {{ display: flex; justify-content: space-between; margin-bottom: 10px; }}
+        .action {{ color: #00d4aa; font-weight: bold; }}
+        .reasoning {{ color: #a0a0a0; font-style: italic; margin: 10px 0; padding: 10px; background: #0f0f23; border-radius: 5px; }}
+        .args {{ color: #ffd93d; }}
+        .screenshot {{ max-width: 100%; border-radius: 5px; margin-top: 10px; }}
+        .stats {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px; margin: 20px 0; }}
+        .stat {{ background: #16213e; padding: 15px; border-radius: 8px; text-align: center; }}
+        .stat-value {{ font-size: 24px; color: #667eea; }}
+        .success {{ color: #00d4aa; }}
+        .error {{ color: #ff6b6b; }}
     </style>
 </head>
 <body>
     <div class="header">
-        <h1>🤖 LUX Execution Report v{SERVICE_VERSION}</h1>
-        <div><strong>Task:</strong> {self.task_description}</div>
-        <div><strong>Duration:</strong> {duration:.1f}s | <strong>Status:</strong> {"✅ Completed" if self.completed else "❌ Not Completed"}</div>
-        {"<div><strong>Todos:</strong> " + str(self.completed_todos) + "/" + str(len(self.todos)) + " completed</div>" if self.todos else ""}
+        <h1>🤖 Execution Report 
+            <span class="mode-badge mode-{self.mode}">{self.mode.upper()}</span>
+        </h1>
+        <p><strong>Task:</strong> {self.task_description}</p>
+        <p><strong>Resolution:</strong> {resolution}</p>
     </div>
-    <div class="sdk-note">
-        📐 <strong>SDK Resolution:</strong> Using <strong>{LUX_REF_WIDTH}×{LUX_REF_HEIGHT}</strong> as per SDK ImageConfig recommendation
+    
+    <div class="stats">
+        <div class="stat">
+            <div class="stat-value">{len(self.steps)}</div>
+            <div>Steps</div>
+        </div>
+        <div class="stat">
+            <div class="stat-value">{duration:.1f}s</div>
+            <div>Duration</div>
+        </div>
+        <div class="stat">
+            <div class="stat-value {'success' if getattr(self, 'success', False) else 'error'}">
+                {'✓' if getattr(self, 'success', False) else '✗'}
+            </div>
+            <div>Status</div>
+        </div>
+        <div class="stat">
+            <div class="stat-value">{self.mode}</div>
+            <div>Provider</div>
+        </div>
     </div>
-    <div class="screen-info">
-        🖥️ <strong>Screen:</strong> {screen_width}×{screen_height} | 
-        <strong>Scale:</strong> X={scale_x:.3f}, Y={scale_y:.3f}
-    </div>
-    {todos_html}
-'''
+    
+    <h2>Execution Timeline</h2>
+"""
         
         for step in self.steps:
-            step_class = "success" if step.success else "error"
-            todo_badge = f'<span class="todo-badge">Todo {step.todo_index + 1}</span>' if step.todo_index is not None else ""
-            html += f'''
-    <div class="step {step_class}">
-        <span class="step-num">Step {step.step_num}</span>{todo_badge}
-        <div class="reasoning">
-            <div class="reasoning-label">🧠 LUX Reasoning:</div>
-            {step.reasoning or "<em>No reasoning</em>"}
+            reasoning_html = f'<div class="reasoning">{step.get("reasoning", "")}</div>' if step.get("reasoning") else ""
+            screenshot_html = f'<img src="{step["screenshot"]}" class="screenshot">' if step.get("screenshot") else ""
+            
+            html += f"""
+    <div class="step">
+        <div class="step-header">
+            <span class="action">Step {step['step_number']}: {step['action']}</span>
+            <span>{step['timestamp']}</span>
         </div>
-        <div><strong>Actions ({len(step.actions)}):</strong></div>
-'''
-            for action in step.actions:
-                action_type = action.get("type", "unknown")
-                lux_coords = action.get("lux_coords")
-                scaled_coords = action.get("scaled_coords")
-                
-                if action_type == "click" and lux_coords:
-                    if scaled_coords:
-                        coords_html = f'LUX ({LUX_REF_WIDTH}×{LUX_REF_HEIGHT}): <span class="original">({lux_coords["x"]}, {lux_coords["y"]})</span> → Screen: <span class="scaled">({scaled_coords["x"]}, {scaled_coords["y"]})</span>'
-                    else:
-                        coords_html = f'({lux_coords["x"]}, {lux_coords["y"]})'
-                else:
-                    arg = str(action.get("argument", ""))[:80]
-                    coords_html = arg.replace("<", "&lt;").replace(">", "&gt;")
-                
-                html += f'''
-        <div class="action">
-            <span class="action-type {action_type}">{action_type.upper()}</span>
-            <span class="coords">{coords_html}</span>
-        </div>
-'''
-            html += "    </div>\n"
+        {reasoning_html}
+        <div class="args">Args: {json.dumps(step['args'])}</div>
+        {screenshot_html}
+    </div>
+"""
         
-        html += f'''
-    <div class="summary">
-        <h2>📊 Summary</h2>
-        <div class="stat"><div class="stat-value">{len(self.steps)}</div><div class="stat-label">Steps</div></div>
-        <div class="stat"><div class="stat-value">{sum(len(s.actions) for s in self.steps)}</div><div class="stat-label">Actions</div></div>
-        <div class="stat"><div class="stat-value">{duration:.1f}s</div><div class="stat-label">Duration</div></div>
-        {"<div class='stat'><div class='stat-value'>" + str(self.completed_todos) + "/" + str(len(self.todos)) + "</div><div class='stat-label'>Todos</div></div>" if self.todos else ""}
-        <div class="stat"><div class="stat-value">{"✅" if self.completed else "❌"}</div><div class="stat-label">Completed</div></div>
+        html += f"""
+    <div class="step">
+        <div class="step-header">
+            <span class="{'success' if getattr(self, 'success', False) else 'error'}">
+                Final: {getattr(self, 'final_message', 'Unknown')}
+            </span>
+        </div>
     </div>
 </body>
-</html>
-'''
+</html>"""
         
         report_path = output_dir / "execution_report.html"
-        with open(report_path, "w", encoding="utf-8") as f:
-            f.write(html)
+        report_path.write_text(html, encoding="utf-8")
         
+        # Also save JSON
         json_path = output_dir / "execution_history.json"
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(self.to_dict(), f, indent=2, ensure_ascii=False)
+        json_path.write_text(json.dumps({
+            "task": self.task_description,
+            "mode": self.mode,
+            "resolution": resolution,
+            "steps": self.steps,
+            "success": getattr(self, 'success', False),
+            "duration_seconds": duration
+        }, indent=2), encoding="utf-8")
         
         return str(report_path)
 
-# ============================================================
-# LOGGING
-# ============================================================
-class Logger:
-    def __init__(self):
-        self.log_file = DEBUG_LOGS_DIR / f"service_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-        self.analyzer = None
-    
-    def log(self, message: str, level: str = "INFO"):
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-        log_line = f"[{timestamp}] [{level}] {message}"
-        print(log_line)
-        try:
-            with open(self.log_file, "a", encoding="utf-8") as f:
-                f.write(log_line + "\n")
-        except: pass
+# ============================================================================
+# SHARED UTILITIES
+# ============================================================================
 
-logger = Logger()
-
-DEBUG_SCREENSHOTS_DIR = DEBUG_LOGS_DIR / "screenshots"
-DEBUG_SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
-_debug_step_counter = 0
-
-def debug_log(message: str, level: str = "INFO"):
-    logger.log(message, level)
-
-def debug_screenshot(prefix: str = "screenshot") -> Optional[str]:
-    global _debug_step_counter
-    _debug_step_counter += 1
-    if not PYAUTOGUI_AVAILABLE: return None
-    try:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"{_debug_step_counter:03d}_{prefix}_{timestamp}.png"
-        filepath = DEBUG_SCREENSHOTS_DIR / filename
-        pyautogui.screenshot().save(filepath)
-        return str(filepath)
-    except: return None
-
-def debug_screen_info() -> dict:
-    if not PYAUTOGUI_AVAILABLE:
-        return {"width": 1920, "height": 1080, "source": "default"}
-    try:
-        w, h = pyautogui.size()
-        return {
-            "width": w, "height": h,
-            "lux_ref_width": LUX_REF_WIDTH, "lux_ref_height": LUX_REF_HEIGHT,
-            "scale_x": w / LUX_REF_WIDTH, "scale_y": h / LUX_REF_HEIGHT,
-            "needs_resize": True,
-            "source": "pyautogui"
-        }
-    except:
-        return {"width": 1920, "height": 1080, "source": "error"}
-
-# ============================================================
-# CLIPBOARD TYPING - For Italian keyboard support
-# ============================================================
 def type_via_clipboard(text: str):
-    """
-    Type text using clipboard (Ctrl+V) instead of typewrite().
-    This supports special characters like @ on Italian keyboards.
-    """
-    if PYPERCLIP_AVAILABLE:
-        # Save current clipboard
+    """Type text via clipboard (handles Unicode)"""
+    original = pyperclip.paste()
+    try:
+        pyperclip.copy(text)
+        time.sleep(0.05)
+        pyautogui.hotkey('ctrl', 'v')
+        time.sleep(0.1)
+    finally:
         try:
-            old_clipboard = pyperclip.paste()
+            pyperclip.copy(original)
         except:
-            old_clipboard = ""
+            pass
+
+def capture_screenshot_png(width: int, height: int) -> bytes:
+    """Capture and resize screenshot, return PNG bytes"""
+    screenshot = pyautogui.screenshot()
+    screenshot = screenshot.resize((width, height), Image.LANCZOS)
+    buffer = BytesIO()
+    screenshot.save(buffer, format='PNG')
+    return buffer.getvalue()
+
+def get_screen_size() -> tuple:
+    """Get actual screen size"""
+    return pyautogui.size()
+
+# ============================================================================
+# GEMINI COMPUTER USE IMPLEMENTATION
+# (Based on official Google repo: github.com/google-gemini/computer-use-preview)
+# ============================================================================
+
+class GeminiComputerUseAgent:
+    """
+    Gemini Computer Use Agent - follows official Google implementation
+    """
+    
+    def __init__(self, api_key: str, task: str, max_steps: int = 15):
+        self.api_key = api_key
+        self.task = task
+        self.max_steps = max_steps
+        self.history = ExecutionHistory(task, "gemini")
+        self.final_reasoning: Optional[str] = None
         
+        # Initialize Gemini client
+        self._client = genai.Client(api_key=api_key)
+        
+        # Conversation history
+        self._contents: List[Content] = [
+            Content(
+                role="user",
+                parts=[Part(text=self.task)],
+            )
+        ]
+        
+        # Configuration (from official repo)
+        self._generate_content_config = GenerateContentConfig(
+            temperature=1,
+            top_p=0.95,
+            top_k=40,
+            max_output_tokens=8192,
+            tools=[
+                types.Tool(
+                    computer_use=types.ComputerUse(
+                        environment=types.Environment.ENVIRONMENT_BROWSER,
+                    ),
+                ),
+            ],
+        )
+        
+        # Screenshot directory
+        self.screenshot_dir = Path("debug_logs/screenshots")
+        self.screenshot_dir.mkdir(parents=True, exist_ok=True)
+        
+    def denormalize_x(self, x: int) -> int:
+        """Convert normalized x (0-999) to screen pixels"""
+        screen_width, _ = get_screen_size()
+        return int(x / 1000 * screen_width)
+    
+    def denormalize_y(self, y: int) -> int:
+        """Convert normalized y (0-999) to screen pixels"""
+        _, screen_height = get_screen_size()
+        return int(y / 1000 * screen_height)
+    
+    def capture_screenshot(self) -> tuple:
+        """Capture screenshot at Gemini reference resolution, return (bytes, path)"""
+        png_bytes = capture_screenshot_png(GEMINI_REF_WIDTH, GEMINI_REF_HEIGHT)
+        
+        # Save for debugging
+        timestamp = datetime.now().strftime("%H%M%S_%f")
+        path = self.screenshot_dir / f"gemini_{timestamp}.png"
+        path.write_bytes(png_bytes)
+        
+        return png_bytes, str(path)
+    
+    def handle_action(self, action: types.FunctionCall) -> tuple:
+        """
+        Execute action and return (url, screenshot_bytes, screenshot_path)
+        Based on official Google implementation
+        """
+        name = action.name
+        args = dict(action.args) if action.args else {}
+        
+        print(f"  → Executing: {name} with args: {args}")
+        
+        if name == "open_web_browser":
+            pass  # Browser already open
+            
+        elif name == "click_at":
+            x = self.denormalize_x(args["x"])
+            y = self.denormalize_y(args["y"])
+            pyautogui.click(x, y)
+            time.sleep(0.3)
+            
+        elif name == "hover_at":
+            x = self.denormalize_x(args["x"])
+            y = self.denormalize_y(args["y"])
+            pyautogui.moveTo(x, y)
+            
+        elif name == "type_text_at":
+            x = self.denormalize_x(args["x"])
+            y = self.denormalize_y(args["y"])
+            text = args["text"]
+            press_enter = args.get("press_enter", False)
+            clear_before = args.get("clear_before_typing", True)
+            
+            pyautogui.click(x, y)
+            time.sleep(0.1)
+            
+            if clear_before:
+                pyautogui.hotkey('ctrl', 'a')
+                pyautogui.press('delete')
+                time.sleep(0.05)
+            
+            type_via_clipboard(text)
+            
+            if press_enter:
+                pyautogui.press('enter')
+            time.sleep(0.2)
+            
+        elif name == "scroll_document":
+            direction = args["direction"]
+            if direction == "down":
+                pyautogui.press('pagedown')
+            elif direction == "up":
+                pyautogui.press('pageup')
+            elif direction == "left":
+                pyautogui.scroll(3, horizontal=True)
+            elif direction == "right":
+                pyautogui.scroll(-3, horizontal=True)
+            time.sleep(0.2)
+            
+        elif name == "scroll_at":
+            x = self.denormalize_x(args["x"])
+            y = self.denormalize_y(args["y"])
+            direction = args["direction"]
+            magnitude = args.get("magnitude", 800)
+            
+            # Denormalize magnitude
+            if direction in ("up", "down"):
+                magnitude = self.denormalize_y(magnitude)
+            else:
+                magnitude = self.denormalize_x(magnitude)
+            
+            pyautogui.moveTo(x, y)
+            
+            if direction == "up":
+                pyautogui.scroll(magnitude // 100)
+            elif direction == "down":
+                pyautogui.scroll(-magnitude // 100)
+            time.sleep(0.2)
+            
+        elif name == "wait_5_seconds":
+            time.sleep(5)
+            
+        elif name == "go_back":
+            pyautogui.hotkey('alt', 'left')
+            time.sleep(0.5)
+            
+        elif name == "go_forward":
+            pyautogui.hotkey('alt', 'right')
+            time.sleep(0.5)
+            
+        elif name == "search":
+            webbrowser.open("https://www.google.com")
+            time.sleep(1)
+            
+        elif name == "navigate":
+            url = args["url"]
+            if not url.startswith(("http://", "https://")):
+                url = "https://" + url
+            webbrowser.open(url)
+            time.sleep(1)
+            
+        elif name == "key_combination":
+            keys = args["keys"].split("+")
+            # Map keys to pyautogui names
+            key_map = {
+                "control": "ctrl",
+                "command": "ctrl",  # Windows equivalent
+                "meta": "ctrl",
+                "return": "enter",
+                "arrowleft": "left",
+                "arrowright": "right",
+                "arrowup": "up",
+                "arrowdown": "down",
+            }
+            mapped_keys = [key_map.get(k.lower(), k.lower()) for k in keys]
+            pyautogui.hotkey(*mapped_keys)
+            time.sleep(0.2)
+            
+        elif name == "drag_and_drop":
+            x = self.denormalize_x(args["x"])
+            y = self.denormalize_y(args["y"])
+            dest_x = self.denormalize_x(args["destination_x"])
+            dest_y = self.denormalize_y(args["destination_y"])
+            
+            pyautogui.moveTo(x, y)
+            pyautogui.mouseDown()
+            pyautogui.moveTo(dest_x, dest_y, duration=0.3)
+            pyautogui.mouseUp()
+            
+        else:
+            print(f"  ⚠️ Unknown action: {name}")
+        
+        # Capture result screenshot
+        screenshot_bytes, screenshot_path = self.capture_screenshot()
+        
+        # Record in history
+        self.history.add_step(name, args, screenshot_path)
+        
+        # Return current URL (we don't have access to browser URL from pyautogui)
+        return "unknown", screenshot_bytes, screenshot_path
+    
+    def get_text(self, candidate: Candidate) -> Optional[str]:
+        """Extract text from candidate"""
+        if not candidate.content or not candidate.content.parts:
+            return None
+        text = []
+        for part in candidate.content.parts:
+            if part.text:
+                text.append(part.text)
+        return " ".join(text) or None
+    
+    def extract_function_calls(self, candidate: Candidate) -> List[types.FunctionCall]:
+        """Extract function calls from candidate"""
+        if not candidate.content or not candidate.content.parts:
+            return []
+        ret = []
+        for part in candidate.content.parts:
+            if part.function_call:
+                ret.append(part.function_call)
+        return ret
+    
+    def get_safety_confirmation(self, safety: dict) -> Literal["CONTINUE", "TERMINATE"]:
+        """Handle safety confirmation (auto-approve with logging)"""
+        if safety.get("decision") == "require_confirmation":
+            print(f"  ⚠️ Safety confirmation required: {safety.get('explanation', 'No explanation')}")
+            # Auto-approve for automation (in production, could prompt user)
+            return "CONTINUE"
+        return "CONTINUE"
+    
+    def run_one_iteration(self) -> Literal["COMPLETE", "CONTINUE"]:
+        """Run one iteration of the agent loop"""
+        
+        # Generate response from Gemini
         try:
-            # Copy text to clipboard and paste
-            pyperclip.copy(text)
-            time.sleep(0.1)  # Increased from 0.05
-            pyautogui.hotkey('ctrl', 'v')
-            time.sleep(0.15)  # Increased from 0.1
-        finally:
-            # Restore old clipboard (optional, comment out if not needed)
-            try:
-                pyperclip.copy(old_clipboard)
-            except:
-                pass
-    else:
-        # Fallback to typewrite if pyperclip not available
-        # This won't work well with special chars on non-US keyboards
-        pyautogui.typewrite(text, interval=0.05)
+            response = self._client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=self._contents,
+                config=self._generate_content_config,
+            )
+        except Exception as e:
+            print(f"  ❌ Gemini API error: {e}")
+            return "COMPLETE"
+        
+        if not response.candidates:
+            print("  ❌ No candidates in response")
+            return "COMPLETE"
+        
+        candidate = response.candidates[0]
+        
+        # Append model turn to history
+        if candidate.content:
+            self._contents.append(candidate.content)
+        
+        reasoning = self.get_text(candidate)
+        function_calls = self.extract_function_calls(candidate)
+        
+        if reasoning:
+            print(f"  💭 Reasoning: {reasoning[:200]}...")
+        
+        # Handle malformed function call
+        if (not function_calls and not reasoning and 
+            candidate.finish_reason == FinishReason.MALFORMED_FUNCTION_CALL):
+            return "CONTINUE"
+        
+        # No function calls = task complete
+        if not function_calls:
+            print(f"  ✅ Task complete: {reasoning}")
+            self.final_reasoning = reasoning
+            return "COMPLETE"
+        
+        # Execute each function call
+        function_responses = []
+        for fc in function_calls:
+            extra_fields = {}
+            
+            # Handle safety decision
+            if fc.args and (safety := fc.args.get("safety_decision")):
+                decision = self.get_safety_confirmation(safety)
+                if decision == "TERMINATE":
+                    return "COMPLETE"
+                extra_fields["safety_acknowledgement"] = "true"
+            
+            # Execute the action
+            url, screenshot_bytes, screenshot_path = self.handle_action(fc)
+            
+            # Update history with reasoning
+            if self.history.steps:
+                self.history.steps[-1]["reasoning"] = reasoning
+            
+            # Build function response (official format)
+            function_responses.append(
+                FunctionResponse(
+                    name=fc.name,
+                    response={
+                        "url": url,
+                        **extra_fields,
+                    },
+                    parts=[
+                        types.FunctionResponsePart(
+                            inline_data=types.FunctionResponseBlob(
+                                mime_type="image/png",
+                                data=screenshot_bytes
+                            )
+                        )
+                    ],
+                )
+            )
+        
+        # Add function responses to conversation
+        self._contents.append(
+            Content(
+                role="user",
+                parts=[Part(function_response=fr) for fr in function_responses],
+            )
+        )
+        
+        # Remove old screenshots to save context space
+        self._cleanup_old_screenshots()
+        
+        return "CONTINUE"
+    
+    def _cleanup_old_screenshots(self):
+        """Remove screenshots from old turns to save context"""
+        turns_with_screenshots = 0
+        
+        for content in reversed(self._contents):
+            if content.role == "user" and content.parts:
+                has_screenshot = False
+                for part in content.parts:
+                    if (part.function_response and 
+                        part.function_response.parts and
+                        part.function_response.name in PREDEFINED_COMPUTER_USE_FUNCTIONS):
+                        has_screenshot = True
+                        break
+                
+                if has_screenshot:
+                    turns_with_screenshots += 1
+                    if turns_with_screenshots > MAX_RECENT_TURNS_WITH_SCREENSHOTS:
+                        for part in content.parts:
+                            if (part.function_response and 
+                                part.function_response.parts and
+                                part.function_response.name in PREDEFINED_COMPUTER_USE_FUNCTIONS):
+                                part.function_response.parts = None
+    
+    def run(self) -> ExecuteResponse:
+        """Run the full agent loop"""
+        print(f"\n🤖 Starting Gemini Computer Use Agent")
+        print(f"   Task: {self.task}")
+        print(f"   Max steps: {self.max_steps}")
+        
+        # Capture initial screenshot
+        screenshot_bytes, screenshot_path = self.capture_screenshot()
+        
+        # Add initial screenshot to conversation
+        self._contents[0].parts.append(
+            Part(
+                inline_data=types.Blob(
+                    mime_type="image/png",
+                    data=screenshot_bytes
+                )
+            )
+        )
+        
+        steps = 0
+        status = "CONTINUE"
+        
+        while status == "CONTINUE" and steps < self.max_steps:
+            steps += 1
+            print(f"\n📍 Step {steps}/{self.max_steps}")
+            status = self.run_one_iteration()
+        
+        # Generate report
+        success = status == "COMPLETE" or steps >= self.max_steps
+        final_msg = self.final_reasoning or f"Completed {steps} steps"
+        self.history.finalize(success, final_msg)
+        
+        report_dir = Path("lux_analysis") / f"gemini_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        report_path = self.history.generate_report(report_dir)
+        
+        return ExecuteResponse(
+            success=success,
+            message=final_msg,
+            steps_executed=steps,
+            report_path=report_path
+        )
 
-# ============================================================
-# PYDANTIC MODELS
-# ============================================================
-class TaskRequest(BaseModel):
-    api_key: str
-    task_description: str
-    mode: str = "actor"  # "actor", "thinker", or "tasker"
-    model: str = "lux-actor-1"
-    max_steps_per_todo: int = 24
-    temperature: float = 0.0
-    start_url: Optional[str] = None
-    todos: Optional[List[str]] = None  # Required for tasker mode
-    drag_duration: float = 0.5
-    scroll_amount: int = 30
-    wait_duration: float = 1.0
-    action_pause: float = 0.1
-    step_delay: float = 0.3
-    enable_analysis: bool = True
-    enable_scaling: bool = False
-    enable_screenshot_resize: bool = True
+# ============================================================================
+# LUX EXECUTION (existing implementation)
+# ============================================================================
 
-class TaskResponse(BaseModel):
-    success: bool
-    message: str
-    completed_todos: int = 0
-    total_todos: int = 0
-    error: Optional[str] = None
-    execution_summary: Optional[Dict[str, Any]] = None
-    analysis_report: Optional[str] = None
-    execution_report: Optional[str] = None
+async def execute_with_lux(
+    api_key: str,
+    task: str,
+    mode: str,
+    max_steps: int,
+    start_url: Optional[str]
+) -> ExecuteResponse:
+    """Execute task using Lux SDK"""
+    
+    if not OAGI_AVAILABLE:
+        return ExecuteResponse(
+            success=False,
+            message="Lux SDK not available",
+            error="OAGI SDK not installed"
+        )
+    
+    history = ExecutionHistory(task, mode)
+    
+    try:
+        client = OAGIClient(api_key=api_key)
+        screenshot_maker = ResizedScreenshotMaker(
+            max_width=LUX_REF_WIDTH,
+            max_height=LUX_REF_HEIGHT
+        )
+        
+        # Navigate to start URL if provided
+        if start_url:
+            webbrowser.open(start_url)
+            await asyncio.sleep(2)
+        
+        if mode == "tasker":
+            # TaskerAgent mode
+            agent = TaskerAgent(
+                client=client,
+                screenshot_maker=screenshot_maker,
+                type_via_clipboard=type_via_clipboard
+            )
+            
+            result = await agent.execute(
+                task=task,
+                max_steps_per_todo=max_steps
+            )
+            
+            history.finalize(True, str(result))
+            
+        else:
+            # Actor/Thinker mode
+            model = "lux-thinker-1" if mode == "thinker" else "lux-actor-1"
+            
+            actor = AsyncActor(
+                client=client,
+                model=model,
+                screenshot_maker=screenshot_maker,
+                type_via_clipboard=type_via_clipboard
+            )
+            
+            steps = 0
+            async for step in actor.run(task, max_steps=max_steps):
+                steps += 1
+                history.add_step(
+                    action=step.action if hasattr(step, 'action') else "step",
+                    args={"step": steps},
+                    reasoning=step.reasoning if hasattr(step, 'reasoning') else None
+                )
+            
+            history.finalize(True, f"Completed {steps} steps")
+        
+        # Generate report
+        report_dir = Path("lux_analysis") / f"{mode}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        report_path = history.generate_report(report_dir)
+        
+        return ExecuteResponse(
+            success=True,
+            message=f"Task completed with {mode}",
+            steps_executed=len(history.steps),
+            report_path=report_path
+        )
+        
+    except Exception as e:
+        history.finalize(False, str(e))
+        return ExecuteResponse(
+            success=False,
+            message="Execution failed",
+            error=str(e)
+        )
 
-class StatusResponse(BaseModel):
-    status: str
-    oagi_available: bool
-    analyzer_available: bool
-    version: str = SERVICE_VERSION
+# ============================================================================
+# FASTAPI APPLICATION
+# ============================================================================
 
-# ============================================================
-# FASTAPI APP
-# ============================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.log(f"Tasker Service v{SERVICE_VERSION} starting...")
-    screen_info = debug_screen_info()
-    logger.log(f"Screen: {screen_info['width']}x{screen_info['height']}")
-    logger.log(f"SDK Resolution: {LUX_REF_WIDTH}x{LUX_REF_HEIGHT}")
-    logger.log(f"Clipboard typing: {'✅ Enabled' if PYPERCLIP_AVAILABLE else '❌ Disabled'}")
-    logger.log(f"Supported modes: actor, thinker, tasker")
+    print("\n" + "="*60)
+    print("🚀 TASKER SERVICE v5.9.0")
+    print("="*60)
+    print(f"OAGI SDK: {'✅ Available' if OAGI_AVAILABLE else '❌ Not available'}")
+    print(f"Gemini SDK: {'✅ Available' if GEMINI_AVAILABLE else '❌ Not available'}")
+    print("\nSUPPORTED MODES:")
+    if OAGI_AVAILABLE:
+        print("  • actor   - Lux AsyncActor (lux-actor-1)")
+        print("  • thinker - Lux AsyncActor (lux-thinker-1)")
+        print("  • tasker  - Lux TaskerAgent")
+    if GEMINI_AVAILABLE:
+        print("  • gemini  - Google Gemini Computer Use")
+    print("="*60 + "\n")
     yield
-    logger.log("Shutting down...")
+    print("Shutting down...")
 
-app = FastAPI(title="Tasker Service", version=SERVICE_VERSION, lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app = FastAPI(title="Tasker Service", version="5.9.0", lifespan=lifespan)
 
-is_running = False
-current_task = None
-
-# ============================================================
-# BROWSER
-# ============================================================
-def open_browser_with_url(url: str):
-    logger.log(f"Opening browser: {url}")
-    import platform
-    system = platform.system()
-    
-    if system == "Windows":
-        chrome_paths = [
-            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-        ]
-        chrome_path = next((p for p in chrome_paths if os.path.exists(p)), None)
-        if chrome_path:
-            lux_profile = os.path.expanduser("~\\AppData\\Local\\Google\\Chrome\\User Data\\LuxProfile")
-            try:
-                subprocess.Popen([chrome_path, f"--user-data-dir={lux_profile}", "--remote-debugging-port=9222", "--start-maximized", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            except:
-                webbrowser.open(url)
-        else:
-            webbrowser.open(url)
-    else:
-        webbrowser.open(url)
-    
-    time.sleep(4)
-
-# ============================================================
-# ENDPOINTS
-# ============================================================
-@app.get("/")
-async def root():
-    """Root endpoint"""
-    return await get_status()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.get("/status", response_model=StatusResponse)
 async def get_status():
-    """Status endpoint - required by bridge"""
+    modes = []
+    if OAGI_AVAILABLE:
+        modes.extend(["actor", "thinker", "tasker"])
+    if GEMINI_AVAILABLE:
+        modes.append("gemini")
+    
     return StatusResponse(
-        status="busy" if is_running else "ready", 
-        oagi_available=OAGI_AVAILABLE, 
-        analyzer_available=ANALYZER_AVAILABLE,
-        version=SERVICE_VERSION
+        status="running",
+        version="5.9.0",
+        oagi_available=OAGI_AVAILABLE,
+        gemini_available=GEMINI_AVAILABLE,
+        modes=modes
     )
 
-@app.get("/health")
-async def health_check():
-    """Health check endpoint"""
-    screen_info = debug_screen_info()
-    return {
-        "status": "healthy", 
-        "version": SERVICE_VERSION, 
-        "oagi_available": OAGI_AVAILABLE,
-        "pil_available": PIL_AVAILABLE,
-        "analyzer_available": ANALYZER_AVAILABLE,
-        "pyautogui_available": PYAUTOGUI_AVAILABLE,
-        "pyperclip_available": PYPERCLIP_AVAILABLE,
-        "is_running": is_running,
-        "current_task": current_task,
-        "screen": screen_info,
-        "lux_resolution": f"{LUX_REF_WIDTH}x{LUX_REF_HEIGHT}",
-        "supported_modes": ["actor", "thinker", "tasker"]
-    }
-
-@app.post("/execute", response_model=TaskResponse)
-async def execute_task(request: TaskRequest):
-    """Main execution endpoint - routes to appropriate executor based on mode"""
-    global is_running, current_task
+@app.post("/execute", response_model=ExecuteResponse)
+async def execute_task(request: ExecuteRequest):
+    print(f"\n📥 Received task: {request.task_description[:100]}...")
+    print(f"   Mode: {request.mode}")
     
-    if not OAGI_AVAILABLE:
-        raise HTTPException(status_code=500, detail=f"OAGI SDK not available: {OAGI_IMPORT_ERROR}")
-    if is_running:
-        raise HTTPException(status_code=409, detail=f"Task running: {current_task}")
-    
-    is_running = True
-    current_task = request.task_description
-    
-    try:
-        logger.log(f"{'='*60}")
-        logger.log(f"EXECUTING TASK")
-        logger.log(f"{'='*60}")
-        logger.log(f"Task: {request.task_description}")
-        logger.log(f"Mode: {request.mode}")
-        logger.log(f"Model: {request.model}")
-        logger.log(f"Max Steps Per Todo: {request.max_steps_per_todo}")
-        logger.log(f"Temperature: {request.temperature}")
-        logger.log(f"Start URL: {request.start_url}")
-        logger.log(f"Todos: {len(request.todos) if request.todos else 0}")
-        logger.log(f"SDK Resolution: {LUX_REF_WIDTH}x{LUX_REF_HEIGHT}")
-        logger.log(f"Screenshot Resize: {request.enable_screenshot_resize}")
-        logger.log(f"Coordinate Scaling: {request.enable_scaling}")
-        logger.log(f"Clipboard Typing: {PYPERCLIP_AVAILABLE}")
+    if request.mode == "gemini":
+        if not GEMINI_AVAILABLE:
+            raise HTTPException(status_code=400, detail="Gemini SDK not available")
         
-        os.environ["OAGI_API_KEY"] = request.api_key
-        
-        if request.start_url:
-            open_browser_with_url(request.start_url)
-        
-        # Route to appropriate executor based on mode
-        if request.mode == "tasker":
-            # Tasker mode - requires todos
-            if not request.todos or len(request.todos) == 0:
-                raise HTTPException(
-                    status_code=400, 
-                    detail="Tasker mode requires todos list. Got empty or null todos."
-                )
-            logger.log(f"🎯 Using TASKER mode with {len(request.todos)} todos")
-            result, execution_report = await execute_with_tasker(request)
-        else:
-            # Actor or Thinker mode - uses AsyncActor
-            logger.log(f"🎯 Using {'THINKER' if request.mode == 'thinker' else 'ACTOR'} mode")
-            result, execution_report = await execute_with_actor(request)
-        
-        result.execution_report = execution_report
-        
-        logger.log(f"Task completed: success={result.success}")
-        return result
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.log(f"Error: {e}", "ERROR")
-        import traceback
-        logger.log(traceback.format_exc(), "ERROR")
-        return TaskResponse(success=False, message="Failed", error=str(e))
-    finally:
-        is_running = False
-        current_task = None
-
-@app.post("/stop")
-async def stop_task():
-    """Stop current task"""
-    global is_running, current_task
-    if not is_running:
-        return {"status": "no task running"}
-    is_running = False
-    stopped = current_task
-    current_task = None
-    return {"status": "stopped", "task": stopped}
-
-# ============================================================
-# LUX IMAGE WRAPPER - Implements read() interface
-# ============================================================
-class LuxImage:
-    """
-    Image wrapper that implements the oagi Image protocol.
-    The Image protocol requires a `read() -> bytes` method.
-    
-    Based on KernelImage from kernel-oagi repository.
-    """
-    
-    def __init__(self, data: bytes, width: int = None, height: int = None):
-        self._data = data
-        self._width = width
-        self._height = height
-    
-    def read(self) -> bytes:
-        """Read the image data as bytes."""
-        return self._data
-    
-    @classmethod
-    def from_pil(cls, pil_image, format: str = "JPEG", quality: int = 85) -> "LuxImage":
-        """Create LuxImage from PIL Image."""
-        buffer = io.BytesIO()
-        
-        # Convert RGBA to RGB if needed for JPEG
-        if pil_image.mode == "RGBA":
-            rgb_image = Image.new("RGB", pil_image.size, (255, 255, 255))
-            rgb_image.paste(pil_image, mask=pil_image.split()[3])
-            pil_image = rgb_image
-        
-        pil_image.save(buffer, format=format, quality=quality)
-        return cls(buffer.getvalue(), pil_image.width, pil_image.height)
-
-
-# ============================================================
-# RESIZED SCREENSHOT MAKER - SDK RESOLUTION (1260x700)
-# ============================================================
-class ResizedScreenshotMaker:
-    """
-    Screenshot maker that resizes to 1260x700 for Lux API.
-    
-    Implements the AsyncImageProvider protocol:
-    - __call__() -> Image: Capture and return a new screenshot
-    - last_image() -> Image: Return the last captured screenshot
-    
-    Image returned has read() -> bytes method.
-    """
-    
-    def __init__(self):
-        if PYAUTOGUI_AVAILABLE:
-            self.screen_width, self.screen_height = pyautogui.size()
-        else:
-            self.screen_width, self.screen_height = 1920, 1080
-        
-        self._last_image: LuxImage = None
-        
-        debug_log(f"📸 ResizedScreenshotMaker (SDK v{SERVICE_VERSION}):")
-        debug_log(f"   Screen: {self.screen_width}x{self.screen_height}")
-        debug_log(f"   Lux SDK expects: {LUX_REF_WIDTH}x{LUX_REF_HEIGHT}")
-        debug_log(f"   Scale factors: X={self.screen_width/LUX_REF_WIDTH:.3f}, Y={self.screen_height/LUX_REF_HEIGHT:.3f}")
-    
-    async def __call__(self) -> LuxImage:
-        """Capture screenshot and resize to 1260x700 for Lux"""
-        
-        if not PIL_AVAILABLE or not PYAUTOGUI_AVAILABLE:
-            debug_log("⚠️ PIL or PyAutoGUI not available - using SDK default", "WARNING")
-            base_maker = AsyncScreenshotMaker()
-            return await base_maker()
-        
-        try:
-            pil_screenshot = pyautogui.screenshot()
-            original_size = pil_screenshot.size
-            
-            # Resize to Lux expected resolution
-            resized = pil_screenshot.resize((LUX_REF_WIDTH, LUX_REF_HEIGHT), Image.LANCZOS)
-            
-            debug_log(f"📸 Screenshot: {original_size[0]}x{original_size[1]} → {LUX_REF_WIDTH}x{LUX_REF_HEIGHT}")
-            
-            # Create LuxImage with read() method
-            image = LuxImage.from_pil(resized)
-            
-            # Cache for last_image()
-            self._last_image = image
-            
-            return image
-            
-        except Exception as e:
-            debug_log(f"⚠️ Screenshot resize failed: {e}", "ERROR")
-            base_maker = AsyncScreenshotMaker()
-            return await base_maker()
-    
-    async def last_image(self) -> LuxImage:
-        """
-        Return the last captured screenshot.
-        If no screenshot has been taken yet, takes a new one.
-        """
-        if self._last_image is None:
-            return await self()
-        return self._last_image
-
-
-class SyncResizedScreenshotMaker:
-    """
-    Screenshot maker that resizes to 1260x700 for Lux API.
-    SYNC version (kept for reference, TaskerAgent uses async).
-    """
-    
-    def __init__(self):
-        if PYAUTOGUI_AVAILABLE:
-            self.screen_width, self.screen_height = pyautogui.size()
-        else:
-            self.screen_width, self.screen_height = 1920, 1080
-        
-        debug_log(f"📸 SyncResizedScreenshotMaker (SDK v{SERVICE_VERSION}):")
-        debug_log(f"   Screen: {self.screen_width}x{self.screen_height}")
-        debug_log(f"   Lux SDK expects: {LUX_REF_WIDTH}x{LUX_REF_HEIGHT}")
-    
-    def __call__(self):
-        """Capture screenshot and resize to 1260x700 for Lux (SYNC)"""
-        
-        if not PIL_AVAILABLE or not PYAUTOGUI_AVAILABLE:
-            debug_log("⚠️ PIL or PyAutoGUI not available", "WARNING")
-            return None
-        
-        try:
-            pil_screenshot = pyautogui.screenshot()
-            original_size = pil_screenshot.size
-            
-            resized = pil_screenshot.resize((LUX_REF_WIDTH, LUX_REF_HEIGHT), Image.LANCZOS)
-            
-            debug_log(f"📸 Screenshot: {original_size[0]}x{original_size[1]} → {LUX_REF_WIDTH}x{LUX_REF_HEIGHT}")
-            
-            return LuxImage.from_pil(resized)
-            
-        except Exception as e:
-            debug_log(f"⚠️ Screenshot resize failed: {e}", "ERROR")
-            return None
-
-
-def scale_coordinates(x: int, y: int, screen_width: int, screen_height: int) -> tuple:
-    """
-    Scale coordinates from Lux SDK reference (1260x700) to actual screen.
-    """
-    x_scaled = int(x * screen_width / LUX_REF_WIDTH)
-    y_scaled = int(y * screen_height / LUX_REF_HEIGHT)
-    return x_scaled, y_scaled
-
-# ============================================================
-# CLIPBOARD ACTION HANDLER - For Italian keyboard support
-# ============================================================
-class ClipboardActionHandler:
-    """
-    Custom action handler that uses clipboard for typing.
-    SYNC version for TaskerAgent.
-    Wraps PyautoguiActionHandler but intercepts 'type' actions.
-    """
-    
-    def __init__(self, config: PyautoguiConfig = None):
-        self.config = config or PyautoguiConfig()
-        self.base_handler = PyautoguiActionHandler(config=self.config)
-    
-    def __call__(self, actions):
-        """Execute actions, using clipboard for type actions"""
-        for action in actions:
-            action_type = str(action.type.value) if hasattr(action.type, "value") else str(action.type)
-            argument = str(action.argument) if hasattr(action, "argument") else ""
-            
-            if action_type.lower() == "type":
-                # Intercept type actions - use clipboard
-                debug_log(f"⌨️ Typing via clipboard: '{argument[:50]}...'")
-                type_via_clipboard(argument)
-                time.sleep(0.1)
-            else:
-                # All other actions - use base handler
-                self.base_handler([action])
-
-
-# ============================================================
-# CLIPBOARD TYPING WRAPPER - Intercepts type actions (ASYNC)
-# ============================================================
-async def execute_actions_with_clipboard_typing(actions, sdk_handler):
-    """
-    Execute actions using SDK handler, but intercept 'type' actions
-    to use clipboard (Ctrl+V) instead of typewrite() for Italian keyboard support.
-    """
-    for action in actions:
-        action_type = str(action.type.value) if hasattr(action.type, "value") else str(action.type)
-        argument = str(action.argument) if hasattr(action, "argument") else ""
-        
-        if action_type.lower() == "type":
-            # Intercept type actions - use clipboard instead of SDK
-            debug_log(f"⌨️ Typing via clipboard: '{argument[:50]}...'")
-            type_via_clipboard(argument)
-            time.sleep(0.1)
-        else:
-            # All other actions - use SDK handler
-            await sdk_handler([action])
-
-# ============================================================
-# TASKER MODE EXECUTION - Uses TaskerAgent with .execute()
-# ============================================================
-async def execute_with_tasker(request: TaskRequest) -> tuple[TaskResponse, Optional[str]]:
-    """
-    Execute using TaskerAgent with todos list.
-    
-    CORRECT PATTERN (from oagi-lux-samples/amazon_scraping.py):
-        observer = AsyncAgentObserver()
-        image_provider = AsyncScreenshotMaker()
-        action_handler = AsyncPyautoguiActionHandler()
-        
-        tasker = TaskerAgent(
-            api_key=...,
-            base_url="https://api.agiopen.org",
-            model="lux-actor-1",
-            max_steps=24,
-            temperature=0.0,
-            step_observer=observer,
-        )
-        tasker.set_task(task=..., todos=[...])
-        success = await tasker.execute(instruction="", action_handler=..., image_provider=...)
-        memory = tasker.get_memory()
-    """
-    logger.log("=" * 50)
-    logger.log("TASKER MODE EXECUTION (v5.7.2)")
-    logger.log("=" * 50)
-    
-    todos = request.todos or []
-    logger.log(f"Task: {request.task_description}")
-    logger.log(f"Todos: {len(todos)}")
-    for i, todo in enumerate(todos):
-        logger.log(f"  [{i}] {todo[:80]}...")
-    
-    # Screen info
-    if PYAUTOGUI_AVAILABLE:
-        screen_width, screen_height = pyautogui.size()
-    else:
-        screen_width, screen_height = 1920, 1080
-    
-    scale_x = screen_width / LUX_REF_WIDTH
-    scale_y = screen_height / LUX_REF_HEIGHT
-    
-    history = ExecutionHistory(request.task_description, todos)
-    
-    try:
-        # Create action handler with PyAutoGUI config
-        pyautogui_config = PyautoguiConfig(
-            drag_duration=request.drag_duration,
-            scroll_amount=request.scroll_amount,
-            wait_duration=request.wait_duration,
-            action_pause=request.action_pause
-        )
-        
-        # Create observer (optional - for step tracking)
-        observer = None
-        if ASYNC_AGENT_OBSERVER_AVAILABLE:
-            observer = AsyncAgentObserver()
-            logger.log("📊 AsyncAgentObserver enabled for step tracking")
-        
-        # Create image provider
-        # Use custom ResizedScreenshotMaker or SDK default
-        if request.enable_screenshot_resize:
-            image_provider = ResizedScreenshotMaker()
-            logger.log(f"📸 Using ResizedScreenshotMaker ({LUX_REF_WIDTH}x{LUX_REF_HEIGHT})")
-        else:
-            image_provider = AsyncScreenshotMaker()
-            logger.log("📸 Using SDK AsyncScreenshotMaker (default resolution)")
-        
-        # Create action handler
-        action_handler = AsyncPyautoguiActionHandler(config=pyautogui_config)
-        logger.log("🎮 Using AsyncPyautoguiActionHandler")
-        
-        logger.log(f"Creating TaskerAgent with:")
-        logger.log(f"  model: lux-actor-1")
-        logger.log(f"  max_steps: {request.max_steps_per_todo}")
-        logger.log(f"  temperature: 0.0 (forced for tasker mode)")
-        
-        # Create TaskerAgent with FULL constructor (from amazon_scraping.py)
-        tasker_kwargs = {
-            "api_key": request.api_key,
-            "base_url": "https://api.agiopen.org",
-            "model": "lux-actor-1",
-            "max_steps": request.max_steps_per_todo,
-            "temperature": 0.0,  # FORZATO A 0.0 per evitare loop infiniti
-        }
-        
-        # Add observer if available
-        if observer:
-            tasker_kwargs["step_observer"] = observer
-        
-        tasker = TaskerAgent(**tasker_kwargs)
-        
-        # Set task and todos
-        tasker.set_task(
+        agent = GeminiComputerUseAgent(
+            api_key=request.api_key,
             task=request.task_description,
-            todos=todos
+            max_steps=request.max_steps_per_todo
         )
         
-        logger.log("TaskerAgent configured, starting execution...")
+        # Navigate to start URL if provided
+        if request.start_url:
+            webbrowser.open(request.start_url)
+            await asyncio.sleep(2)
         
-        # Execute TaskerAgent
-        success = await tasker.execute(
-            instruction="",  # Empty - task already set via set_task()
-            action_handler=action_handler,
-            image_provider=image_provider
+        return agent.run()
+    
+    elif request.mode in ["actor", "thinker", "tasker"]:
+        if not OAGI_AVAILABLE:
+            raise HTTPException(status_code=400, detail="Lux SDK not available")
+        
+        return await execute_with_lux(
+            api_key=request.api_key,
+            task=request.task_description,
+            mode=request.mode,
+            max_steps=request.max_steps_per_todo,
+            start_url=request.start_url
         )
-        
-        # Get memory for todo status (if available)
-        completed_todos = 0
-        todo_statuses = []
-        try:
-            memory = tasker.get_memory()
-            if memory:
-                logger.log(f"📋 Task execution summary: {memory.task_execution_summary}")
-                
-                # Count completed todos
-                for i, todo_mem in enumerate(memory.todos):
-                    status = todo_mem.status.value if hasattr(todo_mem.status, 'value') else str(todo_mem.status)
-                    todo_statuses.append({"index": i, "description": todo_mem.description, "status": status})
-                    if status == "completed":
-                        completed_todos += 1
-                    logger.log(f"  [{i}] {status}: {todo_mem.description[:50]}...")
-        except Exception as mem_err:
-            logger.log(f"⚠️ Could not get memory: {mem_err}", "WARNING")
-            # Fallback: assume all completed if success
-            completed_todos = len(todos) if success else 0
-        
-        # Export observer history if available
-        observer_report = None
-        if observer:
-            try:
-                report_dir = ANALYSIS_DIR / f"tasker_{int(time.time())}"
-                report_dir.mkdir(parents=True, exist_ok=True)
-                observer_file = report_dir / "observer_history.html"
-                observer.export("html", str(observer_file))
-                observer_report = str(observer_file)
-                logger.log(f"📊 Observer report: {observer_report}")
-            except Exception as obs_err:
-                logger.log(f"⚠️ Could not export observer: {obs_err}", "WARNING")
-        
-        # Update history
-        if success:
-            logger.log(f"✅ TaskerAgent completed: {completed_todos}/{len(todos)} todos")
-            history.finish(True, completed_todos=completed_todos)
-        else:
-            logger.log("❌ TaskerAgent returned False", "WARNING")
-            history.finish(False, "TaskerAgent returned failure", completed_todos=completed_todos)
-        
-        # Generate our report
-        report_dir = ANALYSIS_DIR / f"tasker_{int(time.time())}"
-        execution_report = history.generate_report(report_dir)
-        logger.log(f"📊 Report: {execution_report}")
-        
-        if success:
-            message = f"Completed {completed_todos}/{len(todos)} todos"
-        else:
-            message = f"Failed - completed {completed_todos}/{len(todos)} todos"
-        
-        return TaskResponse(
-            success=success,
-            message=message,
-            completed_todos=completed_todos,
-            total_todos=len(todos),
-            error=None if success else "Execution returned failure",
-            execution_summary={
-                "mode": "tasker",
-                "model": "lux-actor-1",
-                "todos": todos,
-                "todo_statuses": todo_statuses,
-                "completed_todos": completed_todos,
-                "total_todos": len(todos),
-                "max_steps_per_todo": request.max_steps_per_todo,
-                "temperature": 0.0,  # Report actual temperature used
-                "lux_resolution": f"{LUX_REF_WIDTH}x{LUX_REF_HEIGHT}",
-                "screen_resolution": f"{screen_width}x{screen_height}",
-                "scale_factors": {"x": scale_x, "y": scale_y},
-                "screenshot_resize": request.enable_screenshot_resize,
-                "observer_report": observer_report
-            }
-        ), execution_report
-        
-    except Exception as e:
-        logger.log(f"Tasker execution error: {e}", "ERROR")
-        import traceback
-        logger.log(traceback.format_exc(), "ERROR")
-        
-        history.finish(False, str(e), completed_todos=0)
-        try:
-            report_dir = ANALYSIS_DIR / f"tasker_{int(time.time())}"
-            execution_report = history.generate_report(report_dir)
-        except:
-            execution_report = None
-        
-        return TaskResponse(
-            success=False,
-            message=f"Error: {str(e)}",
-            completed_todos=0,
-            total_todos=len(todos),
-            error=str(e)
-        ), execution_report
-
-# ============================================================
-# ACTOR/THINKER MODE EXECUTION - Uses AsyncActor
-# ============================================================
-async def execute_with_actor(request: TaskRequest) -> tuple[TaskResponse, Optional[str]]:
-    """Execute with AsyncActor for actor/thinker modes"""
-    logger.log("Actor/Thinker mode execution with reasoning capture")
     
-    # Determine model
-    model = request.model
-    if request.mode == "thinker" and "thinker" not in model:
-        model = "lux-thinker-1"
-    elif request.mode == "actor" and "actor" not in model:
-        model = "lux-actor-1"
-    
-    logger.log(f"Model: {model}")
-    
-    # Screen info
-    if PYAUTOGUI_AVAILABLE:
-        screen_width, screen_height = pyautogui.size()
     else:
-        screen_width, screen_height = 1920, 1080
-    
-    scale_x = screen_width / LUX_REF_WIDTH
-    scale_y = screen_height / LUX_REF_HEIGHT
-    logger.log(f"Screen: {screen_width}x{screen_height}")
-    logger.log(f"SDK Resolution: {LUX_REF_WIDTH}x{LUX_REF_HEIGHT}")
-    logger.log(f"Scale factors: X={scale_x:.3f}, Y={scale_y:.3f}")
-    
-    # Create components
-    screenshot_maker = ResizedScreenshotMaker() if request.enable_screenshot_resize else AsyncScreenshotMaker()
-    pyautogui_config = PyautoguiConfig(
-        drag_duration=request.drag_duration, 
-        scroll_amount=request.scroll_amount, 
-        wait_duration=request.wait_duration, 
-        action_pause=request.action_pause
-    )
-    
-    # Use SDK's action handler (handles coordinates correctly)
-    action_handler = AsyncPyautoguiActionHandler(config=pyautogui_config)
-    
-    history = ExecutionHistory(request.task_description)
-    completed = False
-    stopped = False
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Unknown mode: {request.mode}. Available: {['actor', 'thinker', 'tasker', 'gemini']}"
+        )
+
+@app.post("/debug/test_gemini")
+async def test_gemini(api_key: str = Query(...)):
+    """Test Gemini API connection"""
+    if not GEMINI_AVAILABLE:
+        return {"success": False, "error": "Gemini SDK not installed"}
     
     try:
-        # Pass max_steps_per_todo to init_task()
-        async with AsyncActor(api_key=request.api_key, model=model) as actor:
-            await actor.init_task(request.task_description, max_steps=request.max_steps_per_todo)
-            logger.log(f"Task initialized with max_steps={request.max_steps_per_todo}")
-            
-            for step_num in range(1, request.max_steps_per_todo + 1):
-                # Check if stop requested
-                if not is_running:
-                    logger.log("🛑 Stop requested - aborting execution")
-                    stopped = True
-                    break
-                
-                step_record = StepRecord(step_num)
-                logger.log(f"{'='*50}")
-                logger.log(f"STEP {step_num}/{request.max_steps_per_todo}")
-                logger.log(f"{'='*50}")
-                
-                # Screenshot before
-                step_record.screenshot_before = debug_screenshot(f"step_{step_num}_before")
-                
-                # Get image for Lux (resized to 1260x700)
-                image = await screenshot_maker()
-                
-                # Get step from Lux
-                step = await actor.step(image)
-                
-                # 🎯 CAPTURE REASONING
-                reasoning = getattr(step, "reason", None) or getattr(step, "reasoning", None)
-                step_record.reasoning = reasoning
-                logger.log(f"🧠 REASONING: {reasoning}")
-                
-                # Check if done
-                if step.stop:
-                    logger.log("✅ Task complete")
-                    step_record.stop = True
-                    step_record.success = True
-                    history.add_step(step_record)
-                    completed = True
-                    break
-                
-                # Process actions
-                actions = step.actions or []
-                logger.log(f"📋 Actions: {len(actions)}")
-                
-                for action in actions:
-                    action_type = str(action.type.value) if hasattr(action.type, "value") else str(action.type)
-                    argument = str(action.argument) if hasattr(action, "argument") else ""
-                    
-                    action_data = {"type": action_type, "argument": argument, "lux_coords": None, "scaled_coords": None}
-                    
-                    if action_type == "click" and argument:
-                        try:
-                            coords = argument.replace(" ", "").split(",")
-                            x_lux, y_lux = int(coords[0]), int(coords[1])
-                            action_data["lux_coords"] = {"x": x_lux, "y": y_lux}
-                        except Exception as e:
-                            logger.log(f"   ⚠️ Parse error: {e}", "WARNING")
-                    elif action_type == "type":
-                        logger.log(f"   ⌨️ Type: '{argument[:50]}'")
-                    elif action_type == "scroll":
-                        logger.log(f"   🖱️ Scroll: {argument}")
-                    elif action_type == "hotkey":
-                        logger.log(f"   ⌨️ Hotkey: {argument}")
-                    else:
-                        logger.log(f"   ❓ {action_type}: {argument}")
-                    
-                    step_record.actions.append(action_data)
-                
-                # Execute actions using SDK handler with clipboard typing intercept
-                try:
-                    await execute_actions_with_clipboard_typing(actions, action_handler)
-                    step_record.success = True
-                    logger.log(f"✅ Step {step_num} executed")
-                    
-                except Exception as e:
-                    step_record.error = str(e)
-                    logger.log(f"❌ Step error: {e}", "ERROR")
-                
-                # Screenshot after
-                step_record.screenshot_after = debug_screenshot(f"step_{step_num}_after")
-                history.add_step(step_record)
-                
-                # Delay
-                if request.step_delay > 0:
-                    await asyncio.sleep(request.step_delay)
-            
-            else:
-                logger.log(f"⚠️ Max steps ({request.max_steps_per_todo}) reached")
-        
-        # Generate report
-        history.finish(completed)
-        report_dir = ANALYSIS_DIR / f"execution_{int(time.time())}"
-        execution_report = history.generate_report(report_dir)
-        logger.log(f"📊 Report: {execution_report}")
-        
-        if stopped:
-            message = "Stopped by user"
-        elif completed:
-            message = "Completed"
-        else:
-            message = "Max steps reached"
-        
-        return TaskResponse(
-            success=completed,
-            message=message,
-            completed_todos=1 if completed else 0,
-            total_todos=1,
-            execution_summary={
-                "mode": request.mode,
-                "model": model, 
-                "steps": len(history.steps), 
-                "completed": completed,
-                "stopped": stopped,
-                "max_steps_per_todo": request.max_steps_per_todo,
-                "temperature": request.temperature,  # Use original temperature for actor/thinker
-                "lux_resolution": f"{LUX_REF_WIDTH}x{LUX_REF_HEIGHT}",
-                "screen_resolution": f"{screen_width}x{screen_height}",
-                "scale_factors": {"x": scale_x, "y": scale_y},
-                "clipboard_typing": PYPERCLIP_AVAILABLE
-            }
-        ), execution_report
-        
-    except Exception as e:
-        history.finish(False, str(e))
-        try:
-            report_dir = ANALYSIS_DIR / f"execution_{int(time.time())}"
-            execution_report = history.generate_report(report_dir)
-        except:
-            execution_report = None
-        raise
-
-# ============================================================
-# DEBUG ENDPOINTS
-# ============================================================
-@app.post("/execute_step")
-async def execute_single_step(request: dict):
-    """Execute single step for debugging"""
-    if not OAGI_AVAILABLE:
-        raise HTTPException(status_code=500, detail="OAGI not available")
-    
-    api_key = request.get("api_key")
-    instruction = request.get("instruction")
-    if not api_key or not instruction:
-        raise HTTPException(status_code=400, detail="api_key and instruction required")
-    
-    max_steps = request.get("max_steps_per_todo", 24)
-    
-    async with AsyncActor(api_key=api_key, model=request.get("model", "lux-actor-1")) as actor:
-        await actor.init_task(instruction, max_steps=max_steps)
-        screenshot_maker = ResizedScreenshotMaker()
-        image = await screenshot_maker()
-        step = await actor.step(image)
-        
-        reasoning = getattr(step, "reason", None) or getattr(step, "reasoning", None)
-        actions_data = [
-            {"type": str(a.type.value) if hasattr(a.type, "value") else str(a.type), "argument": str(getattr(a, "argument", ""))} 
-            for a in (step.actions or [])
-        ]
-        
-        return {
-            "stop": getattr(step, "stop", False), 
-            "reasoning": reasoning, 
-            "actions": actions_data,
-            "lux_resolution": f"{LUX_REF_WIDTH}x{LUX_REF_HEIGHT}"
-        }
-
-@app.get("/analysis/sessions")
-async def list_analysis_sessions():
-    """List all analysis sessions"""
-    sessions = []
-    if ANALYSIS_DIR.exists():
-        for session_dir in ANALYSIS_DIR.iterdir():
-            if session_dir.is_dir():
-                report_path = session_dir / "execution_report.html"
-                sessions.append({
-                    "name": session_dir.name,
-                    "path": str(session_dir),
-                    "has_report": report_path.exists(),
-                    "report_path": str(report_path) if report_path.exists() else None
-                })
-    return {"sessions": sorted(sessions, key=lambda x: x['name'], reverse=True)}
-
-@app.get("/analysis/latest")
-async def get_latest_analysis():
-    """Get latest analysis session"""
-    if not ANALYSIS_DIR.exists():
-        return {"error": "No sessions"}
-    sessions = sorted([d for d in ANALYSIS_DIR.iterdir() if d.is_dir()], key=lambda x: x.stat().st_mtime, reverse=True)
-    if not sessions:
-        return {"error": "No sessions"}
-    latest = sessions[0]
-    report_path = latest / "execution_report.html"
-    return {"session": latest.name, "report_path": str(report_path) if report_path.exists() else None}
-
-@app.get("/debug/screen")
-async def get_screen_debug_info():
-    """Get screen info with SDK resolution"""
-    info = debug_screen_info()
-    info["lux_resolution"] = f"{LUX_REF_WIDTH}x{LUX_REF_HEIGHT}"
-    info["clipboard_typing"] = PYPERCLIP_AVAILABLE
-    return info
-
-@app.post("/debug/screenshot")
-async def capture_debug_screenshot(label: str = "manual"):
-    """Capture debug screenshot"""
-    path = debug_screenshot(f"manual_{label}")
-    return {"success": path is not None, "path": path}
-
-@app.post("/debug/test_resize")
-async def test_screenshot_resize():
-    """Test screenshot resize functionality with SDK resolution"""
-    if not PIL_AVAILABLE or not PYAUTOGUI_AVAILABLE:
-        return {"error": "PIL or PyAutoGUI not available"}
-    
-    try:
-        original = pyautogui.screenshot()
-        original_path = DEBUG_SCREENSHOTS_DIR / "test_original.png"
-        original.save(original_path)
-        
-        resized = original.resize((LUX_REF_WIDTH, LUX_REF_HEIGHT), Image.LANCZOS)
-        resized_path = DEBUG_SCREENSHOTS_DIR / "test_resized_sdk.png"
-        resized.save(resized_path)
-        
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents="Say 'Gemini Computer Use ready!' in exactly those words."
+        )
         return {
             "success": True,
-            "original": {"path": str(original_path), "size": original.size},
-            "resized": {"path": str(resized_path), "size": resized.size},
-            "sdk_resolution": f"{LUX_REF_WIDTH}x{LUX_REF_HEIGHT}",
-            "scale_factors": {
-                "x": original.size[0] / LUX_REF_WIDTH,
-                "y": original.size[1] / LUX_REF_HEIGHT
-            }
+            "response": response.text,
+            "model_for_computer_use": GEMINI_MODEL
         }
     except Exception as e:
-        return {"error": str(e)}
+        return {"success": False, "error": str(e)}
 
-@app.post("/debug/test_coordinate_scaling")
-async def test_coordinate_scaling(lux_x: int = 290, lux_y: int = 272):
-    """Test coordinate scaling from SDK resolution to screen"""
-    if not PYAUTOGUI_AVAILABLE:
-        return {"error": "PyAutoGUI not available"}
-    
-    screen_width, screen_height = pyautogui.size()
-    x_scaled, y_scaled = scale_coordinates(lux_x, lux_y, screen_width, screen_height)
-    
-    return {
-        "lux_coords": {"x": lux_x, "y": lux_y},
-        "lux_resolution": f"{LUX_REF_WIDTH}x{LUX_REF_HEIGHT}",
-        "screen_resolution": f"{screen_width}x{screen_height}",
-        "scaled_coords": {"x": x_scaled, "y": y_scaled},
-        "scale_factors": {
-            "x": screen_width / LUX_REF_WIDTH,
-            "y": screen_height / LUX_REF_HEIGHT
-        },
-        "explanation": f"LUX ({lux_x}, {lux_y}) on {LUX_REF_WIDTH}x{LUX_REF_HEIGHT} → ({x_scaled}, {y_scaled}) on {screen_width}x{screen_height}"
-    }
-
-@app.post("/debug/test_mouse")
-async def test_mouse_movement():
-    """Test if PyAutoGUI can move the mouse from within the service"""
-    if not PYAUTOGUI_AVAILABLE:
-        return {"error": "PyAutoGUI not available"}
-    
-    start_pos = pyautogui.position()
-    logger.log(f"🖱️ TEST MOUSE - Start position: {start_pos}")
-    
-    logger.log(f"🖱️ Moving to (500, 500)...")
-    pyautogui.moveTo(500, 500)
-    time.sleep(0.3)
-    
-    after_move = pyautogui.position()
-    logger.log(f"🖱️ After moveTo: {after_move}")
-    
-    logger.log(f"🖱️ Clicking at (500, 500)...")
-    pyautogui.click(500, 500)
-    time.sleep(0.2)
-    
-    logger.log(f"🖱️ Moving to (800, 400)...")
-    pyautogui.moveTo(800, 400)
-    time.sleep(0.3)
-    
-    final_pos = pyautogui.position()
-    logger.log(f"🖱️ Final position: {final_pos}")
-    
-    mouse_moved = (start_pos[0] != after_move[0]) or (start_pos[1] != after_move[1])
-    logger.log(f"🖱️ Mouse moved: {mouse_moved}")
-    
-    return {
-        "start": {"x": start_pos[0], "y": start_pos[1]},
-        "after_move_to_500_500": {"x": after_move[0], "y": after_move[1]},
-        "final_800_400": {"x": final_pos[0], "y": final_pos[1]},
-        "mouse_moved": mouse_moved,
-        "success": mouse_moved
-    }
-
-@app.post("/debug/test_click_at")
-async def test_click_at_coordinates(lux_x: int = 500, lux_y: int = 350):
-    """Test click at scaled coordinates"""
-    if not PYAUTOGUI_AVAILABLE:
-        return {"error": "PyAutoGUI not available"}
-    
-    screen_width, screen_height = pyautogui.size()
-    x_scaled, y_scaled = scale_coordinates(lux_x, lux_y, screen_width, screen_height)
-    
-    logger.log(f"🎯 TEST CLICK - LUX coords: ({lux_x}, {lux_y})")
-    logger.log(f"📐 Scaled to: ({x_scaled}, {y_scaled}) on {screen_width}x{screen_height}")
-    logger.log(f"🖱️ Clicking...")
-    
-    pyautogui.moveTo(x_scaled, y_scaled)
-    time.sleep(0.3)
-    
-    pyautogui.click(x_scaled, y_scaled)
-    time.sleep(0.2)
-    
-    return {
-        "lux_coords": {"x": lux_x, "y": lux_y},
-        "lux_resolution": f"{LUX_REF_WIDTH}x{LUX_REF_HEIGHT}",
-        "screen_resolution": f"{screen_width}x{screen_height}",
-        "scaled_coords": {"x": x_scaled, "y": y_scaled},
-        "clicked": True
-    }
-
-@app.post("/debug/test_type")
-async def test_type_text(text: str = "test@example.com"):
-    """Test typing text via clipboard (supports @ and special chars)"""
-    if not PYAUTOGUI_AVAILABLE:
-        return {"error": "PyAutoGUI not available"}
-    
-    logger.log(f"⌨️ TEST TYPE - Typing via clipboard: '{text}'")
-    
-    type_via_clipboard(text)
-    
-    return {
-        "typed": text,
-        "method": "clipboard" if PYPERCLIP_AVAILABLE else "typewrite",
-        "success": True
-    }
-
-@app.post("/debug/test_click_and_type")
-async def test_click_and_type(lux_x: int = 630, lux_y: int = 350, text: str = "test@example.com"):
-    """Click and type in one action using clipboard"""
-    if not PYAUTOGUI_AVAILABLE:
-        return {"error": "PyAutoGUI not available"}
-    
-    screen_width, screen_height = pyautogui.size()
-    x_scaled, y_scaled = scale_coordinates(lux_x, lux_y, screen_width, screen_height)
-    
-    logger.log(f"🎯 CLICK+TYPE - LUX ({lux_x}, {lux_y}) → Screen ({x_scaled}, {y_scaled})")
-    logger.log(f"⌨️ Will type via clipboard: '{text}'")
-    
-    pyautogui.click(x_scaled, y_scaled)
-    time.sleep(0.3)
-    
-    type_via_clipboard(text)
-    
-    logger.log(f"✅ Click+Type completed")
-    
-    return {
-        "lux_coords": {"x": lux_x, "y": lux_y},
-        "clicked_at": {"x": x_scaled, "y": y_scaled},
-        "typed": text,
-        "method": "clipboard" if PYPERCLIP_AVAILABLE else "typewrite",
-        "success": True
-    }
-
-# ============================================================
+# ============================================================================
 # MAIN
-# ============================================================
+# ============================================================================
+
 if __name__ == "__main__":
-    import uvicorn
-    
-    screen_info = debug_screen_info()
-    print(f"\n{'='*60}")
-    print(f"  TASKER SERVICE v{SERVICE_VERSION}")
-    print(f"  SDK Resolution: {LUX_REF_WIDTH}x{LUX_REF_HEIGHT}")
-    print(f"  Default max_steps_per_todo: 24")
-    print(f"{'='*60}")
-    print(f"  OAGI: {'✅' if OAGI_AVAILABLE else '❌'}  PIL: {'✅' if PIL_AVAILABLE else '❌'}  PyAutoGUI: {'✅' if PYAUTOGUI_AVAILABLE else '❌'}  Pyperclip: {'✅' if PYPERCLIP_AVAILABLE else '❌'}")
-    print(f"  Screen: {screen_info['width']}x{screen_info['height']}")
-    print(f"  Scale: X={screen_info['scale_x']:.3f}, Y={screen_info['scale_y']:.3f}")
-    print(f"  Clipboard Typing: {'✅ Enabled' if PYPERCLIP_AVAILABLE else '❌ Disabled (install pyperclip)'}")
-    print(f"{'='*60}")
-    print(f"  SUPPORTED MODES:")
-    print(f"    • actor   - AsyncActor with manual step control")
-    print(f"    • thinker - AsyncActor with lux-thinker-1 model")
-    print(f"    • tasker  - TaskerAgent with .run() (automatic)")
-    print(f"{'='*60}")
-    print(f"  http://127.0.0.1:{SERVICE_PORT}")
-    print(f"  Reports: {ANALYSIS_DIR}/")
-    print(f"{'='*60}\n")
-    
-    uvicorn.run(app, host="127.0.0.1", port=SERVICE_PORT, log_level="info")
+    uvicorn.run(app, host="127.0.0.1", port=8765)
