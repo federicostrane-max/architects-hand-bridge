@@ -1,7 +1,7 @@
 /**
  * Architect's Hand Bridge - Electron Main Process
  * Handles window management, IPC, and bridge coordination
- * v3.2 - Added persistent config and encrypted password storage
+ * v3.3 - Added Gemini API key storage
  */
 
 const { app, BrowserWindow, ipcMain, shell, Notification, safeStorage } = require('electron');
@@ -144,6 +144,9 @@ function setupIPC() {
       // OpenAGI settings
       openAgiApiKey: config.openAgiApiKey || '',
       
+      // Gemini settings
+      geminiApiKey: config.geminiApiKey || '',
+      
       // User credentials
       email: config.email || '',
       password: config.password || '',
@@ -278,8 +281,9 @@ function setupIPC() {
     return {
       supabase: !!(config.supabaseUrl && config.supabaseAnonKey),
       openAgi: !!config.openAgiApiKey,
+      gemini: !!config.geminiApiKey,
       credentials: !!(config.email && config.password),
-      complete: !!(config.supabaseUrl && config.supabaseAnonKey && config.openAgiApiKey)
+      complete: !!(config.supabaseUrl && config.supabaseAnonKey && (config.openAgiApiKey || config.geminiApiKey))
     };
   });
 
@@ -329,7 +333,7 @@ function setupIPC() {
         }
       });
 
-      // Start the bridge
+      // Start the bridge with both API keys
       await bridge.start(config, supabase);
       
       return { success: true };
