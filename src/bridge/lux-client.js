@@ -34,6 +34,7 @@ class LuxClient {
                 version: data.version,
                 oagiAvailable: data.oagi_available,
                 geminiAvailable: data.gemini_available,
+                playwrightAvailable: data.playwright_available,
                 modes: data.modes || []
             };
         } catch (error) {
@@ -82,16 +83,25 @@ class LuxClient {
     }
 
     /**
-     * Execute task with Gemini Computer Use
+     * Execute task with Gemini Computer Use (Playwright)
      */
-    async executeGeminiTask({ apiKey, instruction, maxSteps = 15, startUrl = null }) {
+    async executeGeminiTask({ 
+        apiKey, 
+        instruction, 
+        maxSteps = 15, 
+        startUrl = null,
+        headless = false,
+        highlightMouse = false 
+    }) {
         console.log('📤 Sending Gemini Computer Use task to service...');
 
         const payload = {
             api_key: apiKey,
             task_description: instruction,
             mode: 'gemini',
-            max_steps_per_todo: maxSteps
+            max_steps_per_todo: maxSteps,
+            headless: headless,
+            highlight_mouse: highlightMouse
         };
 
         if (startUrl) {
