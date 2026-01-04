@@ -1,9 +1,14 @@
 """
-Tasker Service v6.0.1 - Multi-provider Computer Use
+Tasker Service v6.0.2 - Multi-provider Computer Use
 ====================================================
 Supports:
 - Lux (actor/thinker/tasker) via OAGI SDK + PyAutoGUI
 - Gemini Computer Use via Playwright (official Google implementation)
+
+v6.0.2 Changes:
+- Gemini uses Persistent Context to maintain login sessions
+- Profile saved at ~/.gemini-browser-profile
+- First run: login manually, cookies saved for future runs
 
 Based on:
 - Original v5.7.2 Lux implementation
@@ -127,7 +132,7 @@ except ImportError:
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-SERVICE_VERSION = "6.0.1"
+SERVICE_VERSION = "6.0.2"
 SERVICE_PORT = 8765
 DEBUG_LOGS_DIR = Path("debug_logs")
 ANALYSIS_DIR = Path("lux_analysis")
@@ -181,6 +186,7 @@ class ExecuteRequest(BaseModel):
     todos: Optional[List[str]] = None  # For Lux tasker mode
     headless: bool = False  # For Gemini
     highlight_mouse: bool = False  # For Gemini
+    user_data_dir: Optional[str] = None  # For Gemini persistent profile
 
 class StatusResponse(BaseModel):
     status: str
@@ -409,10 +415,17 @@ def type_via_clipboard(text: str):
             pass
 
 # ============================================================================
-# PLAYWRIGHT COMPUTER (from official Google repo)
+# PLAYWRIGHT COMPUTER (from official Google repo + Persistent Context)
 # ============================================================================
+
+# Default profile directory for persistent login
+GEMINI_PROFILE_DIR = Path.home() / ".gemini-browser-profile"
+
 class PlaywrightComputer:
-    """Playwright-based browser control for Gemini Computer Use"""
+    """
+    Playwright-based browser control for Gemini Computer Use.
+    Uses persistent context to maintain login sessions across runs.
+    """
     
     def __init__(
         self,
@@ -421,15 +434,16 @@ class PlaywrightComputer:
         search_engine_url: str = "https://www.google.com",
         headless: bool = False,
         highlight_mouse: bool = False,
+        user_data_dir: Optional[str] = None,
     ):
         self._initial_url = initial_url
         self._screen_size = screen_size
         self._search_engine_url = search_engine_url
         self._headless = headless
         self._highlight_mouse = highlight_mouse
+        self._user_data_dir = user_data_dir or str(GEMINI_PROFILE_DIR)
         self._playwright = None
-        self._browser = None
-        self._context = None
+        self._context = None  # In persistent mode, context IS the browser
         self._page = None
 
     def _handle_new_page(self, new_page):
@@ -439,37 +453,45 @@ class PlaywrightComputer:
         self._page.goto(new_url)
 
     def __enter__(self):
-        print("🌐 Creating Playwright browser session...")
+        print("🌐 Creating Playwright browser session (persistent profile)...")
+        print(f"   Profile: {self._user_data_dir}")
+        
         self._playwright = sync_playwright().start()
-        self._browser = self._playwright.chromium.launch(
-            args=[
-                "--disable-extensions", "--disable-file-system", "--disable-plugins",
-                "--disable-dev-shm-usage", "--disable-background-networking",
-                "--disable-default-apps", "--disable-sync",
-            ],
+        
+        # Use persistent context to maintain login sessions
+        self._context = self._playwright.chromium.launch_persistent_context(
+            user_data_dir=self._user_data_dir,
             headless=self._headless,
+            viewport={"width": self._screen_size[0], "height": self._screen_size[1]},
+            args=[
+                "--disable-dev-shm-usage",
+                "--disable-background-networking",
+            ],
         )
-        self._context = self._browser.new_context(
-            viewport={"width": self._screen_size[0], "height": self._screen_size[1]}
-        )
-        self._page = self._context.new_page()
+        
+        # Create new page or use existing
+        if self._context.pages:
+            self._page = self._context.pages[0]
+        else:
+            self._page = self._context.new_page()
+            
         self._page.goto(self._initial_url)
         self._context.on("page", self._handle_new_page)
+        
         print(f"✅ Playwright browser started at {self._initial_url}")
+        print(f"   💡 First time? Login manually, cookies will be saved for next run")
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if self._context:
-            self._context.close()
         try:
-            if self._browser:
-                self._browser.close()
+            if self._context:
+                self._context.close()
         except Exception as e:
             if "Connection closed" not in str(e):
                 raise
         if self._playwright:
             self._playwright.stop()
-        print("🔴 Playwright browser closed")
+        print("🔴 Playwright browser closed (login session saved)")
 
     def screen_size(self) -> tuple:
         viewport = self._page.viewport_size
@@ -889,13 +911,14 @@ async def execute_with_lux(
 # ============================================================================
 # GEMINI EXECUTION (Playwright)
 # ============================================================================
-def _run_gemini_sync(api_key: str, task: str, max_steps: int, start_url: str, headless: bool, highlight_mouse: bool) -> ExecuteResponse:
+def _run_gemini_sync(api_key: str, task: str, max_steps: int, start_url: str, headless: bool, highlight_mouse: bool, user_data_dir: Optional[str] = None) -> ExecuteResponse:
     """Run Gemini agent synchronously"""
     computer = PlaywrightComputer(
         screen_size=(GEMINI_REF_WIDTH, GEMINI_REF_HEIGHT),
         initial_url=start_url,
         headless=headless,
         highlight_mouse=highlight_mouse,
+        user_data_dir=user_data_dir,
     )
     
     with computer as browser:
@@ -912,7 +935,7 @@ def _run_gemini_sync(api_key: str, task: str, max_steps: int, start_url: str, he
             report_path=report_path
         )
 
-async def execute_with_gemini(api_key: str, task: str, max_steps: int, start_url: Optional[str], headless: bool = False, highlight_mouse: bool = False) -> ExecuteResponse:
+async def execute_with_gemini(api_key: str, task: str, max_steps: int, start_url: Optional[str], headless: bool = False, highlight_mouse: bool = False, user_data_dir: Optional[str] = None) -> ExecuteResponse:
     """Execute task using Gemini + Playwright"""
     if not GEMINI_AVAILABLE:
         return ExecuteResponse(success=False, message="Gemini SDK not available", error="google-genai not installed")
@@ -921,7 +944,7 @@ async def execute_with_gemini(api_key: str, task: str, max_steps: int, start_url
     
     url = start_url or "https://www.google.com"
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(executor, _run_gemini_sync, api_key, task, max_steps, url, headless, highlight_mouse)
+    return await loop.run_in_executor(executor, _run_gemini_sync, api_key, task, max_steps, url, headless, highlight_mouse, user_data_dir)
 
 # ============================================================================
 # FASTAPI APPLICATION
@@ -974,7 +997,7 @@ async def execute_task(request: ExecuteRequest):
             raise HTTPException(status_code=400, detail="Playwright not available")
         return await execute_with_gemini(
             request.api_key, request.task_description, request.max_steps_per_todo,
-            request.start_url, request.headless, request.highlight_mouse
+            request.start_url, request.headless, request.highlight_mouse, request.user_data_dir
         )
     elif request.mode in ["actor", "thinker", "tasker"]:
         if not OAGI_AVAILABLE:
