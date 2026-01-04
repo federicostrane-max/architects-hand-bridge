@@ -44,6 +44,7 @@ class Bridge {
             console.log(`   Version: ${this.taskerStatus.version}`);
             console.log(`   OAGI Available: ${this.taskerStatus.oagiAvailable ? '✅' : '❌'}`);
             console.log(`   Gemini Available: ${this.taskerStatus.geminiAvailable ? '✅' : '❌'}`);
+            console.log(`   Playwright Available: ${this.taskerStatus.playwrightAvailable ? '✅' : '❌'}`);
             console.log(`   Modes: ${this.taskerStatus.modes.join(', ')}`);
             return this.taskerStatus;
         } catch (error) {
@@ -101,6 +102,9 @@ class Bridge {
                     if (!this.taskerStatus?.geminiAvailable) {
                         throw new Error('Gemini mode not available on tasker service');
                     }
+                    if (!this.taskerStatus?.playwrightAvailable) {
+                        throw new Error('Playwright not available. Run: pip install playwright && playwright install chromium');
+                    }
                     result = await this.executeGeminiMode(task);
                     break;
                     
@@ -157,7 +161,7 @@ class Bridge {
     }
 
     async executeGeminiMode(task) {
-        console.log(`🔵 Executing with Gemini Computer Use...`);
+        console.log(`🔵 Executing with Gemini Computer Use (Playwright)...`);
         
         const apiKey = task.gemini_api_key || this.config.geminiApiKey;
         if (!apiKey) {
@@ -168,7 +172,9 @@ class Bridge {
             apiKey: apiKey,
             instruction: task.task_description,
             maxSteps: task.max_steps || 15,
-            startUrl: task.start_url
+            startUrl: task.start_url,
+            headless: task.headless || false,
+            highlightMouse: task.highlight_mouse || false
         });
     }
 
