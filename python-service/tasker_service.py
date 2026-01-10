@@ -1,9 +1,19 @@
 """
-Tasker Service v6.0.5 - Multi-provider Computer Use
+Tasker Service v6.0.7 - Multi-provider Computer Use
 ====================================================
 Supports:
 - Lux (actor/thinker/tasker) via OAGI SDK + PyAutoGUI
 - Gemini Computer Use via Playwright (official Google implementation)
+
+v6.0.7 Changes:
+- Uses Microsoft EDGE instead of Chrome (channel="msedge")
+- Allows Chrome to stay open for web app while Edge does automation
+- Better anti-bot evasion on some sites
+
+v6.0.6 Changes:
+- Uses REAL Chrome instead of Chromium (channel="chrome")
+- Much better anti-bot evasion
+- Requires Chrome to be installed on the system
 
 v6.0.5 Changes:
 - Added ANTI-BOT PROTECTION for Playwright browser
@@ -147,7 +157,7 @@ except ImportError:
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-SERVICE_VERSION = "6.0.5"
+SERVICE_VERSION = "6.0.7"
 SERVICE_PORT = 8765
 DEBUG_LOGS_DIR = Path("debug_logs")
 ANALYSIS_DIR = Path("lux_analysis")
@@ -433,8 +443,8 @@ def type_via_clipboard(text: str):
 # PLAYWRIGHT COMPUTER (from official Google repo + Persistent Context)
 # ============================================================================
 
-# Default profile directory for persistent login
-GEMINI_PROFILE_DIR = Path.home() / ".gemini-browser-profile"
+# Default profile directory for persistent login (Edge)
+GEMINI_PROFILE_DIR = Path.home() / ".gemini-edge-profile"
 
 class PlaywrightComputer:
     """
@@ -470,16 +480,18 @@ class PlaywrightComputer:
         self._page.goto(new_url)
 
     def __enter__(self):
-        print("🌐 Creating Playwright browser session (persistent profile)...")
+        print("🌐 Creating browser session with Microsoft EDGE...")
         print(f"   Profile: {self._user_data_dir}")
         
         self._playwright = sync_playwright().start()
         
         # Use persistent context to maintain login sessions
         # ANTI-BOT PROTECTION: Hide automation flags
+        # channel="msedge" uses Microsoft Edge instead of Chrome
         self._context = self._playwright.chromium.launch_persistent_context(
             user_data_dir=self._user_data_dir,
             headless=self._headless,
+            channel="msedge",  # Use Edge - allows Chrome to stay open for web app!
             viewport={"width": self._screen_size[0], "height": self._screen_size[1]},
             # Anti-bot args
             args=[
