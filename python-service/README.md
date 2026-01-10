@@ -1,220 +1,209 @@
-# 🤖 Tasker Service v5.0
+# Tasker Service v7.0 - Hybrid Mode (DOM + Vision)
 
-FastAPI service that bridges the Lovable web app with local LUX execution using the **official OAGI SDK**.
+## 🎯 Overview
 
-## 📦 Files
+Questa versione implementa l'approccio **Hybrid Mode** ispirato a Stagehand, che combina:
+- **DOM-based actions**: Usa selettori CSS/XPath via Accessibility Tree
+- **Vision-based actions**: Usa coordinate pixel via screenshot
 
-| File | Description |
-|------|-------------|
-| `tasker_service.py` | Main service using official OAGI SDK patterns |
-| `lux_analyzer.py` | Coordinate analysis & debugging system |
-| `lux_analyzer_integration.py` | Integration helper for analyzer |
-| `test_lux_analyzer.py` | Demo & diagnostic tools |
-| `find_real_coordinates.py` | Playwright-based DOM coordinate finder |
-| `_windows.py` | Windows Unicode input handler |
-| `requirements.txt` | Python dependencies |
+Il modello **Gemini 3 Flash** decide autonomamente quale approccio usare per ogni azione.
 
-## 🚀 Quick Start
+## 📊 Confronto con Versioni Precedenti
+
+| Aspetto | v6.0.7 (CUA) | v7.0 (Hybrid) |
+|---------|--------------|---------------|
+| Modello | Gemini 2.5 Computer Use | Gemini 3 Flash |
+| Approccio | Solo Vision (coordinate) | DOM + Vision |
+| Input | Screenshot | Screenshot + Accessibility Tree |
+| Self-healing | No | Sì (DOM → Vision fallback) |
+| Selettori | No | Sì (CSS, XPath, text) |
+
+## 🔧 Installazione
 
 ```bash
-# 1. Install dependencies
-pip install -r requirements.txt
+# Dipendenze
+pip install fastapi uvicorn playwright google-genai
 
-# 2. Run service
-python tasker_service.py
-
-# Service runs on http://127.0.0.1:8765
-# API docs at http://127.0.0.1:8765/docs
+# Installa browser
+playwright install chromium
+playwright install msedge
 ```
 
-## 🔧 Architecture
+## 🚀 Avvio
 
-### v5.0 Changes (Official SDK Pattern)
-
-**Before (v4.x):** Custom implementation
-```python
-# 300+ lines of custom code
-for step in range(max_steps):
-    screenshot = take_screenshot_bytes()  # Custom
-    step_result = actor.step(screenshot)
-    for action in step_result.actions:
-        execute_action(action)  # 200 lines custom
+```bash
+python tasker_service_v7.py
 ```
 
-**After (v5.0):** Official SDK
-```python
-# 10 lines using SDK
-agent = AsyncDefaultAgent(max_steps=20)
-completed = await agent.execute(
-    instruction="Search hotels in Bergamo",
-    action_handler=AsyncPyautoguiActionHandler(),
-    image_provider=AsyncScreenshotMaker(),
-)
-```
+Il servizio sarà disponibile su `http://localhost:8765`
 
 ## 📡 API Endpoints
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/status` | GET | Service status and availability |
-| `/health` | GET | Health check with detailed info |
-| `/execute` | POST | Execute task (main endpoint) |
-| `/execute_step` | POST | Single step execution (debug) |
-| `/stop` | POST | Stop current task |
-| `/analysis/sessions` | GET | List analysis sessions |
-| `/analysis/latest` | GET | Get latest analysis report |
+### `GET /`
+Health check e info sul servizio.
 
-### Execute Request Example
+### `GET /status`
+Stato dell'agente (attivo/inattivo).
+
+### `POST /execute`
+Esegue un task.
 
 ```json
 {
-    "api_key": "your-oagi-api-key",
-    "task_description": "Search for hotels in Bergamo on booking.com",
-    "mode": "actor",
-    "model": "lux-actor-1",
-    "max_steps": 20,
-    "start_url": "https://www.booking.com",
-    "enable_analysis": true
+  "api_key": "YOUR_GEMINI_API_KEY",
+  "task_description": "Cerca 'browser automation' su Google",
+  "initial_url": "https://google.com",
+  "max_steps": 20,
+  "headless": false,
+  "mode": "hybrid"
 }
 ```
 
-## 🔍 LUX Analyzer
+### `POST /stop`
+Ferma l'esecuzione corrente.
 
-Integrated debugging system for coordinate issues.
+## 🧠 Come Funziona l'Hybrid Mode
 
-### Features
-- Captures every LUX action with screenshots
-- Visual markers showing click coordinates
-- HTML report with timeline
-- CSV export for analysis
-- Coordinate heatmap
+### 1. Ad ogni step, il sistema:
+1. Cattura screenshot della pagina
+2. Estrae l'Accessibility Tree (struttura semantica)
+3. Invia entrambi a Gemini 3 Flash
+4. Il modello sceglie il tool appropriato
 
-### Quick Test
-```bash
-# Run demo (no LUX required)
-python test_lux_analyzer.py
-# Choose option 1
+### 2. Tool Disponibili
 
-# Live mouse tracking
-python test_lux_analyzer.py
-# Choose option 2
+**DOM-based (preferiti quando possibile):**
+- `act(selector, instruction)` - Azione su selettore CSS/XPath
 
-# Compare LUX vs real coordinates
-python test_lux_analyzer.py
-# Choose option 3
+**Vision-based (quando DOM non è affidabile):**
+- `click(x, y)` - Click su coordinate
+- `type(text, x?, y?)` - Digita testo
+
+**Control:**
+- `scroll(delta_y)` - Scroll
+- `navigate(url)` - Naviga a URL
+- `wait(duration_ms)` - Attendi
+- `done(summary)` - Task completato
+
+### 3. Self-Healing Automatico
+
+Se un'azione DOM fallisce (selettore non trovato), il sistema:
+1. Prova selettori alternativi
+2. Se specificato, usa le coordinate di fallback
+3. Riporta quale metodo ha funzionato
+
+```
+[12:34:56.789] [WARN] DOM selector failed, falling back to coordinates (850, 420)
+[12:34:57.123] [INFO] ✓ Action succeeded (fallback used)
 ```
 
-### Output
-After execution, find in `lux_analysis/<session>/`:
-```
-├── report.html          # Interactive report
-├── actions.csv          # Excel-compatible data
-├── actions.json         # Full JSON data
-└── screenshots/
-    ├── step_001_before.png
-    ├── step_001_markers.png  # With visual markers
-    ├── step_001_after.png
-    └── ...
-```
+## 📋 Esempio di Output
 
-## 🎯 Coordinate Debugging
-
-If LUX clicks in wrong positions:
-
-### 1. Check Screen Resolution
-```
-Your screen: 1920x1200
-LUX reference: 1920x1080
-Y Scale factor: 1.111
-```
-
-### 2. Run Live Capture
-```bash
-python test_lux_analyzer.py
-# Option 2: Move mouse to target element
-# Note the coordinates
+```json
+{
+  "success": true,
+  "task": "Cerca 'AI automation' su Google",
+  "total_steps": 5,
+  "successful_steps": 5,
+  "failed_steps": 0,
+  "fallback_used": 1,
+  "dom_actions": 3,
+  "vision_actions": 2,
+  "final_url": "https://google.com/search?q=AI+automation",
+  "steps": [
+    {"turn": 1, "action_type": "act", "success": true, "fallback": false},
+    {"turn": 2, "action_type": "type", "success": true, "fallback": false},
+    {"turn": 3, "action_type": "click", "success": true, "fallback": false},
+    {"turn": 4, "action_type": "act", "success": true, "fallback": true},
+    {"turn": 5, "action_type": "done", "success": true, "fallback": false}
+  ]
+}
 ```
 
-### 3. Find Real Coordinates (Playwright)
-```bash
-# Chrome must be open with --remote-debugging-port=9222
-python find_real_coordinates.py
+## 🔐 Persistent Context
+
+Il browser usa un profilo persistente per mantenere i login:
+
+```
+~/.hybrid-browser-profile/
 ```
 
-### 4. Analyze Report
-Open `lux_analysis/<session>/report.html` to see:
-- Where LUX clicked vs where it should have clicked
-- Coordinate percentages
-- Hotspot patterns
+### Setup Login (Prima Volta)
+1. Avvia il servizio
+2. Esegui un task con `headless: false`
+3. Fai login manualmente nei siti che ti servono
+4. Chiudi il browser
+5. I prossimi task saranno già loggati
 
-## ⚙️ Configuration
+## ⚙️ Configurazione
 
-### PyAutoGUI Settings
+### Modelli
 ```python
-TaskRequest(
-    drag_duration=0.5,      # Drag speed
-    scroll_amount=30,       # Scroll steps
-    wait_duration=1.0,      # Wait actions
-    action_pause=0.1,       # Pause between actions
-    step_delay=0.3,         # Delay after each step
-)
+GEMINI_HYBRID_MODEL = "gemini-3-flash-preview"  # Per Hybrid Mode
+GEMINI_CUA_MODEL = "gemini-2.5-computer-use-preview-10-2025"  # Per CUA puro
 ```
 
-### LUX Modes
-| Mode | Model | Use Case |
-|------|-------|----------|
-| `actor` | `lux-actor-1` | Fast, immediate tasks |
-| `thinker` | `lux-thinker-1` | Complex reasoning |
-| `tasker` | TaskerAgent | Structured todo workflows |
-
-## 📝 Logging
-
-Logs are saved to `debug_logs/service_<timestamp>.log`
-
-Analysis reports are in `lux_analysis/<session>/`
-
-## 🔗 Integration with Lovable
-
-The Lovable web app sends POST requests to `/execute` with:
-- OAGI API key
-- Task description
-- Start URL
-- Execution mode
-
-The service:
-1. Opens Chrome with dedicated LUX profile
-2. Executes task using OAGI SDK
-3. Returns success/failure with summary
-4. Optionally generates analysis report
-
-## 📚 Official OAGI SDK
-
-Based on: https://github.com/agiopen-org/oagi-python
-
-Key SDK components used:
-- `AsyncDefaultAgent` - Main execution agent
-- `AsyncPyautoguiActionHandler` - Action execution
-- `AsyncScreenshotMaker` - Screenshot capture
-- `PyautoguiConfig` - Timing configuration
-- `TaskerAgent` - Structured workflows
-
-## 🐛 Troubleshooting
-
-### OAGI SDK not available
-```bash
-pip install oagi
+### Viewport
+```python
+VIEWPORT_WIDTH = 1288   # Ottimale per Computer Use
+VIEWPORT_HEIGHT = 711
 ```
 
-### PyAutoGUI issues on Linux
-```bash
-sudo apt-get install python3-tk python3-dev
+### Profile Directory
+```python
+HYBRID_PROFILE_DIR = Path.home() / ".hybrid-browser-profile"
 ```
 
-### Chrome not found
-The service automatically tries multiple Chrome paths. If none work, it falls back to the default browser.
+## 🐛 Debug
 
-### Coordinate issues
-1. Enable analysis: `enable_analysis: true`
-2. Run task
-3. Open report in `lux_analysis/`
-4. Compare LUX coordinates with actual element positions
+I log mostrano chiaramente quale approccio viene usato:
+
+```
+[12:34:56.789] [DOM] Executing act with selector: button[type="submit"]
+[12:34:57.123] [VISION] Clicking at (850, 420)
+[12:34:57.456] [ACTION] TYPE: text='search query' at (640, 380)
+```
+
+## 📝 Note Importanti
+
+1. **Gemini 3 Flash** è diverso da **Gemini 2.5 Computer Use**:
+   - 3 Flash: Hybrid (DOM + Vision), usa tool custom
+   - 2.5 CU: Solo Vision, usa tool `computer_use` built-in
+
+2. **Browser**: Usa Microsoft Edge per evitare conflitti con Chrome
+
+3. **Selettori supportati**:
+   - CSS: `#id`, `.class`, `[attr="value"]`
+   - XPath: `//button[@type="submit"]`
+   - Text: `text="Click me"`
+
+4. **Quando il modello sceglie Vision**:
+   - Canvas/SVG
+   - Shadow DOM
+   - Elementi dinamici
+   - Icone senza testo
+   - Quando DOM fallisce
+
+## 🔄 Migrazione da v6.0.7
+
+Il nuovo sistema è retrocompatibile. Puoi usare:
+
+```json
+{
+  "mode": "hybrid"  // Nuovo: DOM + Vision
+}
+```
+
+oppure
+
+```json
+{
+  "mode": "cua"  // Legacy: Solo Vision (richiede implementazione separata)
+}
+```
+
+## 📚 Riferimenti
+
+- [Stagehand Documentation](https://docs.stagehand.dev)
+- [Gemini 3 Flash](https://ai.google.dev/gemini-api)
+- [Playwright Accessibility](https://playwright.dev/docs/accessibility-testing)
