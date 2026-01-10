@@ -1,14 +1,23 @@
 """
-Tasker Service v6.0.2 - Multi-provider Computer Use
+Tasker Service v6.0.4 - Multi-provider Computer Use
 ====================================================
 Supports:
 - Lux (actor/thinker/tasker) via OAGI SDK + PyAutoGUI
 - Gemini Computer Use via Playwright (official Google implementation)
 
+v6.0.4 Changes:
+- Browser stays OPEN after task completion (no more auto-close!)
+- Browser is reused between tasks (faster)
+- Added /browser/close endpoint to manually close
+- Added /browser/status endpoint to check browser state
+
+v6.0.3 Changes:
+- Increased navigation timeout to 60s
+- Added error handling for slow pages
+
 v6.0.2 Changes:
 - Gemini uses Persistent Context to maintain login sessions
 - Profile saved at ~/.gemini-browser-profile
-- First run: login manually, cookies saved for future runs
 
 Based on:
 - Original v5.7.2 Lux implementation
@@ -132,7 +141,7 @@ except ImportError:
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-SERVICE_VERSION = "6.0.2"
+SERVICE_VERSION = "6.0.4"
 SERVICE_PORT = 8765
 DEBUG_LOGS_DIR = Path("debug_logs")
 ANALYSIS_DIR = Path("lux_analysis")
@@ -435,6 +444,7 @@ class PlaywrightComputer:
         headless: bool = False,
         highlight_mouse: bool = False,
         user_data_dir: Optional[str] = None,
+        keep_open: bool = True,  # Don't close browser after execution
     ):
         self._initial_url = initial_url
         self._screen_size = screen_size
@@ -442,6 +452,7 @@ class PlaywrightComputer:
         self._headless = headless
         self._highlight_mouse = highlight_mouse
         self._user_data_dir = user_data_dir or str(GEMINI_PROFILE_DIR)
+        self._keep_open = keep_open
         self._playwright = None
         self._context = None  # In persistent mode, context IS the browser
         self._page = None
@@ -479,10 +490,17 @@ class PlaywrightComputer:
         self._context.on("page", self._handle_new_page)
         
         print(f"✅ Playwright browser started at {self._initial_url}")
-        print(f"   💡 First time? Login manually, cookies will be saved for next run")
+        if self._keep_open:
+            print(f"   💡 Browser will stay open after task completes")
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        if self._keep_open:
+            # Don't close - browser stays open
+            print("✅ Browser stays open (close manually or via /browser/close)")
+            return
+        
+        # Close browser (for tests or when keep_open=False)
         try:
             if self._context:
                 self._context.close()
@@ -491,7 +509,7 @@ class PlaywrightComputer:
                 raise
         if self._playwright:
             self._playwright.stop()
-        print("🔴 Playwright browser closed (login session saved)")
+        print("🔴 Playwright browser closed")
 
     def screen_size(self) -> tuple:
         viewport = self._page.viewport_size
@@ -578,8 +596,12 @@ class PlaywrightComputer:
     def navigate(self, url: str) -> EnvState:
         if not url.startswith(("http://", "https://")):
             url = "https://" + url
-        self._page.goto(url)
-        self._page.wait_for_load_state()
+        try:
+            self._page.goto(url, timeout=60000)  # 60 seconds timeout
+            self._page.wait_for_load_state(timeout=30000)
+        except Exception as e:
+            print(f"  ⚠️ Navigation warning: {e}")
+            # Continue anyway - page might be partially loaded
         return self.current_state()
 
     def key_combination(self, keys: list) -> EnvState:
@@ -911,17 +933,59 @@ async def execute_with_lux(
 # ============================================================================
 # GEMINI EXECUTION (Playwright)
 # ============================================================================
-def _run_gemini_sync(api_key: str, task: str, max_steps: int, start_url: str, headless: bool, highlight_mouse: bool, user_data_dir: Optional[str] = None) -> ExecuteResponse:
-    """Run Gemini agent synchronously"""
+
+# Global browser instance (kept open between tasks)
+_persistent_browser: Optional[PlaywrightComputer] = None
+
+def _get_or_create_browser(start_url: str, headless: bool, highlight_mouse: bool, user_data_dir: Optional[str]) -> PlaywrightComputer:
+    """Get existing browser or create new one"""
+    global _persistent_browser
+    
+    if _persistent_browser is not None and _persistent_browser._page is not None:
+        try:
+            # Check if browser is still alive
+            _persistent_browser._page.url
+            print("♻️ Reusing existing browser session")
+            # Navigate to start URL if different
+            if start_url and _persistent_browser._page.url != start_url:
+                _persistent_browser.navigate(start_url)
+            return _persistent_browser
+        except:
+            print("⚠️ Previous browser session died, creating new one")
+            _persistent_browser = None
+    
+    # Create new browser
     computer = PlaywrightComputer(
         screen_size=(GEMINI_REF_WIDTH, GEMINI_REF_HEIGHT),
         initial_url=start_url,
         headless=headless,
         highlight_mouse=highlight_mouse,
         user_data_dir=user_data_dir,
+        keep_open=True,
     )
-    
-    with computer as browser:
+    computer.__enter__()
+    _persistent_browser = computer
+    return computer
+
+def _close_browser():
+    """Manually close the persistent browser"""
+    global _persistent_browser
+    if _persistent_browser is not None:
+        try:
+            if _persistent_browser._context:
+                _persistent_browser._context.close()
+            if _persistent_browser._playwright:
+                _persistent_browser._playwright.stop()
+            print("🔴 Browser closed")
+        except:
+            pass
+        _persistent_browser = None
+
+def _run_gemini_sync(api_key: str, task: str, max_steps: int, start_url: str, headless: bool, highlight_mouse: bool, user_data_dir: Optional[str] = None) -> ExecuteResponse:
+    """Run Gemini agent synchronously"""
+    try:
+        browser = _get_or_create_browser(start_url, headless, highlight_mouse, user_data_dir)
+        
         agent = GeminiBrowserAgent(browser_computer=browser, api_key=api_key, task=task, max_steps=max_steps)
         success, message, steps = agent.run()
         
@@ -929,10 +993,19 @@ def _run_gemini_sync(api_key: str, task: str, max_steps: int, start_url: str, he
         report_dir = ANALYSIS_DIR / f"gemini_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         report_path = agent.history.generate_report(report_dir)
         
+        print("✅ Task complete - browser stays open for next task or manual use")
+        
         return ExecuteResponse(
             success=success, message=message, steps_executed=steps,
             final_url=browser._page.url if browser._page else None,
             report_path=report_path
+        )
+    except Exception as e:
+        print(f"❌ Gemini error: {e}")
+        # Don't close browser on error - let user see what happened
+        return ExecuteResponse(
+            success=False, message=str(e), steps_executed=0,
+            error=str(e)
         )
 
 async def execute_with_gemini(api_key: str, task: str, max_steps: int, start_url: Optional[str], headless: bool = False, highlight_mouse: bool = False, user_data_dir: Optional[str] = None) -> ExecuteResponse:
@@ -1026,7 +1099,7 @@ async def test_playwright():
         return {"success": False, "error": "Playwright not installed"}
     try:
         def _test():
-            with PlaywrightComputer(headless=True) as browser:
+            with PlaywrightComputer(headless=True, keep_open=False) as browser:
                 state = browser.current_state()
                 return {"url": state.url, "screenshot_size": len(state.screenshot)}
         loop = asyncio.get_event_loop()
@@ -1034,6 +1107,36 @@ async def test_playwright():
         return {"success": True, **result}
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+@app.post("/browser/close")
+async def close_browser():
+    """Manually close the persistent Gemini browser"""
+    try:
+        def _close():
+            _close_browser()
+            return {"closed": True}
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(executor, _close)
+        return {"success": True, **result}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+@app.get("/browser/status")
+async def browser_status():
+    """Check if persistent browser is open"""
+    global _persistent_browser
+    is_open = _persistent_browser is not None
+    url = None
+    if is_open:
+        try:
+            url = _persistent_browser._page.url
+        except:
+            is_open = False
+    return {
+        "browser_open": is_open,
+        "current_url": url,
+        "profile_dir": str(GEMINI_PROFILE_DIR)
+    }
 
 if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=SERVICE_PORT)
