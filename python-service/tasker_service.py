@@ -1,1209 +1,1455 @@
+#!/usr/bin/env python3
 """
-Tasker Service v6.0.7 - Multi-provider Computer Use
+tasker_service.py v7.0 - Hybrid Mode (DOM + Vision)
 ====================================================
-Supports:
-- Lux (actor/thinker/tasker) via OAGI SDK + PyAutoGUI
-- Gemini Computer Use via Playwright (official Google implementation)
 
-v6.0.7 Changes:
-- Uses Microsoft EDGE instead of Chrome (channel="msedge")
-- Allows Chrome to stay open for web app while Edge does automation
-- Better anti-bot evasion on some sites
+Implementazione ispirata a Stagehand che combina:
+- DOM-based actions (selettori CSS/XPath via Accessibility Tree)
+- Vision-based actions (coordinate pixel via screenshot)
 
-v6.0.6 Changes:
-- Uses REAL Chrome instead of Chromium (channel="chrome")
-- Much better anti-bot evasion
-- Requires Chrome to be installed on the system
+Il modello Gemini 3 Flash decide autonomamente quale approccio usare
+per ogni singola azione, con self-healing automatico.
 
-v6.0.5 Changes:
-- Added ANTI-BOT PROTECTION for Playwright browser
-- Hides automation flags (navigator.webdriver)
-- Removes --enable-automation flag
-- Sites like webmail.register.it now load properly
-
-v6.0.4 Changes:
-- Browser stays OPEN after task completion (no more auto-close!)
-- Browser is reused between tasks (faster)
-- Added /browser/close endpoint to manually close
-- Added /browser/status endpoint to check browser state
-
-v6.0.3 Changes:
-- Increased navigation timeout to 60s
-- Added error handling for slow pages
-
-v6.0.2 Changes:
-- Gemini uses Persistent Context to maintain login sessions
-- Profile saved at ~/.gemini-browser-profile
-
-Based on:
-- Original v5.7.2 Lux implementation
-- Official Google repo: github.com/google-gemini/computer-use-preview
+Autore: The Architect's Hand
+Versione: 7.0.0
 """
 
-import asyncio
-import io
 import os
 import sys
-import subprocess
-import time
-import webbrowser
 import json
-from typing import Optional, List, Dict, Any, Literal
-from datetime import datetime
+import base64
+import asyncio
+import time
+import re
 from pathlib import Path
-from contextlib import asynccontextmanager
-from dataclasses import dataclass
-from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from typing import Optional, Dict, Any, List, Tuple, Union
+from dataclasses import dataclass, field
+from enum import Enum
 
-from fastapi import FastAPI, HTTPException, Query
+# FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import uvicorn
 
-# ============================================================================
-# OAGI SDK (for Lux)
-# ============================================================================
-OAGI_AVAILABLE = False
-OAGI_IMPORT_ERROR = None
-ASYNC_AGENT_OBSERVER_AVAILABLE = False
-
+# Playwright
 try:
-    from oagi import (
-        AsyncDefaultAgent, AsyncActor, TaskerAgent,
-        AsyncPyautoguiActionHandler, PyautoguiActionHandler, PyautoguiConfig,
-        AsyncScreenshotMaker, PILImage, ImageConfig,
-    )
-    OAGI_AVAILABLE = True
-    print("✅ OAGI SDK loaded")
-except ImportError as e:
-    OAGI_IMPORT_ERROR = str(e)
-    print(f"⚠️ OAGI SDK failed: {e}")
-
-# Try to import AsyncAgentObserver (may be in different location)
-try:
-    from oagi.agent.observer import AsyncAgentObserver
-    ASYNC_AGENT_OBSERVER_AVAILABLE = True
-    print("✅ AsyncAgentObserver loaded")
+    from playwright.async_api import async_playwright, Page, Browser, BrowserContext
+    PLAYWRIGHT_AVAILABLE = True
 except ImportError:
-    print("ℹ️ AsyncAgentObserver not available (optional)")
+    PLAYWRIGHT_AVAILABLE = False
+    print("⚠️ Playwright not available")
 
-# ============================================================================
-# GEMINI SDK
-# ============================================================================
-GEMINI_AVAILABLE = False
+# Google Gemini
 try:
     from google import genai
     from google.genai import types
-    from google.genai.types import (
-        Part,
-        GenerateContentConfig,
-        Content,
-        Candidate,
-        FunctionResponse,
-        FinishReason,
-    )
+    from google.genai.types import Content, Part, FunctionDeclaration, Tool, Schema
     GEMINI_AVAILABLE = True
-    print("✅ Gemini SDK loaded")
+    GEMINI_IMPORT_ERROR = None
 except ImportError as e:
+    GEMINI_AVAILABLE = False
+    GEMINI_IMPORT_ERROR = str(e)
     print(f"⚠️ Gemini SDK not available: {e}")
-
-# ============================================================================
-# PLAYWRIGHT (for Gemini)
-# ============================================================================
-PLAYWRIGHT_AVAILABLE = False
-try:
-    from playwright.sync_api import sync_playwright, Page
-    import playwright.sync_api
-    PLAYWRIGHT_AVAILABLE = True
-    print("✅ Playwright loaded")
-except ImportError as e:
-    print(f"⚠️ Playwright not available: {e}")
-
-# ============================================================================
-# PIL
-# ============================================================================
-PIL_AVAILABLE = False
-try:
-    from PIL import Image
-    PIL_AVAILABLE = True
-    print("✅ PIL loaded")
-except ImportError:
-    print("⚠️ PIL not available")
-
-# ============================================================================
-# PYAUTOGUI (for Lux)
-# ============================================================================
-PYAUTOGUI_AVAILABLE = False
-try:
-    import pyautogui
-    pyautogui.FAILSAFE = True
-    pyautogui.PAUSE = 0.1
-    PYAUTOGUI_AVAILABLE = True
-    print("✅ PyAutoGUI loaded")
-except ImportError:
-    print("⚠️ PyAutoGUI not available")
-
-# ============================================================================
-# PYPERCLIP
-# ============================================================================
-PYPERCLIP_AVAILABLE = False
-try:
-    import pyperclip
-    PYPERCLIP_AVAILABLE = True
-    print("✅ Pyperclip loaded")
-except ImportError:
-    print("⚠️ Pyperclip not available")
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-SERVICE_VERSION = "6.0.7"
-SERVICE_PORT = 8765
-DEBUG_LOGS_DIR = Path("debug_logs")
-ANALYSIS_DIR = Path("lux_analysis")
-DEBUG_LOGS_DIR.mkdir(exist_ok=True)
-ANALYSIS_DIR.mkdir(exist_ok=True)
 
-# Lux resolution (from SDK ImageConfig)
-LUX_REF_WIDTH = 1260
-LUX_REF_HEIGHT = 700
+# Modello per Hybrid Mode (DOM + Vision)
+GEMINI_HYBRID_MODEL = "gemini-3-flash-preview"
 
-# Gemini resolution (from official Google repo)
-GEMINI_REF_WIDTH = 1440
-GEMINI_REF_HEIGHT = 900
-GEMINI_MODEL = "gemini-2.5-computer-use-preview-10-2025"
-MAX_RECENT_TURNS_WITH_SCREENSHOTS = 3
+# Modello per CUA puro (solo Vision) - mantenuto per retrocompatibilità
+GEMINI_CUA_MODEL = "gemini-2.5-computer-use-preview-10-2025"
 
-# Predefined Computer Use functions (from official Google repo)
-PREDEFINED_COMPUTER_USE_FUNCTIONS = [
-    "open_web_browser", "click_at", "hover_at", "type_text_at",
-    "scroll_document", "scroll_at", "wait_5_seconds", "go_back",
-    "go_forward", "search", "navigate", "key_combination", "drag_and_drop",
-]
+# Viewport ottimale per Computer Use (come da Stagehand docs)
+VIEWPORT_WIDTH = 1288
+VIEWPORT_HEIGHT = 711
 
-# Playwright key mapping (from official Google repo)
-PLAYWRIGHT_KEY_MAP = {
-    "backspace": "Backspace", "tab": "Tab", "return": "Enter", "enter": "Enter",
-    "shift": "Shift", "control": "ControlOrMeta", "alt": "Alt", "escape": "Escape",
-    "space": "Space", "pageup": "PageUp", "pagedown": "PageDown", "end": "End",
-    "home": "Home", "left": "ArrowLeft", "up": "ArrowUp", "right": "ArrowRight",
-    "down": "ArrowDown", "insert": "Insert", "delete": "Delete", "semicolon": ";",
-    "equals": "=", "multiply": "Multiply", "add": "Add", "separator": "Separator",
-    "subtract": "Subtract", "decimal": "Decimal", "divide": "Divide",
-    "f1": "F1", "f2": "F2", "f3": "F3", "f4": "F4", "f5": "F5", "f6": "F6",
-    "f7": "F7", "f8": "F8", "f9": "F9", "f10": "F10", "f11": "F11", "f12": "F12",
-    "command": "Meta", "meta": "Meta", "arrowleft": "ArrowLeft",
-    "arrowright": "ArrowRight", "arrowup": "ArrowUp", "arrowdown": "ArrowDown",
-}
-
-# Thread pool for Playwright
-executor = ThreadPoolExecutor(max_workers=2)
+# Profile directory per persistent context
+HYBRID_PROFILE_DIR = Path.home() / ".hybrid-browser-profile"
 
 # ============================================================================
-# MODELS
+# DATA CLASSES
 # ============================================================================
-class ExecuteRequest(BaseModel):
-    api_key: str
-    task_description: str
-    mode: str = "actor"  # actor, thinker, tasker, gemini
-    max_steps_per_todo: int = 15
-    start_url: Optional[str] = None
-    todos: Optional[List[str]] = None  # For Lux tasker mode
-    headless: bool = False  # For Gemini
-    highlight_mouse: bool = False  # For Gemini
-    user_data_dir: Optional[str] = None  # For Gemini persistent profile
 
-class StatusResponse(BaseModel):
-    status: str
-    version: str
-    oagi_available: bool
-    gemini_available: bool
-    playwright_available: bool
-    modes: List[str]
+class ActionType(Enum):
+    """Tipi di azione supportati"""
+    # DOM-based
+    ACT = "act"           # Azione su selettore (click, type, etc.)
+    OBSERVE = "observe"   # Osserva elementi nella pagina
+    EXTRACT = "extract"   # Estrai dati strutturati
+    
+    # Vision-based
+    CLICK = "click"       # Click su coordinate
+    TYPE = "type"         # Digita testo
+    SCROLL = "scroll"     # Scroll
+    DRAG = "drag"         # Drag and drop
+    
+    # Control
+    WAIT = "wait"         # Attendi
+    NAVIGATE = "navigate" # Naviga a URL
+    DONE = "done"         # Task completato
 
-class ExecuteResponse(BaseModel):
-    success: bool
-    message: str
-    steps_executed: int = 0
-    final_url: Optional[str] = None
-    report_path: Optional[str] = None
-    error: Optional[str] = None
 
 @dataclass
-class EnvState:
-    """Environment state for Gemini (from Google repo)"""
-    screenshot: bytes
-    url: str
+class HybridAction:
+    """Rappresenta un'azione hybrid (DOM o Vision)"""
+    action_type: ActionType
+    
+    # Per DOM actions
+    selector: Optional[str] = None
+    instruction: Optional[str] = None
+    
+    # Per Vision actions
+    x: Optional[int] = None
+    y: Optional[int] = None
+    
+    # Parametri comuni
+    text: Optional[str] = None
+    url: Optional[str] = None
+    duration: Optional[int] = None
+    
+    # Metadata
+    reasoning: Optional[str] = None
+    confidence: float = 1.0
+    fallback_available: bool = True
+
+
+@dataclass
+class ExecutionResult:
+    """Risultato di un'esecuzione"""
+    success: bool
+    action: HybridAction
+    screenshot_after: Optional[str] = None
+    error: Optional[str] = None
+    fallback_used: bool = False
+    duration_ms: int = 0
+
+
+@dataclass
+class StepRecord:
+    """Record di uno step di esecuzione"""
+    turn: int
+    action: Optional[HybridAction] = None
+    result: Optional[ExecutionResult] = None
+    accessibility_tree: Optional[str] = None
+    screenshot_before: Optional[str] = None
+    timestamp: datetime = field(default_factory=datetime.now)
+
 
 # ============================================================================
 # LOGGING
 # ============================================================================
-DEBUG_SCREENSHOTS_DIR = DEBUG_LOGS_DIR / "screenshots"
-DEBUG_SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
-_debug_step_counter = 0
 
-def debug_log(message: str, level: str = "INFO"):
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-    print(f"[{timestamp}] [{level}] {message}")
-
-def debug_screenshot(prefix: str = "screenshot") -> Optional[str]:
-    global _debug_step_counter
-    _debug_step_counter += 1
-    if not PYAUTOGUI_AVAILABLE:
-        return None
-    try:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"{_debug_step_counter:03d}_{prefix}_{timestamp}.png"
-        filepath = DEBUG_SCREENSHOTS_DIR / filename
-        pyautogui.screenshot().save(filepath)
-        return str(filepath)
-    except:
-        return None
-
-# ============================================================================
-# EXECUTION HISTORY (shared)
-# ============================================================================
-class StepRecord:
-    def __init__(self, step_num: int, todo_index: Optional[int] = None):
-        self.step_num = step_num
-        self.todo_index = todo_index
-        self.timestamp = datetime.now().isoformat()
-        self.reasoning: Optional[str] = None
-        self.actions: List[Dict] = []
-        self.screenshot_before: Optional[str] = None
-        self.screenshot_after: Optional[str] = None
-        self.success: bool = False
-        self.error: Optional[str] = None
-        self.stop: bool = False
-
-    def to_dict(self) -> Dict:
-        return {
-            "step_num": self.step_num,
-            "todo_index": self.todo_index,
-            "timestamp": self.timestamp,
-            "reasoning": self.reasoning,
-            "actions": self.actions,
-            "screenshot_before": self.screenshot_before,
-            "screenshot_after": self.screenshot_after,
-            "success": self.success,
-            "error": self.error,
-            "stop": self.stop
-        }
-
-class ExecutionHistory:
-    def __init__(self, task_description: str, mode: str, todos: Optional[List[str]] = None):
-        self.task_description = task_description
-        self.mode = mode
-        self.todos = todos or []
-        self.start_time = datetime.now()
-        self.end_time: Optional[datetime] = None
-        self.steps: List[StepRecord] = []
-        self.completed: bool = False
-        self.final_error: Optional[str] = None
-        self.completed_todos: int = 0
-
-    def add_step(self, step: StepRecord):
-        self.steps.append(step)
-
-    def finish(self, completed: bool, error: Optional[str] = None, completed_todos: int = 0):
-        self.end_time = datetime.now()
-        self.completed = completed
-        self.final_error = error
-        self.completed_todos = completed_todos
-
-    def to_dict(self) -> Dict:
-        return {
-            "task_description": self.task_description,
-            "mode": self.mode,
-            "todos": self.todos,
-            "start_time": self.start_time.isoformat(),
-            "end_time": self.end_time.isoformat() if self.end_time else None,
-            "duration_seconds": (self.end_time - self.start_time).total_seconds() if self.end_time else None,
-            "total_steps": len(self.steps),
-            "completed": self.completed,
-            "completed_todos": self.completed_todos,
-            "total_todos": len(self.todos),
-            "final_error": self.final_error,
-            "steps": [s.to_dict() for s in self.steps]
-        }
-
-    def generate_report(self, output_dir: Path) -> str:
-        output_dir.mkdir(parents=True, exist_ok=True)
+class HybridLogger:
+    """Logger per Hybrid Mode"""
+    
+    def __init__(self, verbose: bool = True):
+        self.verbose = verbose
+        self.logs: List[str] = []
         
-        if self.mode == "gemini":
-            ref_width, ref_height = GEMINI_REF_WIDTH, GEMINI_REF_HEIGHT
-            control_method = "Playwright (browser-level)"
-        else:
-            ref_width, ref_height = LUX_REF_WIDTH, LUX_REF_HEIGHT
-            control_method = "PyAutoGUI (OS-level)"
-
-        if PYAUTOGUI_AVAILABLE:
-            screen_width, screen_height = pyautogui.size()
-            scale_x = screen_width / ref_width
-            scale_y = screen_height / ref_height
-        else:
-            screen_width, screen_height = 1920, 1080
-            scale_x = scale_y = 1.0
-
-        duration = (self.end_time - self.start_time).total_seconds() if self.end_time else 0
-
-        html = f'''<!DOCTYPE html>
-<html>
-<head>
-    <title>Execution Report - {self.mode.upper()}</title>
-    <style>
-        body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif; margin: 20px; background: #1a1a2e; color: #eee; }}
-        .header {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 20px; border-radius: 10px; margin-bottom: 20px; }}
-        .header h1 {{ margin: 0; color: white; }}
-        .mode-badge {{ display: inline-block; padding: 5px 15px; border-radius: 20px; font-weight: bold; margin-left: 10px; }}
-        .mode-gemini {{ background: #4285f4; }}
-        .mode-lux {{ background: #00d4aa; }}
-        .info-box {{ background: #16213e; padding: 15px; border-radius: 8px; margin-bottom: 15px; }}
-        .step {{ background: #16213e; padding: 15px; margin: 10px 0; border-radius: 8px; border-left: 4px solid #667eea; }}
-        .step.success {{ border-left-color: #00d4aa; }}
-        .step.error {{ border-left-color: #ff6b6b; }}
-        .reasoning {{ background: #0f0f23; padding: 10px; border-radius: 5px; margin: 10px 0; font-style: italic; color: #a0a0a0; }}
-        .action {{ background: #0f0f23; padding: 8px; border-radius: 4px; margin: 5px 0; font-family: monospace; }}
-        .stats {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px; margin: 20px 0; }}
-        .stat {{ background: #16213e; padding: 15px; border-radius: 8px; text-align: center; }}
-        .stat-value {{ font-size: 24px; color: #667eea; }}
-    </style>
-</head>
-<body>
-    <div class="header">
-        <h1>🤖 Execution Report 
-            <span class="mode-badge mode-{self.mode}">{self.mode.upper()}</span>
-        </h1>
-        <p><strong>Task:</strong> {self.task_description}</p>
-    </div>
+    def log(self, message: str, level: str = "INFO"):
+        timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        formatted = f"[{timestamp}] [{level}] {message}"
+        self.logs.append(formatted)
+        if self.verbose:
+            print(formatted)
     
-    <div class="info-box">
-        <p><strong>Control Method:</strong> {control_method}</p>
-        <p><strong>Reference Resolution:</strong> {ref_width}×{ref_height}</p>
-        <p><strong>Screen:</strong> {screen_width}×{screen_height} | Scale: {scale_x:.2f}x, {scale_y:.2f}x</p>
-    </div>
+    def debug(self, message: str):
+        self.log(message, "DEBUG")
     
-    <div class="stats">
-        <div class="stat"><div class="stat-value">{len(self.steps)}</div><div>Steps</div></div>
-        <div class="stat"><div class="stat-value">{duration:.1f}s</div><div>Duration</div></div>
-        <div class="stat"><div class="stat-value">{"✓" if self.completed else "✗"}</div><div>Status</div></div>
-        <div class="stat"><div class="stat-value">{self.mode}</div><div>Provider</div></div>
-    </div>
+    def info(self, message: str):
+        self.log(message, "INFO")
     
-    <h2>Execution Timeline</h2>
-'''
-        for step in self.steps:
-            step_class = "success" if step.success else "error"
-            reasoning_html = f'<div class="reasoning">{step.reasoning}</div>' if step.reasoning else ""
-            actions_html = "".join([f'<div class="action">{json.dumps(a)}</div>' for a in step.actions])
-            
-            html += f'''
-    <div class="step {step_class}">
-        <strong>Step {step.step_num}</strong> - {step.timestamp}
-        {reasoning_html}
-        {actions_html}
-    </div>
-'''
-        
-        html += f'''
-    <div class="info-box">
-        <strong>Final:</strong> {"Completed" if self.completed else self.final_error or "Unknown"}
-    </div>
-</body>
-</html>'''
+    def warning(self, message: str):
+        self.log(message, "WARN")
+    
+    def error(self, message: str):
+        self.log(message, "ERROR")
+    
+    def action(self, action_type: str, details: str):
+        self.log(f"🎯 {action_type}: {details}", "ACTION")
+    
+    def dom(self, message: str):
+        self.log(f"📄 DOM: {message}", "DOM")
+    
+    def vision(self, message: str):
+        self.log(f"👁️ VISION: {message}", "VISION")
 
-        report_path = output_dir / "execution_report.html"
-        report_path.write_text(html, encoding="utf-8")
 
-        json_path = output_dir / "execution_history.json"
-        json_path.write_text(json.dumps(self.to_dict(), indent=2, ensure_ascii=False), encoding="utf-8")
-
-        return str(report_path)
+logger = HybridLogger()
 
 # ============================================================================
-# LUX UTILITIES
-# ============================================================================
-def type_via_clipboard(text: str):
-    """Type text via clipboard (handles Unicode)"""
-    if not PYPERCLIP_AVAILABLE or not PYAUTOGUI_AVAILABLE:
-        return
-    original = pyperclip.paste()
-    try:
-        pyperclip.copy(text)
-        time.sleep(0.05)
-        pyautogui.hotkey('ctrl', 'v')
-        time.sleep(0.1)
-    finally:
-        try:
-            pyperclip.copy(original)
-        except:
-            pass
-
-# ============================================================================
-# PLAYWRIGHT COMPUTER (from official Google repo + Persistent Context)
+# ACCESSIBILITY TREE EXTRACTOR
 # ============================================================================
 
-# Default profile directory for persistent login (Edge)
-GEMINI_PROFILE_DIR = Path.home() / ".gemini-edge-profile"
-
-class PlaywrightComputer:
+class AccessibilityTreeExtractor:
     """
-    Playwright-based browser control for Gemini Computer Use.
-    Uses persistent context to maintain login sessions across runs.
+    Estrae l'Accessibility Tree dalla pagina.
+    Questo è il componente chiave che permette le azioni DOM-based.
+    
+    L'accessibility tree fornisce una rappresentazione semantica della pagina
+    che è più stabile del raw DOM e contiene informazioni su ruoli, label, stati.
+    """
+    
+    @staticmethod
+    async def extract(page: Page, max_depth: int = 10) -> Dict[str, Any]:
+        """
+        Estrae l'accessibility tree completo dalla pagina.
+        
+        Returns:
+            Dict con la struttura dell'accessibility tree
+        """
+        try:
+            # Usa l'API di Playwright per ottenere l'accessibility tree
+            snapshot = await page.accessibility.snapshot()
+            return snapshot if snapshot else {}
+        except Exception as e:
+            logger.error(f"Failed to extract accessibility tree: {e}")
+            return {}
+    
+    @staticmethod
+    def serialize_tree(tree: Dict[str, Any], max_tokens: int = 8000) -> str:
+        """
+        Serializza l'accessibility tree in formato testo ottimizzato per LLM.
+        Filtra elementi non interattivi e riduce la dimensione.
+        
+        Args:
+            tree: Accessibility tree dict
+            max_tokens: Limite approssimativo di token
+            
+        Returns:
+            Stringa formattata dell'accessibility tree
+        """
+        if not tree:
+            return "No accessibility tree available"
+        
+        lines = []
+        AccessibilityTreeExtractor._serialize_node(tree, lines, depth=0)
+        
+        result = "\n".join(lines)
+        
+        # Troncamento approssimativo (4 chars ≈ 1 token)
+        max_chars = max_tokens * 4
+        if len(result) > max_chars:
+            result = result[:max_chars] + "\n... [truncated]"
+        
+        return result
+    
+    @staticmethod
+    def _serialize_node(node: Dict[str, Any], lines: List[str], depth: int):
+        """Serializza ricorsivamente un nodo dell'accessibility tree"""
+        if depth > 10:  # Limite profondità
+            return
+        
+        indent = "  " * depth
+        role = node.get("role", "unknown")
+        name = node.get("name", "")
+        
+        # Filtra ruoli non interattivi comuni
+        skip_roles = {"generic", "none", "presentation", "paragraph", "StaticText"}
+        if role in skip_roles and not name:
+            # Processa comunque i figli
+            for child in node.get("children", []):
+                AccessibilityTreeExtractor._serialize_node(child, lines, depth)
+            return
+        
+        # Costruisci la linea
+        parts = [f"{indent}[{role}]"]
+        
+        if name:
+            # Tronca nomi lunghi
+            display_name = name[:100] + "..." if len(name) > 100 else name
+            parts.append(f'"{display_name}"')
+        
+        # Aggiungi attributi rilevanti
+        attrs = []
+        if node.get("focused"):
+            attrs.append("focused")
+        if node.get("disabled"):
+            attrs.append("disabled")
+        if node.get("checked") is not None:
+            attrs.append(f"checked={node['checked']}")
+        if node.get("selected"):
+            attrs.append("selected")
+        if node.get("expanded") is not None:
+            attrs.append(f"expanded={node['expanded']}")
+        if node.get("value"):
+            val = str(node["value"])[:50]
+            attrs.append(f"value='{val}'")
+        
+        if attrs:
+            parts.append(f"({', '.join(attrs)})")
+        
+        lines.append(" ".join(parts))
+        
+        # Processa figli
+        for child in node.get("children", []):
+            AccessibilityTreeExtractor._serialize_node(child, lines, depth + 1)
+    
+    @staticmethod
+    def find_interactive_elements(tree: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Trova tutti gli elementi interattivi nell'accessibility tree.
+        Utile per debugging e per trovare selettori.
+        """
+        interactive_roles = {
+            "button", "link", "textbox", "checkbox", "radio", "combobox",
+            "listbox", "option", "menuitem", "tab", "searchbox", "spinbutton",
+            "slider", "switch", "menuitemcheckbox", "menuitemradio"
+        }
+        
+        elements = []
+        
+        def _find(node: Dict[str, Any], path: str = ""):
+            role = node.get("role", "")
+            name = node.get("name", "")
+            
+            if role in interactive_roles:
+                elements.append({
+                    "role": role,
+                    "name": name,
+                    "path": path,
+                    "focused": node.get("focused", False),
+                    "disabled": node.get("disabled", False)
+                })
+            
+            for i, child in enumerate(node.get("children", [])):
+                child_path = f"{path}/{role}[{i}]" if path else f"{role}[{i}]"
+                _find(child, child_path)
+        
+        _find(tree)
+        return elements
+
+
+# ============================================================================
+# SCREENSHOT MANAGER
+# ============================================================================
+
+class ScreenshotManager:
+    """Gestisce la cattura degli screenshot"""
+    
+    def __init__(self, page: Page):
+        self.page = page
+    
+    async def capture(self) -> Tuple[bytes, str]:
+        """
+        Cattura uno screenshot della pagina.
+        
+        Returns:
+            Tuple di (bytes, base64_string)
+        """
+        try:
+            png_bytes = await self.page.screenshot(type="png", full_page=False)
+            b64_string = base64.b64encode(png_bytes).decode("utf-8")
+            return png_bytes, b64_string
+        except Exception as e:
+            logger.error(f"Screenshot failed: {e}")
+            raise
+    
+    async def capture_element(self, selector: str) -> Optional[Tuple[bytes, str]]:
+        """Cattura screenshot di un elemento specifico"""
+        try:
+            element = await self.page.query_selector(selector)
+            if element:
+                png_bytes = await element.screenshot(type="png")
+                b64_string = base64.b64encode(png_bytes).decode("utf-8")
+                return png_bytes, b64_string
+        except Exception as e:
+            logger.error(f"Element screenshot failed: {e}")
+        return None
+
+
+# ============================================================================
+# HYBRID ACTION EXECUTOR
+# ============================================================================
+
+class HybridActionExecutor:
+    """
+    Esegue le azioni hybrid (DOM e Vision).
+    Implementa anche il self-healing automatico.
+    """
+    
+    def __init__(self, page: Page):
+        self.page = page
+        self.last_action_time = 0
+        self.min_action_delay = 100  # ms tra azioni
+    
+    async def execute(self, action: HybridAction) -> ExecutionResult:
+        """
+        Esegue un'azione hybrid.
+        Se l'azione DOM fallisce e c'è un fallback Vision disponibile,
+        prova automaticamente con le coordinate.
+        """
+        start_time = time.time()
+        
+        # Rate limiting
+        elapsed = (time.time() - self.last_action_time) * 1000
+        if elapsed < self.min_action_delay:
+            await asyncio.sleep((self.min_action_delay - elapsed) / 1000)
+        
+        try:
+            if action.action_type == ActionType.ACT:
+                result = await self._execute_act(action)
+            elif action.action_type == ActionType.CLICK:
+                result = await self._execute_click(action)
+            elif action.action_type == ActionType.TYPE:
+                result = await self._execute_type(action)
+            elif action.action_type == ActionType.SCROLL:
+                result = await self._execute_scroll(action)
+            elif action.action_type == ActionType.NAVIGATE:
+                result = await self._execute_navigate(action)
+            elif action.action_type == ActionType.WAIT:
+                result = await self._execute_wait(action)
+            elif action.action_type == ActionType.DONE:
+                result = ExecutionResult(success=True, action=action)
+            else:
+                result = ExecutionResult(
+                    success=False,
+                    action=action,
+                    error=f"Unknown action type: {action.action_type}"
+                )
+            
+            self.last_action_time = time.time()
+            result.duration_ms = int((time.time() - start_time) * 1000)
+            return result
+            
+        except Exception as e:
+            logger.error(f"Action execution failed: {e}")
+            return ExecutionResult(
+                success=False,
+                action=action,
+                error=str(e),
+                duration_ms=int((time.time() - start_time) * 1000)
+            )
+    
+    async def _execute_act(self, action: HybridAction) -> ExecutionResult:
+        """
+        Esegue un'azione DOM-based.
+        Usa il selettore per trovare l'elemento e eseguire l'azione.
+        """
+        if not action.selector:
+            return ExecutionResult(
+                success=False,
+                action=action,
+                error="No selector provided for act action"
+            )
+        
+        logger.dom(f"Executing act with selector: {action.selector}")
+        
+        try:
+            # Trova l'elemento
+            element = await self.page.query_selector(action.selector)
+            
+            if not element:
+                # Self-healing: prova con selettori alternativi
+                element = await self._try_alternative_selectors(action.selector)
+            
+            if not element:
+                # Fallback a Vision se disponibile
+                if action.fallback_available and action.x is not None and action.y is not None:
+                    logger.warning(f"DOM selector failed, falling back to coordinates ({action.x}, {action.y})")
+                    click_action = HybridAction(
+                        action_type=ActionType.CLICK,
+                        x=action.x,
+                        y=action.y,
+                        text=action.text
+                    )
+                    result = await self._execute_click(click_action)
+                    result.fallback_used = True
+                    return result
+                
+                return ExecutionResult(
+                    success=False,
+                    action=action,
+                    error=f"Element not found: {action.selector}"
+                )
+            
+            # Determina l'azione da eseguire basandosi sull'istruzione
+            instruction = (action.instruction or "").lower()
+            
+            if action.text and ("type" in instruction or "enter" in instruction or "fill" in instruction):
+                await element.fill(action.text)
+                logger.dom(f"Filled '{action.text}' into {action.selector}")
+            elif "check" in instruction:
+                await element.check()
+                logger.dom(f"Checked {action.selector}")
+            elif "uncheck" in instruction:
+                await element.uncheck()
+                logger.dom(f"Unchecked {action.selector}")
+            elif "select" in instruction and action.text:
+                await element.select_option(action.text)
+                logger.dom(f"Selected '{action.text}' in {action.selector}")
+            elif "hover" in instruction:
+                await element.hover()
+                logger.dom(f"Hovered over {action.selector}")
+            elif "focus" in instruction:
+                await element.focus()
+                logger.dom(f"Focused {action.selector}")
+            else:
+                # Default: click
+                await element.click()
+                logger.dom(f"Clicked {action.selector}")
+            
+            return ExecutionResult(success=True, action=action)
+            
+        except Exception as e:
+            logger.error(f"Act execution failed: {e}")
+            
+            # Fallback a Vision
+            if action.fallback_available and action.x is not None and action.y is not None:
+                logger.warning(f"DOM action failed, falling back to coordinates ({action.x}, {action.y})")
+                click_action = HybridAction(
+                    action_type=ActionType.CLICK,
+                    x=action.x,
+                    y=action.y,
+                    text=action.text
+                )
+                result = await self._execute_click(click_action)
+                result.fallback_used = True
+                return result
+            
+            return ExecutionResult(success=False, action=action, error=str(e))
+    
+    async def _try_alternative_selectors(self, original_selector: str) -> Optional[Any]:
+        """
+        Prova selettori alternativi quando il primo fallisce.
+        Implementa parte del self-healing.
+        """
+        # Strategie di fallback per selettori comuni
+        alternatives = []
+        
+        # Se è un selettore con attributo, prova varianti
+        if "[" in original_selector:
+            # Prova senza il valore specifico
+            base = original_selector.split("[")[0]
+            if base:
+                alternatives.append(base)
+        
+        # Se contiene testo, prova text selector
+        if "text=" not in original_selector.lower():
+            # Estrai possibile testo dal selettore
+            match = re.search(r'"([^"]+)"', original_selector)
+            if match:
+                alternatives.append(f'text="{match.group(1)}"')
+        
+        for alt_selector in alternatives:
+            try:
+                element = await self.page.query_selector(alt_selector)
+                if element:
+                    logger.dom(f"Found element with alternative selector: {alt_selector}")
+                    return element
+            except:
+                continue
+        
+        return None
+    
+    async def _execute_click(self, action: HybridAction) -> ExecutionResult:
+        """Esegue un click su coordinate specifiche"""
+        if action.x is None or action.y is None:
+            return ExecutionResult(
+                success=False,
+                action=action,
+                error="No coordinates provided for click action"
+            )
+        
+        logger.vision(f"Clicking at ({action.x}, {action.y})")
+        
+        try:
+            await self.page.mouse.click(action.x, action.y)
+            return ExecutionResult(success=True, action=action)
+        except Exception as e:
+            return ExecutionResult(success=False, action=action, error=str(e))
+    
+    async def _execute_type(self, action: HybridAction) -> ExecutionResult:
+        """Digita testo, opzionalmente su coordinate specifiche"""
+        if not action.text:
+            return ExecutionResult(
+                success=False,
+                action=action,
+                error="No text provided for type action"
+            )
+        
+        try:
+            # Se ci sono coordinate, prima clicca lì
+            if action.x is not None and action.y is not None:
+                logger.vision(f"Clicking at ({action.x}, {action.y}) before typing")
+                await self.page.mouse.click(action.x, action.y)
+                await asyncio.sleep(0.1)
+            
+            logger.vision(f"Typing: {action.text[:50]}...")
+            await self.page.keyboard.type(action.text, delay=50)
+            return ExecutionResult(success=True, action=action)
+        except Exception as e:
+            return ExecutionResult(success=False, action=action, error=str(e))
+    
+    async def _execute_scroll(self, action: HybridAction) -> ExecutionResult:
+        """Esegue scroll"""
+        try:
+            # Default: scroll di 300px verso il basso
+            delta_y = action.y if action.y else 300
+            
+            if action.x is not None and action.y is not None:
+                # Scroll su posizione specifica
+                await self.page.mouse.move(action.x, action.y)
+            
+            await self.page.mouse.wheel(0, delta_y)
+            logger.vision(f"Scrolled by {delta_y}px")
+            return ExecutionResult(success=True, action=action)
+        except Exception as e:
+            return ExecutionResult(success=False, action=action, error=str(e))
+    
+    async def _execute_navigate(self, action: HybridAction) -> ExecutionResult:
+        """Naviga a un URL"""
+        if not action.url:
+            return ExecutionResult(
+                success=False,
+                action=action,
+                error="No URL provided for navigate action"
+            )
+        
+        try:
+            logger.info(f"Navigating to: {action.url}")
+            await self.page.goto(action.url, wait_until="domcontentloaded")
+            return ExecutionResult(success=True, action=action)
+        except Exception as e:
+            return ExecutionResult(success=False, action=action, error=str(e))
+    
+    async def _execute_wait(self, action: HybridAction) -> ExecutionResult:
+        """Attende per un periodo specificato"""
+        duration = action.duration if action.duration else 1000
+        logger.info(f"Waiting for {duration}ms")
+        await asyncio.sleep(duration / 1000)
+        return ExecutionResult(success=True, action=action)
+
+
+# ============================================================================
+# GEMINI HYBRID CLIENT
+# ============================================================================
+
+class GeminiHybridClient:
+    """
+    Client per Gemini 3 Flash in modalità Hybrid.
+    
+    Definisce i tool disponibili (DOM e Vision) e gestisce
+    la comunicazione con il modello.
+    """
+    
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.client = genai.Client(api_key=api_key)
+        self.conversation_history: List[Content] = []
+    
+    def _build_tools(self) -> List[Tool]:
+        """
+        Costruisce la lista dei tool disponibili per il modello.
+        Include sia tool DOM-based che Vision-based.
+        """
+        tools = []
+        
+        # Tool DOM-based: act
+        act_tool = FunctionDeclaration(
+            name="act",
+            description="""Execute a DOM-based action using a CSS/XPath selector.
+            Use this when you can identify a clear, reliable selector for the target element.
+            Preferred for: buttons, links, form inputs, elements with clear identifiers.
+            The selector should be as specific as possible.""",
+            parameters=Schema(
+                type="object",
+                properties={
+                    "selector": Schema(
+                        type="string",
+                        description="CSS selector or XPath to find the element. Examples: 'button[type=submit]', '#login-btn', '[data-testid=\"search\"]', 'text=\"Sign In\"'"
+                    ),
+                    "instruction": Schema(
+                        type="string",
+                        description="What to do with the element: 'click', 'type', 'check', 'uncheck', 'select', 'hover', 'focus'"
+                    ),
+                    "text": Schema(
+                        type="string",
+                        description="Text to type or option to select (if applicable)"
+                    ),
+                    "fallback_x": Schema(
+                        type="integer",
+                        description="Fallback X coordinate if selector fails"
+                    ),
+                    "fallback_y": Schema(
+                        type="integer",
+                        description="Fallback Y coordinate if selector fails"
+                    )
+                },
+                required=["selector", "instruction"]
+            )
+        )
+        
+        # Tool Vision-based: click
+        click_tool = FunctionDeclaration(
+            name="click",
+            description="""Click at specific pixel coordinates on the screen.
+            Use this when: no reliable DOM selector exists, element is in canvas/SVG,
+            dealing with dynamic content, or DOM approach failed.
+            Coordinates are relative to the viewport (0,0 = top-left).""",
+            parameters=Schema(
+                type="object",
+                properties={
+                    "x": Schema(
+                        type="integer",
+                        description="X coordinate (pixels from left edge)"
+                    ),
+                    "y": Schema(
+                        type="integer",
+                        description="Y coordinate (pixels from top edge)"
+                    ),
+                    "reasoning": Schema(
+                        type="string",
+                        description="Brief explanation of why you're clicking here"
+                    )
+                },
+                required=["x", "y"]
+            )
+        )
+        
+        # Tool Vision-based: type
+        type_tool = FunctionDeclaration(
+            name="type",
+            description="""Type text, optionally clicking at coordinates first.
+            Use for text input when DOM selector is unreliable.""",
+            parameters=Schema(
+                type="object",
+                properties={
+                    "text": Schema(
+                        type="string",
+                        description="Text to type"
+                    ),
+                    "x": Schema(
+                        type="integer",
+                        description="Optional: X coordinate to click before typing"
+                    ),
+                    "y": Schema(
+                        type="integer",
+                        description="Optional: Y coordinate to click before typing"
+                    )
+                },
+                required=["text"]
+            )
+        )
+        
+        # Tool: scroll
+        scroll_tool = FunctionDeclaration(
+            name="scroll",
+            description="""Scroll the page. Positive y = scroll down, negative = scroll up.""",
+            parameters=Schema(
+                type="object",
+                properties={
+                    "delta_y": Schema(
+                        type="integer",
+                        description="Pixels to scroll (positive=down, negative=up). Default 300."
+                    ),
+                    "x": Schema(
+                        type="integer",
+                        description="Optional: X position to scroll at"
+                    ),
+                    "y": Schema(
+                        type="integer",
+                        description="Optional: Y position to scroll at"
+                    )
+                },
+                required=[]
+            )
+        )
+        
+        # Tool: navigate
+        navigate_tool = FunctionDeclaration(
+            name="navigate",
+            description="""Navigate to a URL.""",
+            parameters=Schema(
+                type="object",
+                properties={
+                    "url": Schema(
+                        type="string",
+                        description="Full URL to navigate to"
+                    )
+                },
+                required=["url"]
+            )
+        )
+        
+        # Tool: wait
+        wait_tool = FunctionDeclaration(
+            name="wait",
+            description="""Wait for a specified duration. Use when page needs time to load or update.""",
+            parameters=Schema(
+                type="object",
+                properties={
+                    "duration_ms": Schema(
+                        type="integer",
+                        description="Duration to wait in milliseconds"
+                    )
+                },
+                required=[]
+            )
+        )
+        
+        # Tool: done
+        done_tool = FunctionDeclaration(
+            name="done",
+            description="""Mark the task as complete. Call this when the task has been successfully completed.""",
+            parameters=Schema(
+                type="object",
+                properties={
+                    "summary": Schema(
+                        type="string",
+                        description="Brief summary of what was accomplished"
+                    )
+                },
+                required=["summary"]
+            )
+        )
+        
+        # Combina tutti i tool
+        tools.append(Tool(function_declarations=[
+            act_tool, click_tool, type_tool, scroll_tool, navigate_tool, wait_tool, done_tool
+        ]))
+        
+        return tools
+    
+    def _build_system_prompt(self, task: str) -> str:
+        """Costruisce il system prompt per il modello"""
+        return f"""You are an AI browser automation agent operating in HYBRID MODE.
+
+You have access to both DOM-based and Vision-based tools:
+
+DOM-BASED TOOLS (preferred when reliable selectors exist):
+- act(selector, instruction, text?): Execute action on element via CSS/XPath selector
+  - Use for: buttons, links, form inputs, elements with clear identifiers
+  - Selectors can be: CSS ('#id', '.class', '[attr=val]'), XPath, or text ('text="Click me"')
+
+VISION-BASED TOOLS (use when DOM approach is unreliable):
+- click(x, y): Click at specific pixel coordinates
+- type(text, x?, y?): Type text, optionally clicking at coordinates first
+- scroll(delta_y): Scroll the page
+  - Use for: canvas elements, SVGs, dynamic content, when selectors fail
+
+CONTROL TOOLS:
+- navigate(url): Go to a URL
+- wait(duration_ms): Wait for page to load
+- done(summary): Mark task as complete
+
+DECISION FRAMEWORK for each action:
+1. Can I identify a reliable DOM selector for this element?
+   - YES → Use act() with the selector
+   - NO → Use click() with coordinates
+
+2. For form inputs:
+   - If input has clear selector → act(selector, "type", text)
+   - If input is hard to select → type(text, x, y)
+
+3. For buttons/links:
+   - Standard HTML with id/class/text → act(selector, "click")
+   - Icon buttons, SVG, canvas → click(x, y)
+
+4. Always provide fallback coordinates in act() when possible
+
+CURRENT TASK: {task}
+
+Analyze the screenshot and accessibility tree carefully.
+Choose the most reliable approach for each action.
+If an action fails, the system will automatically try the fallback."""
+    
+    async def get_next_action(
+        self,
+        task: str,
+        screenshot_bytes: bytes,
+        accessibility_tree: str,
+        current_url: str,
+        previous_actions: List[str] = None
+    ) -> HybridAction:
+        """
+        Chiede al modello la prossima azione da eseguire.
+        
+        Args:
+            task: Descrizione del task
+            screenshot_bytes: Screenshot PNG
+            accessibility_tree: Accessibility tree serializzato
+            current_url: URL corrente
+            previous_actions: Lista delle azioni precedenti
+            
+        Returns:
+            HybridAction da eseguire
+        """
+        # Costruisci il contesto
+        context_parts = [
+            f"CURRENT URL: {current_url}\n",
+            f"ACCESSIBILITY TREE:\n{accessibility_tree}\n"
+        ]
+        
+        if previous_actions:
+            context_parts.append(f"PREVIOUS ACTIONS:\n" + "\n".join(previous_actions[-5:]))
+        
+        context_parts.append(f"\nWhat is the next action to complete the task?")
+        
+        # Costruisci il messaggio
+        user_content = Content(
+            role="user",
+            parts=[
+                Part(text="\n".join(context_parts)),
+                Part.from_bytes(data=screenshot_bytes, mime_type="image/png")
+            ]
+        )
+        
+        # Prima chiamata: includi system prompt
+        if not self.conversation_history:
+            system_content = Content(
+                role="user",
+                parts=[Part(text=self._build_system_prompt(task))]
+            )
+            self.conversation_history.append(system_content)
+            
+            # Risposta fittizia del modello per il system prompt
+            self.conversation_history.append(Content(
+                role="model",
+                parts=[Part(text="I understand. I'll analyze the page and choose the best approach for each action.")]
+            ))
+        
+        self.conversation_history.append(user_content)
+        
+        # Config con tools
+        config = types.GenerateContentConfig(
+            tools=self._build_tools(),
+            temperature=0.1,  # Bassa temperatura per azioni deterministiche
+        )
+        
+        # Chiama il modello
+        response = self.client.models.generate_content(
+            model=GEMINI_HYBRID_MODEL,
+            contents=self.conversation_history,
+            config=config
+        )
+        
+        # Aggiungi risposta alla history
+        if response.candidates:
+            self.conversation_history.append(response.candidates[0].content)
+        
+        # Parsa la risposta
+        return self._parse_response(response)
+    
+    def _parse_response(self, response) -> HybridAction:
+        """Parsa la risposta del modello in un HybridAction"""
+        if not response.candidates:
+            return HybridAction(
+                action_type=ActionType.DONE,
+                reasoning="No response from model"
+            )
+        
+        candidate = response.candidates[0]
+        
+        # Cerca function calls
+        for part in candidate.content.parts:
+            if part.function_call:
+                fc = part.function_call
+                args = dict(fc.args) if fc.args else {}
+                
+                logger.info(f"Model chose: {fc.name}({args})")
+                
+                if fc.name == "act":
+                    return HybridAction(
+                        action_type=ActionType.ACT,
+                        selector=args.get("selector"),
+                        instruction=args.get("instruction", "click"),
+                        text=args.get("text"),
+                        x=args.get("fallback_x"),
+                        y=args.get("fallback_y"),
+                        fallback_available=bool(args.get("fallback_x") and args.get("fallback_y"))
+                    )
+                
+                elif fc.name == "click":
+                    return HybridAction(
+                        action_type=ActionType.CLICK,
+                        x=args.get("x"),
+                        y=args.get("y"),
+                        reasoning=args.get("reasoning")
+                    )
+                
+                elif fc.name == "type":
+                    return HybridAction(
+                        action_type=ActionType.TYPE,
+                        text=args.get("text"),
+                        x=args.get("x"),
+                        y=args.get("y")
+                    )
+                
+                elif fc.name == "scroll":
+                    return HybridAction(
+                        action_type=ActionType.SCROLL,
+                        y=args.get("delta_y", 300),
+                        x=args.get("x"),
+                    )
+                
+                elif fc.name == "navigate":
+                    return HybridAction(
+                        action_type=ActionType.NAVIGATE,
+                        url=args.get("url")
+                    )
+                
+                elif fc.name == "wait":
+                    return HybridAction(
+                        action_type=ActionType.WAIT,
+                        duration=args.get("duration_ms", 1000)
+                    )
+                
+                elif fc.name == "done":
+                    return HybridAction(
+                        action_type=ActionType.DONE,
+                        reasoning=args.get("summary")
+                    )
+        
+        # Se non c'è function call, considera il task completato
+        text_response = ""
+        for part in candidate.content.parts:
+            if part.text:
+                text_response += part.text
+        
+        logger.info(f"Model text response (no tool): {text_response[:200]}")
+        return HybridAction(
+            action_type=ActionType.DONE,
+            reasoning=text_response
+        )
+    
+    def add_action_result(self, action: HybridAction, result: ExecutionResult):
+        """Aggiunge il risultato di un'azione alla conversation history"""
+        result_text = f"Action result: {'SUCCESS' if result.success else 'FAILED'}"
+        if result.error:
+            result_text += f" - Error: {result.error}"
+        if result.fallback_used:
+            result_text += " (fallback coordinates used)"
+        
+        self.conversation_history.append(Content(
+            role="user",
+            parts=[Part(text=result_text)]
+        ))
+    
+    def reset(self):
+        """Reset della conversation history"""
+        self.conversation_history = []
+
+
+# ============================================================================
+# HYBRID BROWSER AGENT
+# ============================================================================
+
+class HybridBrowserAgent:
+    """
+    Agente browser che opera in modalità Hybrid.
+    Coordina il browser, il modello Gemini, e l'esecuzione delle azioni.
     """
     
     def __init__(
         self,
-        screen_size: tuple = (GEMINI_REF_WIDTH, GEMINI_REF_HEIGHT),
-        initial_url: str = "https://www.google.com",
-        search_engine_url: str = "https://www.google.com",
+        api_key: str,
         headless: bool = False,
-        highlight_mouse: bool = False,
-        user_data_dir: Optional[str] = None,
-        keep_open: bool = True,  # Don't close browser after execution
+        profile_dir: Optional[Path] = None
     ):
-        self._initial_url = initial_url
-        self._screen_size = screen_size
-        self._search_engine_url = search_engine_url
-        self._headless = headless
-        self._highlight_mouse = highlight_mouse
-        self._user_data_dir = user_data_dir or str(GEMINI_PROFILE_DIR)
-        self._keep_open = keep_open
-        self._playwright = None
-        self._context = None  # In persistent mode, context IS the browser
-        self._page = None
-
-    def _handle_new_page(self, new_page):
-        """Handle new tabs - redirect to current page"""
-        new_url = new_page.url
-        new_page.close()
-        self._page.goto(new_url)
-
-    def __enter__(self):
-        print("🌐 Creating browser session with Microsoft EDGE...")
-        print(f"   Profile: {self._user_data_dir}")
+        self.api_key = api_key
+        self.headless = headless
+        self.profile_dir = profile_dir or HYBRID_PROFILE_DIR
         
-        self._playwright = sync_playwright().start()
+        self.playwright = None
+        self.browser = None
+        self.context = None
+        self.page = None
         
-        # Use persistent context to maintain login sessions
-        # ANTI-BOT PROTECTION: Hide automation flags
-        # channel="msedge" uses Microsoft Edge instead of Chrome
-        self._context = self._playwright.chromium.launch_persistent_context(
-            user_data_dir=self._user_data_dir,
-            headless=self._headless,
-            channel="msedge",  # Use Edge - allows Chrome to stay open for web app!
-            viewport={"width": self._screen_size[0], "height": self._screen_size[1]},
-            # Anti-bot args
+        self.gemini_client = None
+        self.executor = None
+        self.screenshot_manager = None
+        self.is_running = False
+    
+    async def start(self, initial_url: Optional[str] = None):
+        """Avvia il browser e inizializza i componenti"""
+        if not PLAYWRIGHT_AVAILABLE:
+            raise RuntimeError("Playwright not available")
+        if not GEMINI_AVAILABLE:
+            raise RuntimeError(f"Gemini SDK not available: {GEMINI_IMPORT_ERROR}")
+        
+        logger.info("Starting Hybrid Browser Agent...")
+        logger.info(f"Profile directory: {self.profile_dir}")
+        
+        # Crea profile directory se non esiste
+        self.profile_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Avvia Playwright
+        self.playwright = await async_playwright().start()
+        
+        # Usa Edge con persistent context per evitare conflitti con Chrome
+        self.context = await self.playwright.chromium.launch_persistent_context(
+            user_data_dir=str(self.profile_dir),
+            channel="msedge",
+            headless=self.headless,
+            viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
             args=[
-                "--disable-dev-shm-usage",
-                "--disable-background-networking",
-                "--disable-blink-features=AutomationControlled",  # Hide automation
-                "--disable-infobars",
-                "--no-first-run",
-                "--no-default-browser-check",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--disable-web-security",
             ],
-            # Remove the automation flag that websites detect
             ignore_default_args=["--enable-automation"],
         )
         
-        # Create new page or use existing
-        if self._context.pages:
-            self._page = self._context.pages[0]
-            # For existing page, also evaluate the anti-bot script directly
-            try:
-                self._page.evaluate("""
-                    Object.defineProperty(navigator, 'webdriver', {
-                        get: () => undefined
-                    });
-                """)
-            except:
-                pass  # Page might not be ready yet
+        # Usa la prima pagina o creane una nuova
+        if self.context.pages:
+            self.page = self.context.pages[0]
         else:
-            self._page = self._context.new_page()
+            self.page = await self.context.new_page()
         
-        # ANTI-BOT: Inject script to hide navigator.webdriver
-        # This runs on EVERY navigation (including manual)
-        self._page.add_init_script("""
-            // Hide webdriver property
-            Object.defineProperty(navigator, 'webdriver', {
-                get: () => undefined
-            });
-            
-            // Hide automation-related properties
-            Object.defineProperty(navigator, 'plugins', {
-                get: () => [1, 2, 3, 4, 5]
-            });
-            
-            // Remove automation-related window properties
-            delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
-            delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
-            delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
+        # Anti-detection
+        await self.page.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            window.chrome = { runtime: {} };
         """)
         
-        # Navigate AFTER anti-bot script is set
-        self._page.goto(self._initial_url)
-        self._context.on("page", self._handle_new_page)
+        # Inizializza componenti
+        self.gemini_client = GeminiHybridClient(self.api_key)
+        self.executor = HybridActionExecutor(self.page)
+        self.screenshot_manager = ScreenshotManager(self.page)
         
-        print(f"✅ Playwright browser started at {self._initial_url}")
-        print(f"   🛡️ Anti-bot protection ENABLED")
-        if self._keep_open:
-            print(f"   💡 Browser will stay open after task completes")
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if self._keep_open:
-            # Don't close - browser stays open
-            print("✅ Browser stays open (close manually or via /browser/close)")
-            return
+        # Naviga all'URL iniziale se specificato
+        if initial_url:
+            await self.page.goto(initial_url, wait_until="domcontentloaded")
+            logger.info(f"Navigated to: {initial_url}")
         
-        # Close browser (for tests or when keep_open=False)
-        try:
-            if self._context:
-                self._context.close()
-        except Exception as e:
-            if "Connection closed" not in str(e):
-                raise
-        if self._playwright:
-            self._playwright.stop()
-        print("🔴 Playwright browser closed")
-
-    def screen_size(self) -> tuple:
-        viewport = self._page.viewport_size
-        return (viewport["width"], viewport["height"]) if viewport else self._screen_size
-
-    def current_state(self) -> EnvState:
-        self._page.wait_for_load_state()
-        time.sleep(0.5)
-        screenshot_bytes = self._page.screenshot(type="png", full_page=False)
-        return EnvState(screenshot=screenshot_bytes, url=self._page.url)
-
-    def open_web_browser(self) -> EnvState:
-        return self.current_state()
-
-    def click_at(self, x: int, y: int) -> EnvState:
-        self._highlight_position(x, y)
-        self._page.mouse.click(x, y)
-        self._page.wait_for_load_state()
-        return self.current_state()
-
-    def hover_at(self, x: int, y: int) -> EnvState:
-        self._highlight_position(x, y)
-        self._page.mouse.move(x, y)
-        self._page.wait_for_load_state()
-        return self.current_state()
-
-    def type_text_at(self, x: int, y: int, text: str, press_enter: bool = False, clear_before_typing: bool = True) -> EnvState:
-        self._highlight_position(x, y)
-        self._page.mouse.click(x, y)
-        self._page.wait_for_load_state()
-        if clear_before_typing:
-            self.key_combination(["Control", "A"] if sys.platform != "darwin" else ["Command", "A"])
-            self.key_combination(["Delete"])
-        self._page.keyboard.type(text)
-        self._page.wait_for_load_state()
-        if press_enter:
-            self.key_combination(["Enter"])
-        self._page.wait_for_load_state()
-        return self.current_state()
-
-    def scroll_document(self, direction: str) -> EnvState:
-        if direction == "down":
-            return self.key_combination(["PageDown"])
-        elif direction == "up":
-            return self.key_combination(["PageUp"])
-        elif direction in ("left", "right"):
-            amount = self.screen_size()[0] // 2
-            sign = "-" if direction == "left" else ""
-            self._page.evaluate(f"window.scrollBy({sign}{amount}, 0);")
-            self._page.wait_for_load_state()
-            return self.current_state()
-        raise ValueError(f"Unsupported direction: {direction}")
-
-    def scroll_at(self, x: int, y: int, direction: str, magnitude: int = 800) -> EnvState:
-        self._highlight_position(x, y)
-        self._page.mouse.move(x, y)
-        self._page.wait_for_load_state()
-        dx, dy = 0, 0
-        if direction == "up": dy = -magnitude
-        elif direction == "down": dy = magnitude
-        elif direction == "left": dx = -magnitude
-        elif direction == "right": dx = magnitude
-        self._page.mouse.wheel(dx, dy)
-        self._page.wait_for_load_state()
-        return self.current_state()
-
-    def wait_5_seconds(self) -> EnvState:
-        time.sleep(5)
-        return self.current_state()
-
-    def go_back(self) -> EnvState:
-        self._page.go_back()
-        self._page.wait_for_load_state()
-        return self.current_state()
-
-    def go_forward(self) -> EnvState:
-        self._page.go_forward()
-        self._page.wait_for_load_state()
-        return self.current_state()
-
-    def search(self) -> EnvState:
-        return self.navigate(self._search_engine_url)
-
-    def navigate(self, url: str) -> EnvState:
-        if not url.startswith(("http://", "https://")):
-            url = "https://" + url
-        try:
-            self._page.goto(url, timeout=60000)  # 60 seconds timeout
-            self._page.wait_for_load_state(timeout=30000)
-        except Exception as e:
-            print(f"  ⚠️ Navigation warning: {e}")
-            # Continue anyway - page might be partially loaded
-        return self.current_state()
-
-    def key_combination(self, keys: list) -> EnvState:
-        keys = [PLAYWRIGHT_KEY_MAP.get(k.lower(), k) for k in keys]
-        for key in keys[:-1]:
-            self._page.keyboard.down(key)
-        self._page.keyboard.press(keys[-1])
-        for key in reversed(keys[:-1]):
-            self._page.keyboard.up(key)
-        return self.current_state()
-
-    def drag_and_drop(self, x: int, y: int, destination_x: int, destination_y: int) -> EnvState:
-        self._highlight_position(x, y)
-        self._page.mouse.move(x, y)
-        self._page.wait_for_load_state()
-        self._page.mouse.down()
-        self._page.wait_for_load_state()
-        self._highlight_position(destination_x, destination_y)
-        self._page.mouse.move(destination_x, destination_y)
-        self._page.wait_for_load_state()
-        self._page.mouse.up()
-        return self.current_state()
-
-    def _highlight_position(self, x: int, y: int):
-        if not self._highlight_mouse:
-            return
-        self._page.evaluate(f"""
-        () => {{
-            const div = document.createElement('div');
-            div.style.pointerEvents = 'none';
-            div.style.border = '4px solid red';
-            div.style.borderRadius = '50%';
-            div.style.width = '20px';
-            div.style.height = '20px';
-            div.style.position = 'fixed';
-            div.style.zIndex = '9999';
-            div.style.left = {x} - 10 + 'px';
-            div.style.top = {y} - 10 + 'px';
-            document.body.appendChild(div);
-            setTimeout(() => div.remove(), 2000);
-        }}
-        """)
-        time.sleep(0.5)
-
-# ============================================================================
-# GEMINI BROWSER AGENT (from official Google repo)
-# ============================================================================
-class GeminiBrowserAgent:
-    """Gemini Computer Use Agent using Playwright"""
+        self.is_running = True
+        logger.info("Hybrid Browser Agent started successfully")
     
-    def __init__(self, browser_computer: PlaywrightComputer, api_key: str, task: str, max_steps: int = 15):
-        self._browser = browser_computer
-        self._api_key = api_key
-        self._task = task
-        self._max_steps = max_steps
-        self.final_reasoning: Optional[str] = None
-        self.history = ExecutionHistory(task, "gemini")
+    async def execute_task(
+        self,
+        task: str,
+        max_steps: int = 20,
+        step_callback: Optional[callable] = None
+    ) -> Dict[str, Any]:
+        """
+        Esegue un task completo.
         
-        self.screenshot_dir = DEBUG_SCREENSHOTS_DIR
-        self._client = genai.Client(api_key=api_key)
-        self._contents: List[Content] = [Content(role="user", parts=[Part(text=self._task)])]
-        self._config = GenerateContentConfig(
-            temperature=1, top_p=0.95, top_k=40, max_output_tokens=8192,
-            tools=[types.Tool(computer_use=types.ComputerUse(environment=types.Environment.ENVIRONMENT_BROWSER))]
-        )
-
-    def denormalize_x(self, x: int) -> int:
-        return int(x / 1000 * self._browser.screen_size()[0])
-
-    def denormalize_y(self, y: int) -> int:
-        return int(y / 1000 * self._browser.screen_size()[1])
-
-    def _save_screenshot(self, screenshot_bytes: bytes) -> str:
-        timestamp = datetime.now().strftime("%H%M%S_%f")
-        path = self.screenshot_dir / f"gemini_{timestamp}.png"
-        path.write_bytes(screenshot_bytes)
-        return str(path)
-
-    def handle_action(self, action: types.FunctionCall) -> EnvState:
-        name = action.name
-        args = dict(action.args) if action.args else {}
-        print(f"  → Executing: {name}")
-
-        if name == "open_web_browser":
-            return self._browser.open_web_browser()
-        elif name == "click_at":
-            return self._browser.click_at(self.denormalize_x(args["x"]), self.denormalize_y(args["y"]))
-        elif name == "hover_at":
-            return self._browser.hover_at(self.denormalize_x(args["x"]), self.denormalize_y(args["y"]))
-        elif name == "type_text_at":
-            return self._browser.type_text_at(
-                self.denormalize_x(args["x"]), self.denormalize_y(args["y"]),
-                args["text"], args.get("press_enter", False), args.get("clear_before_typing", True)
-            )
-        elif name == "scroll_document":
-            return self._browser.scroll_document(args["direction"])
-        elif name == "scroll_at":
-            magnitude = args.get("magnitude", 800)
-            direction = args["direction"]
-            if direction in ("up", "down"):
-                magnitude = self.denormalize_y(magnitude)
-            else:
-                magnitude = self.denormalize_x(magnitude)
-            return self._browser.scroll_at(
-                self.denormalize_x(args["x"]), self.denormalize_y(args["y"]), direction, magnitude
-            )
-        elif name == "wait_5_seconds":
-            return self._browser.wait_5_seconds()
-        elif name == "go_back":
-            return self._browser.go_back()
-        elif name == "go_forward":
-            return self._browser.go_forward()
-        elif name == "search":
-            return self._browser.search()
-        elif name == "navigate":
-            return self._browser.navigate(args["url"])
-        elif name == "key_combination":
-            return self._browser.key_combination(args["keys"].split("+"))
-        elif name == "drag_and_drop":
-            return self._browser.drag_and_drop(
-                self.denormalize_x(args["x"]), self.denormalize_y(args["y"]),
-                self.denormalize_x(args["destination_x"]), self.denormalize_y(args["destination_y"])
-            )
-        else:
-            print(f"  ⚠️ Unknown action: {name}")
-            return self._browser.current_state()
-
-    def get_text(self, candidate: Candidate) -> Optional[str]:
-        if not candidate.content or not candidate.content.parts:
-            return None
-        texts = [p.text for p in candidate.content.parts if p.text]
-        return " ".join(texts) or None
-
-    def extract_function_calls(self, candidate: Candidate) -> List[types.FunctionCall]:
-        if not candidate.content or not candidate.content.parts:
-            return []
-        return [p.function_call for p in candidate.content.parts if p.function_call]
-
-    def run_one_iteration(self) -> Literal["COMPLETE", "CONTINUE"]:
-        try:
-            response = self._client.models.generate_content(
-                model=GEMINI_MODEL, contents=self._contents, config=self._config
-            )
-        except Exception as e:
-            print(f"  ❌ Gemini API error: {e}")
-            return "COMPLETE"
-
-        if not response.candidates:
-            print("  ❌ No candidates")
-            return "COMPLETE"
-
-        candidate = response.candidates[0]
-        if candidate.content:
-            self._contents.append(candidate.content)
-
-        reasoning = self.get_text(candidate)
-        function_calls = self.extract_function_calls(candidate)
-
-        if reasoning:
-            print(f"  💭 {reasoning[:150]}...")
-
-        if not function_calls and not reasoning and candidate.finish_reason == FinishReason.MALFORMED_FUNCTION_CALL:
-            return "CONTINUE"
-
-        if not function_calls:
-            print(f"  ✅ Task complete: {reasoning}")
-            self.final_reasoning = reasoning
-            return "COMPLETE"
-
-        function_responses = []
-        for fc in function_calls:
-            extra_fields = {}
-            if fc.args and (safety := fc.args.get("safety_decision")):
-                if safety.get("decision") == "require_confirmation":
-                    print(f"  ⚠️ Safety check: {safety.get('explanation', 'N/A')}")
-                extra_fields["safety_acknowledgement"] = "true"
-
-            env_state = self.handle_action(fc)
-            screenshot_path = self._save_screenshot(env_state.screenshot)
-
-            step = StepRecord(len(self.history.steps) + 1)
-            step.reasoning = reasoning
-            step.actions = [{"type": fc.name, "args": dict(fc.args) if fc.args else {}}]
-            step.screenshot_after = screenshot_path
-            step.success = True
-            self.history.add_step(step)
-
-            function_responses.append(
-                FunctionResponse(
-                    name=fc.name,
-                    response={"url": env_state.url, **extra_fields},
-                    parts=[types.FunctionResponsePart(
-                        inline_data=types.FunctionResponseBlob(mime_type="image/png", data=env_state.screenshot)
-                    )]
-                )
-            )
-
-        self._contents.append(Content(role="user", parts=[Part(function_response=fr) for fr in function_responses]))
-        self._cleanup_old_screenshots()
-        return "CONTINUE"
-
-    def _cleanup_old_screenshots(self):
-        turns_found = 0
-        for content in reversed(self._contents):
-            if content.role == "user" and content.parts:
-                has_screenshot = any(
-                    p.function_response and p.function_response.parts and
-                    p.function_response.name in PREDEFINED_COMPUTER_USE_FUNCTIONS
-                    for p in content.parts
-                )
-                if has_screenshot:
-                    turns_found += 1
-                    if turns_found > MAX_RECENT_TURNS_WITH_SCREENSHOTS:
-                        for p in content.parts:
-                            if (p.function_response and p.function_response.parts and
-                                p.function_response.name in PREDEFINED_COMPUTER_USE_FUNCTIONS):
-                                p.function_response.parts = None
-
-    def run(self) -> tuple:
-        print(f"\n🤖 Starting Gemini Browser Agent")
-        print(f"   Task: {self._task}")
-        print(f"   Max steps: {self._max_steps}")
-
-        initial_state = self._browser.current_state()
-        self._contents[0].parts.append(
-            Part(inline_data=types.Blob(mime_type="image/png", data=initial_state.screenshot))
-        )
-
-        steps = 0
-        status = "CONTINUE"
-        while status == "CONTINUE" and steps < self._max_steps:
-            steps += 1
-            print(f"\n📍 Step {steps}/{self._max_steps}")
-            status = self.run_one_iteration()
-
-        success = self.final_reasoning is not None
-        message = self.final_reasoning or f"Reached max steps ({steps})"
-        return success, message, steps
-
-# ============================================================================
-# LUX EXECUTION (OAGI SDK)
-# ============================================================================
-async def execute_with_lux(
-    api_key: str, task: str, mode: str, max_steps: int,
-    start_url: Optional[str], todos: Optional[List[str]] = None
-) -> ExecuteResponse:
-    """Execute task using OAGI Lux SDK"""
-    
-    if not OAGI_AVAILABLE:
-        return ExecuteResponse(
-            success=False, message="OAGI SDK not available",
-            error=OAGI_IMPORT_ERROR or "oagi package not installed"
-        )
-
-    history = ExecutionHistory(task, mode, todos)
-
-    try:
-        if start_url:
-            webbrowser.open(start_url)
-            await asyncio.sleep(2)
-
-        # Image config for Lux
-        image_config = ImageConfig(format="JPEG", quality=85, width=LUX_REF_WIDTH, height=LUX_REF_HEIGHT)
-        image_provider = AsyncScreenshotMaker(config=image_config)
-        action_handler = AsyncPyautoguiActionHandler()
-
-        if mode == "tasker" and todos:
-            # TaskerAgent mode with todos
-            observer = AsyncAgentObserver() if ASYNC_AGENT_OBSERVER_AVAILABLE else None
+        Args:
+            task: Descrizione del task da eseguire
+            max_steps: Numero massimo di step
+            step_callback: Callback opzionale chiamata ad ogni step
             
-            tasker = TaskerAgent(
-                api_key=api_key,
-                base_url="https://api.agiopen.org",
-                model="lux-actor-1",
-                max_steps=max_steps,
-                temperature=0.0,
-                step_observer=observer,
-            )
-            tasker.set_task(task=task, todos=todos)
+        Returns:
+            Dict con risultati dell'esecuzione
+        """
+        if not self.is_running:
+            raise RuntimeError("Agent not started")
+        
+        logger.info("=" * 60)
+        logger.info(f"HYBRID MODE EXECUTION")
+        logger.info(f"Task: {task}")
+        logger.info(f"Max steps: {max_steps}")
+        logger.info("=" * 60)
+        
+        self.gemini_client.reset()
+        
+        steps: List[StepRecord] = []
+        previous_actions: List[str] = []
+        completed = False
+        
+        for turn in range(1, max_steps + 1):
+            if not self.is_running:
+                logger.warning("Execution stopped by user")
+                break
             
-            success = await tasker.execute(
-                instruction="",
-                action_handler=action_handler,
-                image_provider=image_provider,
-            )
+            logger.info(f"\n{'='*40}")
+            logger.info(f"STEP {turn}/{max_steps}")
+            logger.info(f"{'='*40}")
             
-            history.finish(success, completed_todos=len(todos) if success else 0)
-
-        else:
-            # AsyncActor mode
-            model = "lux-thinker-1" if mode == "thinker" else "lux-actor-1"
+            step = StepRecord(turn=turn)
             
-            actor = AsyncActor(
-                api_key=api_key,
-                base_url="https://api.agiopen.org",
-                model=model,
-                max_steps=max_steps,
-            )
-            
-            step_count = 0
-            async for step in actor.run(
-                instruction=task,
-                action_handler=action_handler,
-                image_provider=image_provider,
-            ):
-                step_count += 1
-                record = StepRecord(step_count)
-                record.reasoning = getattr(step, 'reasoning', None)
-                record.success = True
-                history.add_step(record)
-            
-            history.finish(True)
-
-        report_dir = ANALYSIS_DIR / f"{mode}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        report_path = history.generate_report(report_dir)
-
-        return ExecuteResponse(
-            success=True,
-            message=f"Task completed with {mode}",
-            steps_executed=len(history.steps),
-            report_path=report_path
-        )
-
-    except Exception as e:
-        history.finish(False, str(e))
-        debug_log(f"Lux execution error: {e}", "ERROR")
-        return ExecuteResponse(success=False, message="Execution failed", error=str(e))
-
-# ============================================================================
-# GEMINI EXECUTION (Playwright)
-# ============================================================================
-
-# Global browser instance (kept open between tasks)
-_persistent_browser: Optional[PlaywrightComputer] = None
-
-def _get_or_create_browser(start_url: str, headless: bool, highlight_mouse: bool, user_data_dir: Optional[str]) -> PlaywrightComputer:
-    """Get existing browser or create new one"""
-    global _persistent_browser
-    
-    if _persistent_browser is not None and _persistent_browser._page is not None:
-        try:
-            # Check if browser is still alive
-            _persistent_browser._page.url
-            print("♻️ Reusing existing browser session")
-            
-            # Re-apply anti-bot protection on page reuse
             try:
-                _persistent_browser._page.evaluate("""
-                    Object.defineProperty(navigator, 'webdriver', {
-                        get: () => undefined
-                    });
-                """)
-            except:
-                pass
+                # 1. Cattura screenshot
+                screenshot_bytes, screenshot_b64 = await self.screenshot_manager.capture()
+                step.screenshot_before = screenshot_b64
+                
+                # 2. Estrai accessibility tree
+                a11y_tree = await AccessibilityTreeExtractor.extract(self.page)
+                a11y_serialized = AccessibilityTreeExtractor.serialize_tree(a11y_tree)
+                step.accessibility_tree = a11y_serialized
+                
+                logger.debug(f"Accessibility tree extracted: {len(a11y_serialized)} chars")
+                
+                # 3. Ottieni la prossima azione dal modello
+                current_url = self.page.url
+                action = await self.gemini_client.get_next_action(
+                    task=task,
+                    screenshot_bytes=screenshot_bytes,
+                    accessibility_tree=a11y_serialized,
+                    current_url=current_url,
+                    previous_actions=previous_actions
+                )
+                
+                step.action = action
+                
+                # Log dell'azione scelta
+                if action.action_type == ActionType.ACT:
+                    logger.action("DOM", f"selector='{action.selector}' instruction='{action.instruction}'")
+                elif action.action_type == ActionType.CLICK:
+                    logger.action("VISION", f"click at ({action.x}, {action.y})")
+                elif action.action_type == ActionType.TYPE:
+                    logger.action("TYPE", f"text='{action.text[:30]}...' at ({action.x}, {action.y})")
+                elif action.action_type == ActionType.DONE:
+                    logger.info(f"✅ Task completed: {action.reasoning}")
+                    completed = True
+                else:
+                    logger.action(action.action_type.value.upper(), str(action))
+                
+                # 4. Esegui l'azione
+                if action.action_type == ActionType.DONE:
+                    step.result = ExecutionResult(success=True, action=action)
+                    steps.append(step)
+                    break
+                
+                result = await self.executor.execute(action)
+                step.result = result
+                
+                # 5. Aggiungi risultato alla history
+                action_desc = f"{action.action_type.value}"
+                if action.selector:
+                    action_desc += f"(selector='{action.selector}')"
+                elif action.x is not None:
+                    action_desc += f"(x={action.x}, y={action.y})"
+                action_desc += f" -> {'OK' if result.success else 'FAILED'}"
+                if result.fallback_used:
+                    action_desc += " [fallback]"
+                previous_actions.append(action_desc)
+                
+                self.gemini_client.add_action_result(action, result)
+                
+                # Log risultato
+                if result.success:
+                    logger.info(f"✓ Action succeeded" + (" (fallback used)" if result.fallback_used else ""))
+                else:
+                    logger.error(f"✗ Action failed: {result.error}")
+                
+                # Breve pausa tra le azioni
+                await asyncio.sleep(0.3)
+                
+            except Exception as e:
+                logger.error(f"Step {turn} failed with exception: {e}")
+                step.result = ExecutionResult(
+                    success=False,
+                    action=step.action or HybridAction(action_type=ActionType.WAIT),
+                    error=str(e)
+                )
             
-            # Navigate to start URL if different
-            if start_url and _persistent_browser._page.url != start_url:
-                _persistent_browser.navigate(start_url)
-            return _persistent_browser
-        except:
-            print("⚠️ Previous browser session died, creating new one")
-            _persistent_browser = None
+            steps.append(step)
+            
+            if step_callback:
+                await step_callback(step)
+        
+        # Compila risultati
+        successful_steps = sum(1 for s in steps if s.result and s.result.success)
+        failed_steps = sum(1 for s in steps if s.result and not s.result.success)
+        fallback_used = sum(1 for s in steps if s.result and s.result.fallback_used)
+        
+        dom_actions = sum(1 for s in steps if s.action and s.action.action_type == ActionType.ACT)
+        vision_actions = sum(1 for s in steps if s.action and s.action.action_type in [ActionType.CLICK, ActionType.TYPE])
+        
+        return {
+            "success": completed,
+            "task": task,
+            "total_steps": len(steps),
+            "successful_steps": successful_steps,
+            "failed_steps": failed_steps,
+            "fallback_used": fallback_used,
+            "dom_actions": dom_actions,
+            "vision_actions": vision_actions,
+            "final_url": self.page.url,
+            "steps": [
+                {
+                    "turn": s.turn,
+                    "action_type": s.action.action_type.value if s.action else None,
+                    "success": s.result.success if s.result else None,
+                    "fallback": s.result.fallback_used if s.result else False,
+                    "error": s.result.error if s.result else None
+                }
+                for s in steps
+            ]
+        }
     
-    # Create new browser
-    computer = PlaywrightComputer(
-        screen_size=(GEMINI_REF_WIDTH, GEMINI_REF_HEIGHT),
-        initial_url=start_url,
-        headless=headless,
-        highlight_mouse=highlight_mouse,
-        user_data_dir=user_data_dir,
-        keep_open=True,
-    )
-    computer.__enter__()
-    _persistent_browser = computer
-    return computer
-
-def _close_browser():
-    """Manually close the persistent browser"""
-    global _persistent_browser
-    if _persistent_browser is not None:
-        try:
-            if _persistent_browser._context:
-                _persistent_browser._context.close()
-            if _persistent_browser._playwright:
-                _persistent_browser._playwright.stop()
-            print("🔴 Browser closed")
-        except:
-            pass
-        _persistent_browser = None
-
-def _run_gemini_sync(api_key: str, task: str, max_steps: int, start_url: str, headless: bool, highlight_mouse: bool, user_data_dir: Optional[str] = None) -> ExecuteResponse:
-    """Run Gemini agent synchronously"""
-    try:
-        browser = _get_or_create_browser(start_url, headless, highlight_mouse, user_data_dir)
+    async def stop(self):
+        """Ferma l'agente e chiude il browser"""
+        self.is_running = False
         
-        agent = GeminiBrowserAgent(browser_computer=browser, api_key=api_key, task=task, max_steps=max_steps)
-        success, message, steps = agent.run()
+        if self.context:
+            await self.context.close()
+        if self.playwright:
+            await self.playwright.stop()
         
-        agent.history.finish(success, None if success else message)
-        report_dir = ANALYSIS_DIR / f"gemini_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        report_path = agent.history.generate_report(report_dir)
-        
-        print("✅ Task complete - browser stays open for next task or manual use")
-        
-        return ExecuteResponse(
-            success=success, message=message, steps_executed=steps,
-            final_url=browser._page.url if browser._page else None,
-            report_path=report_path
-        )
-    except Exception as e:
-        print(f"❌ Gemini error: {e}")
-        # Don't close browser on error - let user see what happened
-        return ExecuteResponse(
-            success=False, message=str(e), steps_executed=0,
-            error=str(e)
-        )
-
-async def execute_with_gemini(api_key: str, task: str, max_steps: int, start_url: Optional[str], headless: bool = False, highlight_mouse: bool = False, user_data_dir: Optional[str] = None) -> ExecuteResponse:
-    """Execute task using Gemini + Playwright"""
-    if not GEMINI_AVAILABLE:
-        return ExecuteResponse(success=False, message="Gemini SDK not available", error="google-genai not installed")
-    if not PLAYWRIGHT_AVAILABLE:
-        return ExecuteResponse(success=False, message="Playwright not available", error="Run: pip install playwright && playwright install chromium")
+        logger.info("Hybrid Browser Agent stopped")
     
-    url = start_url or "https://www.google.com"
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(executor, _run_gemini_sync, api_key, task, max_steps, url, headless, highlight_mouse, user_data_dir)
+    def request_stop(self):
+        """Richiede lo stop dell'esecuzione corrente"""
+        self.is_running = False
+
 
 # ============================================================================
-# FASTAPI APPLICATION
+# FASTAPI SERVICE
 # ============================================================================
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    print("\n" + "="*60)
-    print(f"🚀 TASKER SERVICE v{SERVICE_VERSION}")
-    print("="*60)
-    print(f"OAGI SDK:    {'✅ Available' if OAGI_AVAILABLE else '❌ Not available'}")
-    print(f"Gemini SDK:  {'✅ Available' if GEMINI_AVAILABLE else '❌ Not available'}")
-    print(f"Playwright:  {'✅ Available' if PLAYWRIGHT_AVAILABLE else '❌ Not available'}")
-    print("\nSUPPORTED MODES:")
-    if OAGI_AVAILABLE:
-        print("  • actor   - Lux AsyncActor (PyAutoGUI)")
-        print("  • thinker - Lux AsyncActor (PyAutoGUI)")
-        print("  • tasker  - Lux TaskerAgent (PyAutoGUI)")
-    if GEMINI_AVAILABLE and PLAYWRIGHT_AVAILABLE:
-        print("  • gemini  - Google Gemini Computer Use (Playwright)")
-    print("="*60 + "\n")
-    yield
-    executor.shutdown(wait=False)
-    print("Shutting down...")
 
-app = FastAPI(title="Tasker Service", version=SERVICE_VERSION, lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app = FastAPI(
+    title="Hybrid Browser Agent Service",
+    description="Browser automation with Hybrid Mode (DOM + Vision)",
+    version="7.0.0"
+)
 
-@app.get("/status", response_model=StatusResponse)
-async def get_status():
-    modes = []
-    if OAGI_AVAILABLE:
-        modes.extend(["actor", "thinker", "tasker"])
-    if GEMINI_AVAILABLE and PLAYWRIGHT_AVAILABLE:
-        modes.append("gemini")
-    return StatusResponse(
-        status="running", version=SERVICE_VERSION,
-        oagi_available=OAGI_AVAILABLE, gemini_available=GEMINI_AVAILABLE,
-        playwright_available=PLAYWRIGHT_AVAILABLE, modes=modes
-    )
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Global agent instance
+agent: Optional[HybridBrowserAgent] = None
+
+
+class ExecuteRequest(BaseModel):
+    """Request per esecuzione task"""
+    api_key: str
+    task_description: str
+    initial_url: Optional[str] = None
+    max_steps: int = 20
+    headless: bool = False
+    mode: str = "hybrid"  # "hybrid" o "cua" per retrocompatibilità
+
+
+class ExecuteResponse(BaseModel):
+    """Response dell'esecuzione"""
+    success: bool
+    task: str
+    total_steps: int
+    successful_steps: int
+    failed_steps: int
+    fallback_used: int
+    dom_actions: int
+    vision_actions: int
+    final_url: str
+    steps: List[Dict[str, Any]]
+    message: Optional[str] = None
+
+
+@app.get("/")
+async def root():
+    """Health check"""
+    return {
+        "service": "Hybrid Browser Agent",
+        "version": "7.0.0",
+        "status": "running",
+        "mode": "hybrid",
+        "models": {
+            "hybrid": GEMINI_HYBRID_MODEL,
+            "cua": GEMINI_CUA_MODEL
+        },
+        "features": {
+            "dom_actions": True,
+            "vision_actions": True,
+            "self_healing": True,
+            "persistent_context": True
+        }
+    }
+
+
+@app.get("/status")
+async def status():
+    """Stato dell'agente"""
+    return {
+        "agent_active": agent is not None and agent.is_running,
+        "playwright_available": PLAYWRIGHT_AVAILABLE,
+        "gemini_available": GEMINI_AVAILABLE,
+        "profile_dir": str(HYBRID_PROFILE_DIR)
+    }
+
 
 @app.post("/execute", response_model=ExecuteResponse)
 async def execute_task(request: ExecuteRequest):
-    debug_log(f"Received task: {request.task_description[:100]}...")
-    debug_log(f"Mode: {request.mode}")
+    """
+    Esegue un task in modalità Hybrid.
     
-    if request.mode == "gemini":
-        if not GEMINI_AVAILABLE:
-            raise HTTPException(status_code=400, detail="Gemini SDK not available")
-        if not PLAYWRIGHT_AVAILABLE:
-            raise HTTPException(status_code=400, detail="Playwright not available")
-        return await execute_with_gemini(
-            request.api_key, request.task_description, request.max_steps_per_todo,
-            request.start_url, request.headless, request.highlight_mouse, request.user_data_dir
-        )
-    elif request.mode in ["actor", "thinker", "tasker"]:
-        if not OAGI_AVAILABLE:
-            raise HTTPException(status_code=400, detail="OAGI SDK not available")
-        return await execute_with_lux(
-            request.api_key, request.task_description, request.mode,
-            request.max_steps_per_todo, request.start_url, request.todos
-        )
-    else:
-        raise HTTPException(status_code=400, detail=f"Unknown mode: {request.mode}")
-
-@app.post("/debug/test_gemini")
-async def test_gemini(api_key: str = Query(...)):
-    if not GEMINI_AVAILABLE:
-        return {"success": False, "error": "Gemini SDK not installed"}
-    try:
-        client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(model="gemini-2.0-flash", contents="Say 'Gemini ready!'")
-        return {"success": True, "response": response.text, "computer_use_model": GEMINI_MODEL, "playwright_available": PLAYWRIGHT_AVAILABLE}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-@app.post("/debug/test_playwright")
-async def test_playwright():
+    Il modello Gemini 3 Flash analizzerà la pagina e sceglierà
+    automaticamente tra azioni DOM-based e Vision-based.
+    """
+    global agent
+    
     if not PLAYWRIGHT_AVAILABLE:
-        return {"success": False, "error": "Playwright not installed"}
+        raise HTTPException(status_code=500, detail="Playwright not available")
+    if not GEMINI_AVAILABLE:
+        raise HTTPException(status_code=500, detail=f"Gemini SDK not available: {GEMINI_IMPORT_ERROR}")
+    
     try:
-        def _test():
-            with PlaywrightComputer(headless=True, keep_open=False) as browser:
-                state = browser.current_state()
-                return {"url": state.url, "screenshot_size": len(state.screenshot)}
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(executor, _test)
-        return {"success": True, **result}
+        # Crea nuovo agente
+        agent = HybridBrowserAgent(
+            api_key=request.api_key,
+            headless=request.headless
+        )
+        
+        # Avvia
+        await agent.start(initial_url=request.initial_url)
+        
+        # Esegui task
+        result = await agent.execute_task(
+            task=request.task_description,
+            max_steps=request.max_steps
+        )
+        
+        return ExecuteResponse(
+            success=result["success"],
+            task=result["task"],
+            total_steps=result["total_steps"],
+            successful_steps=result["successful_steps"],
+            failed_steps=result["failed_steps"],
+            fallback_used=result["fallback_used"],
+            dom_actions=result["dom_actions"],
+            vision_actions=result["vision_actions"],
+            final_url=result["final_url"],
+            steps=result["steps"],
+            message="Task completed successfully" if result["success"] else "Task did not complete"
+        )
+        
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        logger.error(f"Execution failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    
+    finally:
+        if agent:
+            await agent.stop()
+            agent = None
 
-@app.post("/browser/close")
-async def close_browser():
-    """Manually close the persistent Gemini browser"""
-    try:
-        def _close():
-            _close_browser()
-            return {"closed": True}
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(executor, _close)
-        return {"success": True, **result}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
 
-@app.get("/browser/status")
-async def browser_status():
-    """Check if persistent browser is open"""
-    global _persistent_browser
-    is_open = _persistent_browser is not None
-    url = None
-    if is_open:
-        try:
-            url = _persistent_browser._page.url
-        except:
-            is_open = False
-    return {
-        "browser_open": is_open,
-        "current_url": url,
-        "profile_dir": str(GEMINI_PROFILE_DIR)
-    }
+@app.post("/stop")
+async def stop_execution():
+    """Ferma l'esecuzione corrente"""
+    global agent
+    
+    if agent:
+        agent.request_stop()
+        return {"status": "stop requested"}
+    
+    return {"status": "no active agent"}
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=SERVICE_PORT)
+    import uvicorn
+    
+    print("=" * 60)
+    print("HYBRID BROWSER AGENT SERVICE v7.0")
+    print("=" * 60)
+    print(f"Playwright available: {PLAYWRIGHT_AVAILABLE}")
+    print(f"Gemini SDK available: {GEMINI_AVAILABLE}")
+    print(f"Hybrid model: {GEMINI_HYBRID_MODEL}")
+    print(f"CUA model: {GEMINI_CUA_MODEL}")
+    print(f"Profile directory: {HYBRID_PROFILE_DIR}")
+    print("=" * 60)
+    
+    uvicorn.run(app, host="0.0.0.0", port=8765)
