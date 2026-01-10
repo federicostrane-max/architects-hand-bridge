@@ -1,9 +1,15 @@
 """
-Tasker Service v6.0.4 - Multi-provider Computer Use
+Tasker Service v6.0.5 - Multi-provider Computer Use
 ====================================================
 Supports:
 - Lux (actor/thinker/tasker) via OAGI SDK + PyAutoGUI
 - Gemini Computer Use via Playwright (official Google implementation)
+
+v6.0.5 Changes:
+- Added ANTI-BOT PROTECTION for Playwright browser
+- Hides automation flags (navigator.webdriver)
+- Removes --enable-automation flag
+- Sites like webmail.register.it now load properly
 
 v6.0.4 Changes:
 - Browser stays OPEN after task completion (no more auto-close!)
@@ -141,7 +147,7 @@ except ImportError:
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-SERVICE_VERSION = "6.0.4"
+SERVICE_VERSION = "6.0.5"
 SERVICE_PORT = 8765
 DEBUG_LOGS_DIR = Path("debug_logs")
 ANALYSIS_DIR = Path("lux_analysis")
@@ -470,26 +476,64 @@ class PlaywrightComputer:
         self._playwright = sync_playwright().start()
         
         # Use persistent context to maintain login sessions
+        # ANTI-BOT PROTECTION: Hide automation flags
         self._context = self._playwright.chromium.launch_persistent_context(
             user_data_dir=self._user_data_dir,
             headless=self._headless,
             viewport={"width": self._screen_size[0], "height": self._screen_size[1]},
+            # Anti-bot args
             args=[
                 "--disable-dev-shm-usage",
                 "--disable-background-networking",
+                "--disable-blink-features=AutomationControlled",  # Hide automation
+                "--disable-infobars",
+                "--no-first-run",
+                "--no-default-browser-check",
             ],
+            # Remove the automation flag that websites detect
+            ignore_default_args=["--enable-automation"],
         )
         
         # Create new page or use existing
         if self._context.pages:
             self._page = self._context.pages[0]
+            # For existing page, also evaluate the anti-bot script directly
+            try:
+                self._page.evaluate("""
+                    Object.defineProperty(navigator, 'webdriver', {
+                        get: () => undefined
+                    });
+                """)
+            except:
+                pass  # Page might not be ready yet
         else:
             self._page = self._context.new_page()
+        
+        # ANTI-BOT: Inject script to hide navigator.webdriver
+        # This runs on EVERY navigation (including manual)
+        self._page.add_init_script("""
+            // Hide webdriver property
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => undefined
+            });
             
+            // Hide automation-related properties
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => [1, 2, 3, 4, 5]
+            });
+            
+            // Remove automation-related window properties
+            delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
+            delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
+            delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
+        """)
+        
+        # Navigate AFTER anti-bot script is set
         self._page.goto(self._initial_url)
         self._context.on("page", self._handle_new_page)
         
         print(f"✅ Playwright browser started at {self._initial_url}")
+        print(f"   🛡️ Anti-bot protection ENABLED")
         if self._keep_open:
             print(f"   💡 Browser will stay open after task completes")
         return self
@@ -946,6 +990,17 @@ def _get_or_create_browser(start_url: str, headless: bool, highlight_mouse: bool
             # Check if browser is still alive
             _persistent_browser._page.url
             print("♻️ Reusing existing browser session")
+            
+            # Re-apply anti-bot protection on page reuse
+            try:
+                _persistent_browser._page.evaluate("""
+                    Object.defineProperty(navigator, 'webdriver', {
+                        get: () => undefined
+                    });
+                """)
+            except:
+                pass
+            
             # Navigate to start URL if different
             if start_url and _persistent_browser._page.url != start_url:
                 _persistent_browser.navigate(start_url)
