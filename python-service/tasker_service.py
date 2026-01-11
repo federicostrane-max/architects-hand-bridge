@@ -46,7 +46,7 @@ from pydantic import BaseModel, Field
 # CONFIGURATION
 # ============================================================================
 
-SERVICE_VERSION = "7.1.2"
+SERVICE_VERSION = "7.1.3"
 SERVICE_PORT = 8765
 
 # Lux reference resolution (il modello è stato trainato su questa risoluzione)
@@ -123,45 +123,28 @@ except ImportError:
     PYPERCLIP_AVAILABLE = False
     logger.log("⚠️ Pyperclip non disponibile", "WARNING")
 
-# OpenAGI Lux SDK
+# OpenAGI Lux SDK (oagi)
 OAGI_AVAILABLE = False
 ASYNC_ACTOR_AVAILABLE = False
 TASKER_AGENT_AVAILABLE = False
 ASYNC_AGENT_OBSERVER_AVAILABLE = False
 
 try:
-    from oagi.lux import AsyncActor
+    from oagi import (
+        AsyncActor,
+        TaskerAgent,
+        AsyncAgentObserver,
+        AsyncScreenshotMaker,
+        AsyncPyautoguiActionHandler,
+        PyautoguiConfig
+    )
     ASYNC_ACTOR_AVAILABLE = True
-    logger.log("✅ AsyncActor disponibile")
-except ImportError:
-    try:
-        from oagi import AsyncActor
-        ASYNC_ACTOR_AVAILABLE = True
-        logger.log("✅ AsyncActor disponibile (import alternativo)")
-    except ImportError:
-        logger.log("⚠️ AsyncActor non disponibile", "WARNING")
-
-try:
-    from oagi.core.agent import TaskerAgent
     TASKER_AGENT_AVAILABLE = True
-    logger.log("✅ TaskerAgent disponibile")
-except ImportError:
-    logger.log("⚠️ TaskerAgent non disponibile", "WARNING")
-
-try:
-    from oagi.core.observer import AsyncAgentObserver
     ASYNC_AGENT_OBSERVER_AVAILABLE = True
-    logger.log("✅ AsyncAgentObserver disponibile")
-except ImportError:
-    logger.log("⚠️ AsyncAgentObserver non disponibile", "WARNING")
-
-try:
-    from oagi.handlers.screenshot_async import AsyncScreenshotMaker
-    from oagi.handlers.pyautogui_async import AsyncPyautoguiActionHandler, PyautoguiConfig
-    OAGI_AVAILABLE = ASYNC_ACTOR_AVAILABLE or TASKER_AGENT_AVAILABLE
-    logger.log("✅ OAGI handlers disponibili")
-except ImportError:
-    logger.log("⚠️ OAGI handlers non disponibili", "WARNING")
+    OAGI_AVAILABLE = True
+    logger.log("✅ OAGI SDK completo (AsyncActor, TaskerAgent, handlers)")
+except ImportError as e:
+    logger.log(f"⚠️ OAGI SDK non disponibile: {e}", "WARNING")
 
 # Google GenAI (google-genai, NOT google-generativeai)
 try:
