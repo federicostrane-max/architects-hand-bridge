@@ -46,7 +46,7 @@ from pydantic import BaseModel, Field
 # CONFIGURATION
 # ============================================================================
 
-SERVICE_VERSION = "7.1.4"
+SERVICE_VERSION = "7.1.5"
 SERVICE_PORT = 8765
 
 # Lux reference resolution (il modello è stato trainato su questa risoluzione)
@@ -174,11 +174,11 @@ class TaskRequest(BaseModel):
     """Request per esecuzione task"""
     task_description: str
     start_url: Optional[str] = None
-    mode: Literal["actor", "thinker", "tasker", "gemini_cua", "gemini_hybrid"] = "actor"
+    mode: Literal["actor", "thinker", "tasker", "gemini", "gemini_cua", "gemini_hybrid"] = "actor"
     
     # API Keys (passate dalla web app)
-    api_key: Optional[str] = None  # OAGI API key per Lux
-    gemini_api_key: Optional[str] = None  # Gemini API key
+    api_key: Optional[str] = None  # OAGI API key per Lux, oppure Gemini API key se mode=gemini
+    gemini_api_key: Optional[str] = None  # Gemini API key (alternativa)
     
     # Lux settings
     model: str = "lux-actor-1"
@@ -198,6 +198,7 @@ class TaskRequest(BaseModel):
     
     # Gemini settings
     headless: bool = False
+    highlight_mouse: bool = False
 
 
 class TaskResponse(BaseModel):
@@ -713,7 +714,7 @@ class HybridModeExecutor:
                 self.client = genai.Client(api_key=key)
                 logger.log(f"✅ Gemini Client configurato per: {GEMINI_HYBRID_MODEL}")
             else:
-                raise ValueError("GEMINI_API_KEY non configurata (passa gemini_api_key nella request o setta env var)")
+                raise ValueError("Gemini API key non configurata")
     
     async def start_browser(self, start_url: Optional[str] = None):
         """Avvia browser Edge con profilo persistente"""
@@ -1066,7 +1067,7 @@ async def execute_with_gemini_cua(request: TaskRequest) -> TaskResponse:
     """Esegue task con Gemini CUA (solo vision)"""
     logger.clear()
     logger.log("=" * 60)
-    logger.log("GEMINI CUA MODE - v7.1.3")
+    logger.log("GEMINI CUA MODE - v7.1.4")
     logger.log("=" * 60)
     
     if not GEMINI_AVAILABLE or not PLAYWRIGHT_AVAILABLE:
@@ -1076,14 +1077,17 @@ async def execute_with_gemini_cua(request: TaskRequest) -> TaskResponse:
             mode_used="gemini_cua"
         )
     
-    # Usa api_key dalla request o fallback a env var
-    api_key = request.gemini_api_key or os.getenv("GEMINI_API_KEY")
+    # Usa gemini_api_key o api_key come fallback (retrocompatibilità)
+    api_key = request.gemini_api_key or request.api_key or os.getenv("GEMINI_API_KEY")
     if not api_key:
         return TaskResponse(
             success=False,
-            error="GEMINI_API_KEY non configurata (passa gemini_api_key nella request o setta env var)",
+            error="Gemini API key non configurata",
             mode_used="gemini_cua"
         )
+    
+    # Usa max_steps_per_todo come fallback per max_steps
+    max_steps = request.max_steps if request.max_steps != 30 else request.max_steps_per_todo
     
     client = genai.Client(api_key=api_key)
     actions_log = []
@@ -1106,8 +1110,8 @@ async def execute_with_gemini_cua(request: TaskRequest) -> TaskResponse:
             await page.goto(request.start_url, wait_until="domcontentloaded", timeout=30000)
             await asyncio.sleep(1)
         
-        for step in range(1, request.max_steps + 1):
-            logger.log(f"\n--- Step {step}/{request.max_steps} ---")
+        for step in range(1, max_steps + 1):
+            logger.log(f"\n--- Step {step}/{max_steps} ---")
             
             screenshot_bytes = await page.screenshot(type="png")
             
@@ -1202,8 +1206,8 @@ Viewport: {VIEWPORT_WIDTH}x{VIEWPORT_HEIGHT}"""
         
         return TaskResponse(
             success=False,
-            error=f"Max steps ({request.max_steps}) raggiunto",
-            steps_executed=request.max_steps,
+            error=f"Max steps ({max_steps}) raggiunto",
+            steps_executed=max_steps,
             mode_used="gemini_cua",
             actions_log=actions_log,
             logs=logger.get_logs()
@@ -1311,18 +1315,26 @@ async def execute_task(request: TaskRequest):
     is_running = True
     
     try:
+        # Lux modes
         if request.mode in ["actor", "thinker"]:
             return await execute_with_actor(request)
         
         elif request.mode == "tasker":
             return await execute_with_tasker(request)
         
+        # Gemini modes
         elif request.mode == "gemini_cua":
             return await execute_with_gemini_cua(request)
         
-        elif request.mode == "gemini_hybrid":
-            executor = HybridModeExecutor(headless=request.headless, api_key=request.gemini_api_key)
-            return await executor.run(request.task_description, request.start_url, request.max_steps)
+        elif request.mode in ["gemini", "gemini_hybrid"]:
+            # 'gemini' è alias per 'gemini_hybrid' (retrocompatibilità)
+            # Usa api_key come fallback per gemini_api_key (il client passa api_key)
+            gemini_key = request.gemini_api_key or request.api_key
+            # Usa max_steps_per_todo come fallback per max_steps (il client passa max_steps_per_todo)
+            max_steps = request.max_steps if request.max_steps != 30 else request.max_steps_per_todo
+            
+            executor = HybridModeExecutor(headless=request.headless, api_key=gemini_key)
+            return await executor.run(request.task_description, request.start_url, max_steps)
         
         else:
             raise HTTPException(status_code=400, detail=f"Mode sconosciuto: {request.mode}")
