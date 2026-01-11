@@ -46,7 +46,7 @@ from pydantic import BaseModel, Field
 # CONFIGURATION
 # ============================================================================
 
-SERVICE_VERSION = "7.1.9"
+SERVICE_VERSION = "7.2.0"
 SERVICE_PORT = 8765
 
 # Lux reference resolution (il modello è stato trainato su questa risoluzione)
@@ -844,7 +844,7 @@ STRUMENTI:
 Preferisci act_dom quando possibile. Coordinate: viewport {VIEWPORT_WIDTH}x{VIEWPORT_HEIGHT}.
 Rispondi SOLO con il JSON:"""
     
-    async def analyze_and_decide(self, task: str, step: int) -> HybridAction:
+    async def analyze_and_decide(self, task: str, step: int, retry_count: int = 0) -> HybridAction:
         screenshot_b64 = await self.capture_screenshot()
         a11y_tree = await self.get_accessibility_tree()
         current_url = self.page.url
@@ -877,15 +877,67 @@ Rispondi SOLO con il JSON:"""
             
             response_text = response.text.strip()
             
+            # Estrai JSON dalla risposta
             if "```" in response_text:
-                response_text = response_text.split("```")[1].replace("json", "").strip()
+                # Trova il blocco di codice
+                parts = response_text.split("```")
+                for part in parts:
+                    part = part.replace("json", "").strip()
+                    if part.startswith("{"):
+                        response_text = part
+                        break
             
-            action_data = json.loads(response_text)
-            return self._parse_action(action_data)
+            # Prova a riparare JSON comuni errori
+            response_text = self._try_fix_json(response_text)
+            
+            try:
+                action_data = json.loads(response_text)
+                return self._parse_action(action_data)
+            except json.JSONDecodeError as json_err:
+                logger.log(f"⚠️ JSON malformato: {json_err}", "WARNING")
+                logger.log(f"⚠️ Risposta: {response_text[:200]}...", "WARNING")
+                
+                # Retry fino a 2 volte
+                if retry_count < 2:
+                    logger.log(f"🔄 Retry {retry_count + 1}/2...", "INFO")
+                    await asyncio.sleep(0.5)
+                    return await self.analyze_and_decide(task, step, retry_count + 1)
+                
+                # Dopo 2 retry, ritorna WAIT invece di FAIL
+                logger.log("⏳ Troppi errori JSON, aspetto e continuo...", "WARNING")
+                return HybridAction(action_type=ActionType.WAIT, reasoning="Errore parsing, attendo")
             
         except Exception as e:
             logger.log(f"❌ Errore Gemini: {e}", "ERROR")
+            
+            # Retry per errori di rete
+            if retry_count < 2:
+                logger.log(f"🔄 Retry {retry_count + 1}/2...", "INFO")
+                await asyncio.sleep(1)
+                return await self.analyze_and_decide(task, step, retry_count + 1)
+            
             return HybridAction(action_type=ActionType.FAIL, reasoning=str(e))
+    
+    def _try_fix_json(self, text: str) -> str:
+        """Prova a riparare JSON comuni errori"""
+        text = text.strip()
+        
+        # Rimuovi caratteri prima di {
+        if "{" in text:
+            text = text[text.index("{"):]
+        
+        # Rimuovi caratteri dopo l'ultima }
+        if "}" in text:
+            text = text[:text.rindex("}") + 1]
+        
+        # Fix virgolette non chiuse alla fine
+        # Count quotes
+        quote_count = text.count('"')
+        if quote_count % 2 != 0:
+            # Aggiungi virgoletta mancante prima dell'ultima }
+            text = text[:-1] + '"}'
+        
+        return text
     
     def _parse_action(self, data: dict) -> HybridAction:
         action_map = {
@@ -1051,7 +1103,7 @@ Rispondi SOLO con il JSON:"""
         self.actions_log = []
         logger.clear()
         logger.log("=" * 60)
-        logger.log("GEMINI HYBRID MODE - v7.1.8")
+        logger.log(f"GEMINI HYBRID MODE - v{SERVICE_VERSION}")
         logger.log("=" * 60)
         logger.log(f"Task: {task[:80]}...")
         logger.log(f"Reuse browser: {self.is_browser_open()} | New tab: {new_tab}")
@@ -1110,7 +1162,7 @@ async def execute_with_gemini_cua(request: TaskRequest) -> TaskResponse:
     """Esegue task con Gemini CUA (solo vision)"""
     logger.clear()
     logger.log("=" * 60)
-    logger.log("GEMINI CUA MODE - v7.1.4")
+    logger.log(f"GEMINI CUA MODE - v{SERVICE_VERSION}")
     logger.log("=" * 60)
     
     if not GEMINI_AVAILABLE or not PLAYWRIGHT_AVAILABLE:
