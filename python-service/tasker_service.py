@@ -46,7 +46,7 @@ from pydantic import BaseModel, Field
 # CONFIGURATION
 # ============================================================================
 
-SERVICE_VERSION = "7.1.0"
+SERVICE_VERSION = "7.1.2"
 SERVICE_PORT = 8765
 
 # Lux reference resolution (il modello è stato trainato su questa risoluzione)
@@ -130,47 +130,49 @@ TASKER_AGENT_AVAILABLE = False
 ASYNC_AGENT_OBSERVER_AVAILABLE = False
 
 try:
-    from openagi.lux import AsyncActor
+    from oagi.lux import AsyncActor
     ASYNC_ACTOR_AVAILABLE = True
     logger.log("✅ AsyncActor disponibile")
 except ImportError:
     try:
-        from openagi import AsyncActor
+        from oagi import AsyncActor
         ASYNC_ACTOR_AVAILABLE = True
         logger.log("✅ AsyncActor disponibile (import alternativo)")
     except ImportError:
         logger.log("⚠️ AsyncActor non disponibile", "WARNING")
 
 try:
-    from openagi.core.agent import TaskerAgent
+    from oagi.core.agent import TaskerAgent
     TASKER_AGENT_AVAILABLE = True
     logger.log("✅ TaskerAgent disponibile")
 except ImportError:
     logger.log("⚠️ TaskerAgent non disponibile", "WARNING")
 
 try:
-    from openagi.core.observer import AsyncAgentObserver
+    from oagi.core.observer import AsyncAgentObserver
     ASYNC_AGENT_OBSERVER_AVAILABLE = True
     logger.log("✅ AsyncAgentObserver disponibile")
 except ImportError:
     logger.log("⚠️ AsyncAgentObserver non disponibile", "WARNING")
 
 try:
-    from openagi.handlers.screenshot_async import AsyncScreenshotMaker
-    from openagi.handlers.pyautogui_async import AsyncPyautoguiActionHandler, PyautoguiConfig
+    from oagi.handlers.screenshot_async import AsyncScreenshotMaker
+    from oagi.handlers.pyautogui_async import AsyncPyautoguiActionHandler, PyautoguiConfig
     OAGI_AVAILABLE = ASYNC_ACTOR_AVAILABLE or TASKER_AGENT_AVAILABLE
-    logger.log("✅ OpenAGI handlers disponibili")
+    logger.log("✅ OAGI handlers disponibili")
 except ImportError:
-    logger.log("⚠️ OpenAGI handlers non disponibili", "WARNING")
+    logger.log("⚠️ OAGI handlers non disponibili", "WARNING")
 
-# Google Generative AI
+# Google GenAI (google-genai, NOT google-generativeai)
 try:
-    import google.generativeai as genai
+    from google import genai
+    from google.genai import types
+    from google.genai.types import Content, Part, GenerateContentConfig
     GEMINI_AVAILABLE = True
-    logger.log("✅ Google Generative AI SDK disponibile")
+    logger.log("✅ Google GenAI SDK disponibile")
 except ImportError:
     GEMINI_AVAILABLE = False
-    logger.log("⚠️ Google Generative AI SDK non disponibile", "WARNING")
+    logger.log("⚠️ Google GenAI SDK non disponibile", "WARNING")
 
 # Playwright
 try:
@@ -721,8 +723,8 @@ class HybridModeExecutor:
         if GEMINI_AVAILABLE:
             api_key = os.getenv("GEMINI_API_KEY")
             if api_key:
-                genai.configure(api_key=api_key)
-                self.model = genai.GenerativeModel(GEMINI_HYBRID_MODEL)
+                self.client = genai.Client(api_key=api_key)
+                logger.log(f"✅ Gemini Client configurato per: {GEMINI_HYBRID_MODEL}")
             else:
                 raise ValueError("GEMINI_API_KEY non configurata")
     
@@ -820,10 +822,31 @@ Rispondi SOLO con il JSON:"""
         current_url = self.page.url
         
         prompt = self._build_prompt(task, a11y_tree, current_url, step)
-        image_part = {"inline_data": {"mime_type": "image/png", "data": screenshot_b64}}
         
         try:
-            response = self.model.generate_content([prompt, image_part])
+            # Prepara contenuto per google-genai SDK
+            contents = [
+                Content(
+                    role="user",
+                    parts=[
+                        Part(text=prompt),
+                        Part(inline_data=types.Blob(
+                            mime_type="image/png",
+                            data=base64.b64decode(screenshot_b64)
+                        ))
+                    ]
+                )
+            ]
+            
+            response = self.client.models.generate_content(
+                model=GEMINI_HYBRID_MODEL,
+                contents=contents,
+                config=GenerateContentConfig(
+                    temperature=0.2,
+                    max_output_tokens=1024,
+                )
+            )
+            
             response_text = response.text.strip()
             
             if "```" in response_text:
@@ -1056,7 +1079,7 @@ async def execute_with_gemini_cua(request: TaskRequest) -> TaskResponse:
     """Esegue task con Gemini CUA (solo vision)"""
     logger.clear()
     logger.log("=" * 60)
-    logger.log("GEMINI CUA MODE - v7.0")
+    logger.log("GEMINI CUA MODE - v7.1.1")
     logger.log("=" * 60)
     
     if not GEMINI_AVAILABLE or not PLAYWRIGHT_AVAILABLE:
@@ -1074,9 +1097,7 @@ async def execute_with_gemini_cua(request: TaskRequest) -> TaskResponse:
             mode_used="gemini_cua"
         )
     
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(GEMINI_CUA_MODEL)
-    
+    client = genai.Client(api_key=api_key)
     actions_log = []
     
     try:
@@ -1101,7 +1122,6 @@ async def execute_with_gemini_cua(request: TaskRequest) -> TaskResponse:
             logger.log(f"\n--- Step {step}/{request.max_steps} ---")
             
             screenshot_bytes = await page.screenshot(type="png")
-            screenshot_b64 = base64.b64encode(screenshot_bytes).decode("utf-8")
             
             prompt = f"""Task: {request.task_description}
 URL: {page.url}
@@ -1112,10 +1132,29 @@ Analizza lo screenshot. Rispondi con JSON:
 
 Viewport: {VIEWPORT_WIDTH}x{VIEWPORT_HEIGHT}"""
             
-            image_part = {"inline_data": {"mime_type": "image/png", "data": screenshot_b64}}
-            
             try:
-                response = model.generate_content([prompt, image_part])
+                contents = [
+                    Content(
+                        role="user",
+                        parts=[
+                            Part(text=prompt),
+                            Part(inline_data=types.Blob(
+                                mime_type="image/png",
+                                data=screenshot_bytes
+                            ))
+                        ]
+                    )
+                ]
+                
+                response = client.models.generate_content(
+                    model=GEMINI_CUA_MODEL,
+                    contents=contents,
+                    config=GenerateContentConfig(
+                        temperature=0.2,
+                        max_output_tokens=1024,
+                    )
+                )
+                
                 response_text = response.text.strip()
                 
                 if "```" in response_text:
