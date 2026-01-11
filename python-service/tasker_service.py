@@ -1309,6 +1309,16 @@ async def execute_task(request: TaskRequest):
     """Esegue un task"""
     global is_running
     
+    # Debug: log full request
+    logger.log("=" * 60)
+    logger.log(f"[REQUEST] mode: {request.mode}")
+    logger.log(f"[REQUEST] task: {request.task_description[:50]}...")
+    logger.log(f"[REQUEST] api_key: {'***' + request.api_key[-4:] if request.api_key else 'None'}")
+    logger.log(f"[REQUEST] gemini_api_key: {'***' + request.gemini_api_key[-4:] if request.gemini_api_key else 'None'}")
+    logger.log(f"[REQUEST] max_steps: {request.max_steps}")
+    logger.log(f"[REQUEST] max_steps_per_todo: {request.max_steps_per_todo}")
+    logger.log("=" * 60)
+    
     if is_running:
         raise HTTPException(status_code=409, detail="Un task è già in esecuzione")
     
@@ -1330,8 +1340,22 @@ async def execute_task(request: TaskRequest):
             # 'gemini' è alias per 'gemini_hybrid' (retrocompatibilità)
             # Usa api_key come fallback per gemini_api_key (il client passa api_key)
             gemini_key = request.gemini_api_key or request.api_key
+            
+            # Debug: log what we received
+            logger.log(f"[DEBUG] mode: {request.mode}")
+            logger.log(f"[DEBUG] gemini_api_key presente: {bool(request.gemini_api_key)}")
+            logger.log(f"[DEBUG] api_key presente: {bool(request.api_key)}")
+            logger.log(f"[DEBUG] gemini_key finale: {bool(gemini_key)}")
+            
             # Usa max_steps_per_todo come fallback per max_steps (il client passa max_steps_per_todo)
             max_steps = request.max_steps if request.max_steps != 30 else request.max_steps_per_todo
+            
+            if not gemini_key:
+                return TaskResponse(
+                    success=False,
+                    error="Gemini API key non configurata. Verifica che sia salvata nelle impostazioni della app.",
+                    mode_used="gemini_hybrid"
+                )
             
             executor = HybridModeExecutor(headless=request.headless, api_key=gemini_key)
             return await executor.run(request.task_description, request.start_url, max_steps)
