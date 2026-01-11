@@ -46,7 +46,7 @@ from pydantic import BaseModel, Field
 # CONFIGURATION
 # ============================================================================
 
-SERVICE_VERSION = "7.1.7"
+SERVICE_VERSION = "7.1.9"
 SERVICE_PORT = 8765
 
 # Lux reference resolution (il modello è stato trainato su questa risoluzione)
@@ -199,6 +199,10 @@ class TaskRequest(BaseModel):
     # Gemini settings
     headless: bool = False
     highlight_mouse: bool = False
+    
+    # Browser reuse settings
+    reuse_browser: bool = True  # True = riusa pagina esistente, False = nuova pagina
+    new_tab: bool = False  # True = apre nuova tab nello stesso browser (mantiene login)
 
 
 class TaskResponse(BaseModel):
@@ -710,6 +714,7 @@ class HybridModeExecutor:
         self.context: Optional[BrowserContext] = None
         self.page: Optional[Page] = None
         self.actions_log: list = []
+        self.api_key = api_key
         
         if GEMINI_AVAILABLE:
             # Usa api_key passata o fallback a env var
@@ -720,8 +725,36 @@ class HybridModeExecutor:
             else:
                 raise ValueError("Gemini API key non configurata")
     
-    async def start_browser(self, start_url: Optional[str] = None):
-        """Avvia browser Edge con profilo persistente"""
+    def is_browser_open(self) -> bool:
+        """Verifica se il browser è ancora aperto e funzionante"""
+        try:
+            return self.context is not None and self.page is not None and not self.page.is_closed()
+        except:
+            return False
+    
+    async def start_browser(self, start_url: Optional[str] = None, new_tab: bool = False):
+        """Avvia browser Edge con profilo persistente o riusa esistente"""
+        
+        # Se il browser è già aperto
+        if self.is_browser_open():
+            if new_tab:
+                # Apri nuova tab (mantiene login perché stesso context)
+                logger.log("📑 Apertura nuova tab (login mantenuto)")
+                self.page = await self.context.new_page()
+                if start_url:
+                    logger.log(f"📍 Navigazione: {start_url}")
+                    await self.page.goto(start_url, wait_until="domcontentloaded", timeout=30000)
+                    await asyncio.sleep(1)
+            else:
+                # Riusa la pagina esistente
+                logger.log(f"♻️ Riuso pagina esistente: {self.page.url}")
+                if start_url:
+                    logger.log(f"📍 Navigazione: {start_url}")
+                    await self.page.goto(start_url, wait_until="domcontentloaded", timeout=30000)
+                    await asyncio.sleep(1)
+            return
+        
+        # Avvia nuovo browser
         self.playwright = await async_playwright().start()
         HYBRID_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
         
@@ -751,6 +784,9 @@ class HybridModeExecutor:
             await self.context.close()
         if self.playwright:
             await self.playwright.stop()
+        self.context = None
+        self.page = None
+        self.playwright = None
     
     async def capture_screenshot(self) -> str:
         screenshot_bytes = await self.page.screenshot(type="png")
@@ -1011,16 +1047,17 @@ Rispondi SOLO con il JSON:"""
         self.actions_log.append(log_entry)
         return log_entry["success"]
     
-    async def run(self, task: str, start_url: Optional[str], max_steps: int = 30) -> TaskResponse:
+    async def run(self, task: str, start_url: Optional[str], max_steps: int = 30, new_tab: bool = False) -> TaskResponse:
         self.actions_log = []
         logger.clear()
         logger.log("=" * 60)
-        logger.log("GEMINI HYBRID MODE - v7.0")
+        logger.log("GEMINI HYBRID MODE - v7.1.8")
         logger.log("=" * 60)
         logger.log(f"Task: {task[:80]}...")
+        logger.log(f"Reuse browser: {self.is_browser_open()} | New tab: {new_tab}")
         
         try:
-            await self.start_browser(start_url)
+            await self.start_browser(start_url, new_tab=new_tab)
             
             for step in range(1, max_steps + 1):
                 logger.log(f"\n--- Step {step}/{max_steps} ---")
@@ -1274,6 +1311,63 @@ app.add_middleware(
 )
 
 is_running = False
+# Executor globale per mantenere il browser aperto tra i task
+global_hybrid_executor: Optional[HybridModeExecutor] = None
+
+
+def detect_browser_behavior(task_description: str) -> dict:
+    """
+    Analizza la descrizione del task per determinare il comportamento del browser.
+    
+    Returns:
+        {"new_tab": bool, "close_current": bool}
+    """
+    task_lower = task_description.lower()
+    
+    # Pattern per NUOVA TAB/PAGINA
+    new_tab_patterns = [
+        "nuova pagina", "nuova tab", "nuovo tab", "nuova scheda",
+        "apri una nuova", "in una nuova", "apri nuova",
+        "new tab", "new page", "open new", "in a new",
+        "altra pagina", "altra tab", "altra scheda",
+    ]
+    
+    # Pattern per CHIUDERE e riaprire
+    close_patterns = [
+        "chiudi e apri", "riavvia browser", "nuovo browser",
+        "close and open", "restart browser", "fresh browser",
+        "ricomincia", "da zero", "from scratch",
+    ]
+    
+    # Pattern per USARE PAGINA CORRENTE (esplicito)
+    same_page_patterns = [
+        "stessa pagina", "questa pagina", "pagina corrente",
+        "same page", "current page", "this page",
+        "continua", "prosegui", "vai avanti",
+    ]
+    
+    result = {"new_tab": False, "close_current": False}
+    
+    for pattern in new_tab_patterns:
+        if pattern in task_lower:
+            result["new_tab"] = True
+            logger.log(f"🔍 Rilevato pattern nuova tab: '{pattern}'")
+            break
+    
+    for pattern in close_patterns:
+        if pattern in task_lower:
+            result["close_current"] = True
+            logger.log(f"🔍 Rilevato pattern chiudi browser: '{pattern}'")
+            break
+    
+    for pattern in same_page_patterns:
+        if pattern in task_lower:
+            result["new_tab"] = False
+            result["close_current"] = False
+            logger.log(f"🔍 Rilevato pattern stessa pagina: '{pattern}'")
+            break
+    
+    return result
 
 
 @app.get("/")
@@ -1353,15 +1447,27 @@ async def execute_task(request: TaskRequest):
             return await execute_with_gemini_cua(request)
         
         elif request.mode in ["gemini", "gemini_hybrid"]:
+            global global_hybrid_executor
+            
             # 'gemini' è alias per 'gemini_hybrid' (retrocompatibilità)
             # Usa api_key come fallback per gemini_api_key (il client passa api_key)
             gemini_key = request.gemini_api_key or request.api_key
+            
+            # Rileva comportamento browser dalla descrizione del task
+            behavior = detect_browser_behavior(request.task_description)
+            
+            # I parametri espliciti nella request hanno priorità
+            new_tab = request.new_tab or behavior["new_tab"]
+            close_current = behavior["close_current"]
             
             # Debug: log what we received
             logger.log(f"[DEBUG] mode: {request.mode}")
             logger.log(f"[DEBUG] gemini_api_key presente: {bool(request.gemini_api_key)}")
             logger.log(f"[DEBUG] api_key presente: {bool(request.api_key)}")
             logger.log(f"[DEBUG] gemini_key finale: {bool(gemini_key)}")
+            logger.log(f"[DEBUG] reuse_browser: {request.reuse_browser}")
+            logger.log(f"[DEBUG] new_tab (rilevato): {new_tab}")
+            logger.log(f"[DEBUG] close_current (rilevato): {close_current}")
             
             # Usa max_steps_per_todo come fallback per max_steps (il client passa max_steps_per_todo)
             max_steps = request.max_steps if request.max_steps != 30 else request.max_steps_per_todo
@@ -1373,8 +1479,29 @@ async def execute_task(request: TaskRequest):
                     mode_used="gemini_hybrid"
                 )
             
-            executor = HybridModeExecutor(headless=request.headless, api_key=gemini_key)
-            return await executor.run(request.task_description, request.start_url, max_steps)
+            # Se richiesto di chiudere il browser corrente
+            if close_current and global_hybrid_executor and global_hybrid_executor.is_browser_open():
+                logger.log("🚫 Chiusura browser esistente come richiesto")
+                await global_hybrid_executor.close_browser()
+                global_hybrid_executor = None
+            
+            # Logica per riuso browser
+            if request.reuse_browser and global_hybrid_executor and global_hybrid_executor.is_browser_open():
+                # Riusa l'executor esistente (browser già aperto)
+                logger.log("♻️ Riuso executor esistente")
+                executor = global_hybrid_executor
+            else:
+                # Crea nuovo executor
+                logger.log("🆕 Creazione nuovo executor")
+                executor = HybridModeExecutor(headless=request.headless, api_key=gemini_key)
+                global_hybrid_executor = executor
+            
+            return await executor.run(
+                request.task_description, 
+                request.start_url, 
+                max_steps,
+                new_tab=new_tab
+            )
         
         else:
             raise HTTPException(status_code=400, detail=f"Mode sconosciuto: {request.mode}")
@@ -1388,6 +1515,29 @@ async def stop_execution():
     global is_running
     is_running = False
     return {"status": "stop richiesto"}
+
+
+@app.post("/close_browser")
+async def close_browser():
+    """Chiude il browser Gemini se aperto"""
+    global global_hybrid_executor
+    if global_hybrid_executor and global_hybrid_executor.is_browser_open():
+        await global_hybrid_executor.close_browser()
+        logger.log("🚫 Browser chiuso")
+        return {"status": "browser chiuso"}
+    return {"status": "nessun browser aperto"}
+
+
+@app.get("/browser_status")
+async def browser_status():
+    """Stato del browser Gemini"""
+    global global_hybrid_executor
+    if global_hybrid_executor and global_hybrid_executor.is_browser_open():
+        return {
+            "browser_open": True,
+            "current_url": global_hybrid_executor.page.url if global_hybrid_executor.page else None
+        }
+    return {"browser_open": False, "current_url": None}
 
 
 @app.get("/screen")
