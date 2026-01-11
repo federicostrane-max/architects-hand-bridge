@@ -46,7 +46,7 @@ from pydantic import BaseModel, Field
 # CONFIGURATION
 # ============================================================================
 
-SERVICE_VERSION = "7.1.6"
+SERVICE_VERSION = "7.1.7"
 SERVICE_PORT = 8765
 
 # Lux reference resolution (il modello è stato trainato su questa risoluzione)
@@ -1060,7 +1060,9 @@ Rispondi SOLO con il JSON:"""
             )
             
         finally:
-            await self.close_browser()
+            # NON chiudere il browser - lascialo aperto per l'utente
+            # await self.close_browser()
+            logger.log("🌐 Browser lasciato aperto")
 
 
 # ============================================================================
@@ -1176,8 +1178,10 @@ Viewport: {VIEWPORT_WIDTH}x{VIEWPORT_HEIGHT}"""
                     actions_log.append({"step": step, "action": "scroll"})
                     
                 elif action_type == "done":
-                    await context.close()
-                    await pw.stop()
+                    # NON chiudere il browser - lascialo aperto
+                    # await context.close()
+                    # await pw.stop()
+                    logger.log("🌐 Browser lasciato aperto")
                     return TaskResponse(
                         success=True,
                         result=action_data.get("reasoning", "Task completato"),
@@ -1188,8 +1192,10 @@ Viewport: {VIEWPORT_WIDTH}x{VIEWPORT_HEIGHT}"""
                     )
                     
                 elif action_type == "fail":
-                    await context.close()
-                    await pw.stop()
+                    # NON chiudere il browser - lascialo aperto
+                    # await context.close()
+                    # await pw.stop()
+                    logger.log("🌐 Browser lasciato aperto")
                     return TaskResponse(
                         success=False,
                         error=action_data.get("reasoning", "Task fallito"),
@@ -1205,8 +1211,10 @@ Viewport: {VIEWPORT_WIDTH}x{VIEWPORT_HEIGHT}"""
                 logger.log(f"⚠️ Errore step {step}: {e}", "WARNING")
                 continue
         
-        await context.close()
-        await pw.stop()
+        # NON chiudere il browser - lascialo aperto
+        # await context.close()
+        # await pw.stop()
+        logger.log("🌐 Browser lasciato aperto")
         
         return TaskResponse(
             success=False,
