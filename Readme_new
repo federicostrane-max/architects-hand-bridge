@@ -1,0 +1,298 @@
+# Python Service - The Architect's Hand Bridge
+
+Servizi Python per l'automazione browser e desktop tramite AI.
+
+---
+
+## 🏗️ Architettura
+
+Questa cartella contiene **due servizi paralleli** che possono funzionare simultaneamente:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              DESKTOP                                        │
+│                                                                             │
+│   ┌─────────────────────────────┐    ┌─────────────────────────────────┐   │
+│   │   tasker_service.py        │    │   tool_server.py                │   │
+│   │   ═══════════════════      │    │   ════════════════              │   │
+│   │   Porta: 8765              │    │   Porta: 8766                   │   │
+│   │                            │    │                                 │   │
+│   │   🧠 Brain + Hands         │    │   🖐️ Hands Only                 │   │
+│   │   - Lux/Gemini integrati   │    │   - Solo esecuzione             │   │
+│   │   - Orchestrazione interna │    │   - Nessuna AI integrata        │   │
+│   │   - Loop detection         │    │   - Endpoint semplici           │   │
+│   │   - Self-healing           │    │   - Web app fa orchestrazione   │   │
+│   │                            │    │                                 │   │
+│   │   Usato da: Electron UI    │    │   Usato da: Web App (Lovable)   │   │
+│   └─────────────────────────────┘    └─────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 📁 File
+
+| File | Descrizione |
+|------|-------------|
+| `tasker_service.py` | Servizio completo con AI (Lux/Gemini) - porta 8765 |
+| `tool_server.py` | Servizio esecuzione pura - porta 8766 |
+| `requirements.txt` | Dipendenze Python |
+| `start-tasker-service.bat` | Avvia tasker_service (8765) |
+| `start-tool-server.bat` | Avvia tool_server (8766) |
+| `start-both.bat` | Avvia entrambi i servizi |
+
+---
+
+## 🚀 Quick Start
+
+### Prerequisiti
+
+```bash
+# Python 3.10+
+python --version
+
+# Installa dipendenze
+pip install -r requirements.txt
+
+# Installa browser Playwright
+playwright install chromium
+```
+
+### Avvio Servizi
+
+**Opzione 1: Solo Tool Server (per web app)**
+```bash
+start-tool-server.bat
+# oppure
+python tool_server.py
+```
+
+**Opzione 2: Solo Tasker Service (per Electron)**
+```bash
+start-tasker-service.bat
+# oppure
+python tasker_service.py
+```
+
+**Opzione 3: Entrambi**
+```bash
+start-both.bat
+```
+
+---
+
+## 🔌 Porte e Endpoint
+
+### Tool Server (8766) - Per Web App
+
+| Endpoint | Metodo | Descrizione |
+|----------|--------|-------------|
+| `/health` | GET | Health check |
+| `/screenshot` | POST | Cattura screenshot |
+| `/click` | POST | Click a coordinate |
+| `/type` | POST | Digita testo |
+| `/scroll` | POST | Scroll pagina |
+| `/keypress` | POST | Pressione tasti |
+| `/browser/start` | POST | Avvia sessione browser |
+| `/browser/stop` | POST | Chiudi sessione |
+| `/browser/dom/tree` | GET | Accessibility Tree |
+| `/browser/navigate` | POST | Naviga a URL |
+| `/browser/current_url` | GET | URL corrente |
+
+**Documentazione completa**: Vedi `TOOL_SERVER_API_DOCUMENTATION.md`
+
+### Tasker Service (8765) - Per Electron
+
+| Endpoint | Metodo | Descrizione |
+|----------|--------|-------------|
+| `/lux_tasks` | POST | Esegue task con Lux AI |
+| `/gemini_hybrid` | POST | Esegue con Gemini Hybrid |
+| `/screenshot` | POST | Screenshot (legacy) |
+| ... | | (altri endpoint legacy) |
+
+---
+
+## 🔧 Configurazione
+
+### Variabili Ambiente (opzionali per tool_server)
+
+```bash
+# Solo se usi Lux/Gemini direttamente (non necessario per tool_server)
+set OAGI_API_KEY=your-lux-api-key
+set GOOGLE_AI_STUDIO_API_KEY=your-gemini-key
+```
+
+### Viewport Default
+
+- **Tool Server**: 1280x720 (configurabile via API)
+- **Tasker Service**: 1920x1080 (legacy)
+
+---
+
+## 📊 Quando Usare Quale Servizio
+
+| Scenario | Servizio | Porta |
+|----------|----------|-------|
+| Electron app controlla automazione | tasker_service | 8765 |
+| Web app controlla automazione | tool_server | 8766 |
+| Web app chiama Lux/Gemini direttamente | tool_server | 8766 |
+| Test endpoint isolati | tool_server | 8766 |
+| Compatibilità codice legacy | tasker_service | 8765 |
+
+---
+
+## 🧪 Test Rapido
+
+### Test Tool Server
+
+```bash
+# Health check
+curl http://127.0.0.1:8766/health
+
+# Screenshot desktop
+curl -X POST http://127.0.0.1:8766/screenshot \
+  -H "Content-Type: application/json" \
+  -d '{"scope": "desktop"}'
+
+# Avvia browser
+curl -X POST http://127.0.0.1:8766/browser/start \
+  -H "Content-Type: application/json" \
+  -d '{"start_url": "https://google.com"}'
+```
+
+### Test Tasker Service
+
+```bash
+# Health check
+curl http://127.0.0.1:8765/health
+
+# Screenshot (legacy format)
+curl -X POST http://127.0.0.1:8765/screenshot \
+  -H "Content-Type: application/json" \
+  -d '{}'
+```
+
+---
+
+## 🔄 Flusso Tipico Web App
+
+```
+Web App (Lovable)
+       │
+       │ 1. POST /browser/start
+       ▼
+   Tool Server (8766)
+       │
+       │ 2. Avvia Playwright browser
+       ▼
+   Browser Session (ID: abc123)
+       │
+       │
+Web App
+       │ 3. GET /browser/dom/tree?session_id=abc123
+       ▼
+   Tool Server
+       │ 4. Restituisce Accessibility Tree
+       ▼
+Web App (chiama Lux/Gemini API direttamente)
+       │ 5. AI decide: "click su Compose"
+       │ 6. AI trova coordinate: {x: 150, y: 200}
+       ▼
+       │ 7. POST /click {x: 150, y: 200, session_id: abc123}
+       ▼
+   Tool Server
+       │ 8. Esegue click
+       ▼
+   Ripeti da step 3...
+```
+
+---
+
+## ⚠️ Note Importanti
+
+### Non Modificare tasker_service.py
+
+Il `tasker_service.py` è usato dalla Electron app esistente. **Non modificarlo** per evitare breaking changes. Aggiungi nuove funzionalità solo in `tool_server.py`.
+
+### Coordinate Systems
+
+Tool Server supporta diversi sistemi di coordinate:
+
+| `coordinate_origin` | Descrizione |
+|---------------------|-------------|
+| `viewport` | Pixel relativi al viewport browser |
+| `screen` | Pixel assoluti schermo |
+| `lux_sdk` | Coordinate Lux (1260x700) → auto-convertite |
+
+### Scope
+
+| `scope` | Target |
+|---------|--------|
+| `browser` | Sessione Playwright (richiede session_id) |
+| `desktop` | Schermo intero via PyAutoGUI |
+
+---
+
+## 📚 Documentazione Aggiuntiva
+
+- `TOOL_SERVER_API_DOCUMENTATION.md` - Documentazione completa API
+- `TOOL_SERVER_QUICK_REFERENCE.md` - Riferimento rapido
+- `LOVABLE_INTEGRATION_GUIDE.md` - Guida integrazione web app
+- `LOVABLE_HYBRID_STRATEGY.md` - Strategia DOM + Vision
+- `LOVABLE_VISION_API_GUIDE.md` - Best practices Lux/Gemini
+
+---
+
+## 🐛 Troubleshooting
+
+### Porta già in uso
+
+```bash
+# Windows: trova processo
+netstat -ano | findstr :8766
+
+# Termina processo
+taskkill /PID <pid> /F
+```
+
+### Playwright non trova browser
+
+```bash
+# Reinstalla browser
+playwright install chromium
+```
+
+### CORS errors dalla web app
+
+Tool Server ha CORS abilitato per tutti gli origin. Se hai problemi:
+1. Verifica che il server sia in esecuzione
+2. Usa `http://127.0.0.1:8766` (non `localhost`)
+
+### Screenshot vuoto
+
+- Verifica che il browser sia visibile (non minimizzato)
+- Per desktop scope, verifica permessi screen capture
+
+---
+
+## 📝 Changelog
+
+### v8.0 - Tool Server
+- Nuovo servizio separato su porta 8766
+- API RESTful per web app
+- Supporto sessioni browser multiple
+- Endpoint DOM/Accessibility Tree
+- Sistemi coordinate multipli
+
+### v7.2.1 - Tasker Service
+- Integrazione Lux Actor/Thinker/Tasker
+- Gemini Hybrid mode
+- Self-healing
+- Loop detection
+
+---
+
+## 📄 Licenza
+
+Proprietario - The Architect's Hand
