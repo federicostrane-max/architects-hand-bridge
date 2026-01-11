@@ -46,7 +46,7 @@ from pydantic import BaseModel, Field
 # CONFIGURATION
 # ============================================================================
 
-SERVICE_VERSION = "7.1.3"
+SERVICE_VERSION = "7.1.4"
 SERVICE_PORT = 8765
 
 # Lux reference resolution (il modello è stato trainato su questa risoluzione)
@@ -176,8 +176,11 @@ class TaskRequest(BaseModel):
     start_url: Optional[str] = None
     mode: Literal["actor", "thinker", "tasker", "gemini_cua", "gemini_hybrid"] = "actor"
     
+    # API Keys (passate dalla web app)
+    api_key: Optional[str] = None  # OAGI API key per Lux
+    gemini_api_key: Optional[str] = None  # Gemini API key
+    
     # Lux settings
-    api_key: Optional[str] = None  # OAGI API key
     model: str = "lux-actor-1"
     max_steps: int = 30
     max_steps_per_todo: int = 24
@@ -696,7 +699,7 @@ class HybridAction:
 class HybridModeExecutor:
     """Esecutore Hybrid Mode che combina DOM e Vision"""
     
-    def __init__(self, headless: bool = False):
+    def __init__(self, headless: bool = False, api_key: Optional[str] = None):
         self.headless = headless
         self.playwright = None
         self.context: Optional[BrowserContext] = None
@@ -704,12 +707,13 @@ class HybridModeExecutor:
         self.actions_log: list = []
         
         if GEMINI_AVAILABLE:
-            api_key = os.getenv("GEMINI_API_KEY")
-            if api_key:
-                self.client = genai.Client(api_key=api_key)
+            # Usa api_key passata o fallback a env var
+            key = api_key or os.getenv("GEMINI_API_KEY")
+            if key:
+                self.client = genai.Client(api_key=key)
                 logger.log(f"✅ Gemini Client configurato per: {GEMINI_HYBRID_MODEL}")
             else:
-                raise ValueError("GEMINI_API_KEY non configurata")
+                raise ValueError("GEMINI_API_KEY non configurata (passa gemini_api_key nella request o setta env var)")
     
     async def start_browser(self, start_url: Optional[str] = None):
         """Avvia browser Edge con profilo persistente"""
@@ -1062,7 +1066,7 @@ async def execute_with_gemini_cua(request: TaskRequest) -> TaskResponse:
     """Esegue task con Gemini CUA (solo vision)"""
     logger.clear()
     logger.log("=" * 60)
-    logger.log("GEMINI CUA MODE - v7.1.1")
+    logger.log("GEMINI CUA MODE - v7.1.3")
     logger.log("=" * 60)
     
     if not GEMINI_AVAILABLE or not PLAYWRIGHT_AVAILABLE:
@@ -1072,11 +1076,12 @@ async def execute_with_gemini_cua(request: TaskRequest) -> TaskResponse:
             mode_used="gemini_cua"
         )
     
-    api_key = os.getenv("GEMINI_API_KEY")
+    # Usa api_key dalla request o fallback a env var
+    api_key = request.gemini_api_key or os.getenv("GEMINI_API_KEY")
     if not api_key:
         return TaskResponse(
             success=False,
-            error="GEMINI_API_KEY non configurata",
+            error="GEMINI_API_KEY non configurata (passa gemini_api_key nella request o setta env var)",
             mode_used="gemini_cua"
         )
     
@@ -1316,7 +1321,7 @@ async def execute_task(request: TaskRequest):
             return await execute_with_gemini_cua(request)
         
         elif request.mode == "gemini_hybrid":
-            executor = HybridModeExecutor(headless=request.headless)
+            executor = HybridModeExecutor(headless=request.headless, api_key=request.gemini_api_key)
             return await executor.run(request.task_description, request.start_url, request.max_steps)
         
         else:
