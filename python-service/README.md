@@ -1,4 +1,4 @@
-# Architect's Hand - Tasker Service v7.1.0
+# Architect's Hand - Tasker Service v7.1.2
 
 ## Multi-Provider Computer Use (Lux + Gemini)
 
@@ -18,11 +18,11 @@ Servizio unificato che supporta **5 modalità** di automazione:
 # 1. Dipendenze Python
 pip install fastapi uvicorn pydantic pyautogui pyperclip pillow
 
-# 2. Provider Lux (opzionale)
-pip install openagi
+# 2. Provider Lux (OAGI)
+pip install oagi
 
-# 3. Provider Gemini (opzionale)
-pip install google-generativeai playwright
+# 3. Provider Gemini
+pip install google-genai playwright
 playwright install msedge
 
 # 4. Configura API keys
@@ -110,6 +110,12 @@ python tasker_service_v7.py
 - **Observer reports HTML** in tasker mode
 
 ## Changelog
+
+### v7.1.2
+- ✅ Fix SDK: `google-genai` invece di `google-generativeai`
+
+### v7.1.1
+- ✅ Fix import: `oagi` invece di `openagi`
 
 ### v7.1.0
 - ✅ Modelli aggiornati: Gemini 3 Flash + Gemini 2.5 Computer Use
