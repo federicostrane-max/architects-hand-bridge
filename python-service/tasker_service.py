@@ -46,7 +46,7 @@ from pydantic import BaseModel, Field
 # CONFIGURATION
 # ============================================================================
 
-SERVICE_VERSION = "7.2.0"
+SERVICE_VERSION = "7.2.1"
 SERVICE_PORT = 8765
 
 # Lux reference resolution (il modello è stato trainato su questa risoluzione)
@@ -685,6 +685,7 @@ class ActionType(Enum):
     """Tipi di azione per Hybrid Mode"""
     ACT_DOM = "act_dom"
     CLICK_VISION = "click_vision"
+    DOUBLE_CLICK = "double_click"  # Nuovo per loop handling
     TYPE = "type"
     SCROLL = "scroll"
     NAVIGATE = "navigate"
@@ -715,6 +716,7 @@ class HybridModeExecutor:
         self.page: Optional[Page] = None
         self.actions_log: list = []
         self.api_key = api_key
+        self.action_history: List[dict] = []  # History per loop detection
         
         if GEMINI_AVAILABLE:
             # Usa api_key passata o fallback a env var
@@ -818,7 +820,68 @@ class HybridModeExecutor:
         
         return "\n".join(lines)
     
-    def _build_prompt(self, task: str, a11y_tree: str, current_url: str, step: int) -> str:
+    def _detect_loop(self) -> bool:
+        """Rileva se siamo in un loop (3+ azioni simili consecutive)"""
+        if len(self.action_history) < 3:
+            return False
+        
+        last_3 = self.action_history[-3:]
+        
+        # Verifica se le ultime 3 azioni sono dello stesso tipo
+        action_types = [a.get("action") for a in last_3]
+        if len(set(action_types)) == 1 and action_types[0] in ["click_vision", "act_dom"]:
+            # Verifica se le coordinate sono simili (entro 50px)
+            if action_types[0] == "click_vision":
+                coords = [(a.get("x", 0), a.get("y", 0)) for a in last_3]
+                x_range = max(c[0] for c in coords) - min(c[0] for c in coords)
+                y_range = max(c[1] for c in coords) - min(c[1] for c in coords)
+                if x_range < 50 and y_range < 50:
+                    logger.log("🔄 LOOP RILEVATO: 3+ click simili sulle stesse coordinate", "WARNING")
+                    return True
+            elif action_types[0] == "act_dom":
+                selectors = [a.get("selector", "") for a in last_3]
+                if len(set(selectors)) == 1:
+                    logger.log("🔄 LOOP RILEVATO: 3+ click sullo stesso selettore", "WARNING")
+                    return True
+        
+        return False
+    
+    def _get_history_for_prompt(self) -> str:
+        """Genera stringa delle ultime azioni per il prompt"""
+        if not self.action_history:
+            return "Nessuna azione precedente."
+        
+        lines = []
+        for i, action in enumerate(self.action_history[-5:], 1):  # Ultime 5 azioni
+            action_type = action.get("action", "unknown")
+            if action_type == "click_vision":
+                lines.append(f"  {i}. click_vision ({action.get('x')}, {action.get('y')})")
+            elif action_type == "act_dom":
+                lines.append(f"  {i}. act_dom selector='{action.get('selector', '')[:50]}'")
+            elif action_type == "type":
+                lines.append(f"  {i}. type '{action.get('text', '')[:30]}...'")
+            elif action_type == "navigate":
+                lines.append(f"  {i}. navigate to {action.get('url', '')[:50]}")
+            else:
+                lines.append(f"  {i}. {action_type}")
+        
+        return "\n".join(lines)
+    
+    def _build_prompt(self, task: str, a11y_tree: str, current_url: str, step: int, loop_detected: bool = False) -> str:
+        history_text = self._get_history_for_prompt()
+        
+        loop_warning = ""
+        if loop_detected:
+            loop_warning = """
+⚠️ ATTENZIONE: HAI RIPETUTO LA STESSA AZIONE 3+ VOLTE SENZA SUCCESSO!
+DEVI provare una strategia DIVERSA:
+- Se stai cliccando un elemento senza effetto, prova DOPPIO CLICK (double_click)
+- Se non riesci a cliccare, prova a SCROLLARE per rendere visibile l'elemento
+- Se l'elemento non risponde, prova a usare un selettore diverso
+- Se niente funziona, riporta FAIL con spiegazione
+
+"""
+
         return f"""Sei un agente di automazione web Hybrid (DOM + Vision).
 
 TASK: {task}
@@ -826,6 +889,9 @@ TASK: {task}
 URL: {current_url}
 Step: {step}
 
+AZIONI PRECEDENTI (ultime 5):
+{history_text}
+{loop_warning}
 ACCESSIBILITY TREE:
 ```
 {a11y_tree[:6000]}
@@ -834,14 +900,16 @@ ACCESSIBILITY TREE:
 STRUMENTI:
 1. act_dom - Click via selettore: {{"action": "act_dom", "selector": "...", "reasoning": "..."}}
 2. click_vision - Click via coordinate: {{"action": "click_vision", "x": 640, "y": 380, "reasoning": "..."}}
-3. type - Digita testo: {{"action": "type", "text": "...", "reasoning": "..."}}
-4. scroll - Scrolla: {{"action": "scroll", "direction": "down", "reasoning": "..."}}
-5. navigate - Vai a URL: {{"action": "navigate", "url": "...", "reasoning": "..."}}
-6. wait - Attendi: {{"action": "wait", "reasoning": "..."}}
-7. done - Completato: {{"action": "done", "reasoning": "..."}}
-8. fail - Fallito: {{"action": "fail", "reasoning": "..."}}
+3. double_click - Doppio click via coordinate: {{"action": "double_click", "x": 640, "y": 380, "reasoning": "..."}}
+4. type - Digita testo: {{"action": "type", "text": "...", "reasoning": "..."}}
+5. scroll - Scrolla: {{"action": "scroll", "direction": "down", "reasoning": "..."}}
+6. navigate - Vai a URL: {{"action": "navigate", "url": "...", "reasoning": "..."}}
+7. wait - Attendi: {{"action": "wait", "reasoning": "..."}}
+8. done - Completato: {{"action": "done", "reasoning": "..."}}
+9. fail - Fallito: {{"action": "fail", "reasoning": "..."}}
 
 Preferisci act_dom quando possibile. Coordinate: viewport {VIEWPORT_WIDTH}x{VIEWPORT_HEIGHT}.
+NON ripetere azioni che non hanno funzionato. Se un click non funziona, prova double_click o scroll.
 Rispondi SOLO con il JSON:"""
     
     async def analyze_and_decide(self, task: str, step: int, retry_count: int = 0) -> HybridAction:
@@ -849,7 +917,10 @@ Rispondi SOLO con il JSON:"""
         a11y_tree = await self.get_accessibility_tree()
         current_url = self.page.url
         
-        prompt = self._build_prompt(task, a11y_tree, current_url, step)
+        # Rileva loop
+        loop_detected = self._detect_loop()
+        
+        prompt = self._build_prompt(task, a11y_tree, current_url, step, loop_detected)
         
         try:
             # Prepara contenuto per google-genai SDK
@@ -943,6 +1014,7 @@ Rispondi SOLO con il JSON:"""
         action_map = {
             "act_dom": ActionType.ACT_DOM,
             "click_vision": ActionType.CLICK_VISION,
+            "double_click": ActionType.DOUBLE_CLICK,
             "type": ActionType.TYPE,
             "scroll": ActionType.SCROLL,
             "navigate": ActionType.NAVIGATE,
@@ -950,6 +1022,20 @@ Rispondi SOLO con il JSON:"""
             "done": ActionType.DONE,
             "fail": ActionType.FAIL,
         }
+        
+        # Salva l'azione nella history per loop detection
+        self.action_history.append({
+            "action": data.get("action", "unknown"),
+            "selector": data.get("selector"),
+            "x": data.get("x"),
+            "y": data.get("y"),
+            "text": data.get("text"),
+            "url": data.get("url"),
+        })
+        
+        # Mantieni solo le ultime 10 azioni
+        if len(self.action_history) > 10:
+            self.action_history = self.action_history[-10:]
         
         return HybridAction(
             action_type=action_map.get(data.get("action", "fail"), ActionType.FAIL),
@@ -1057,6 +1143,19 @@ Rispondi SOLO con il JSON:"""
                     except Exception as heal_error:
                         logger.log(f"[SELF-HEAL] ❌ Fallito: {heal_error}", "ERROR")
                         log_entry["error"] = str(heal_error)
+            
+            elif action.action_type == ActionType.DOUBLE_CLICK:
+                # === DOPPIO CLICK (per webmail, elementi che richiedono dblclick) ===
+                x, y = action.x, action.y
+                logger.log(f"[DOUBLE_CLICK] ({x}, {y})")
+                
+                try:
+                    await self.page.mouse.dblclick(x, y)
+                    log_entry["success"] = True
+                    log_entry["coordinates"] = {"x": x, "y": y}
+                except Exception as e:
+                    logger.log(f"[DOUBLE_CLICK] Fallito: {e}", "ERROR")
+                    log_entry["error"] = str(e)
             
             elif action.action_type == ActionType.TYPE:
                 logger.log(f"[TYPE] {action.text[:30]}...")
