@@ -46,7 +46,7 @@ from pydantic import BaseModel, Field
 # CONFIGURATION
 # ============================================================================
 
-SERVICE_VERSION = "7.1.5"
+SERVICE_VERSION = "7.1.6"
 SERVICE_PORT = 8765
 
 # Lux reference resolution (il modello è stato trainato su questa risoluzione)
@@ -220,6 +220,10 @@ class StatusResponse(BaseModel):
     version: str
     providers: dict
     modes: List[str]
+    # Campi flat per retrocompatibilità con bridge
+    oagi_available: bool = False
+    gemini_available: bool = False
+    playwright_available: bool = False
 
 
 # ============================================================================
@@ -1279,7 +1283,7 @@ async def get_status():
     if TASKER_AGENT_AVAILABLE:
         modes.append("tasker")
     if GEMINI_AVAILABLE and PLAYWRIGHT_AVAILABLE:
-        modes.extend(["gemini_cua", "gemini_hybrid"])
+        modes.extend(["gemini", "gemini_cua", "gemini_hybrid"])
     
     return StatusResponse(
         status="running" if not is_running else "busy",
@@ -1300,7 +1304,11 @@ async def get_status():
                 "pyperclip": PYPERCLIP_AVAILABLE,
             }
         },
-        modes=modes
+        modes=modes,
+        # Campi flat per retrocompatibilità con bridge
+        oagi_available=OAGI_AVAILABLE,
+        gemini_available=GEMINI_AVAILABLE,
+        playwright_available=PLAYWRIGHT_AVAILABLE
     )
 
 
