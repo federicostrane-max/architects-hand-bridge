@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-tasker_service.py v7.0 - Unified Multi-Provider Computer Use
+tasker_service.py v7.2.2 - Unified Multi-Provider Computer Use
 =============================================================
 
 SUPPORTED PROVIDERS:
@@ -21,6 +21,7 @@ SUPPORTED PROVIDERS:
 Versioni:
 - v6.0.7: Switch a Edge per evitare conflitti
 - v7.0.0: Unified con Hybrid Mode + Lux completo
+- v7.2.2: FIX CRITICO - Risoluzione Lux corretta a 1260x700 (da repo ufficiale oagi)
 """
 
 import asyncio
@@ -46,12 +47,27 @@ from pydantic import BaseModel, Field
 # CONFIGURATION
 # ============================================================================
 
-SERVICE_VERSION = "7.2.1"
+SERVICE_VERSION = "7.2.2"
 SERVICE_PORT = 8765
 
-# Lux reference resolution (il modello è stato trainato su questa risoluzione)
-LUX_REF_WIDTH = 1920
-LUX_REF_HEIGHT = 1200
+# ==========================================================================
+# RISOLUZIONE LUX - CORRETTA DA DOCUMENTAZIONE UFFICIALE SDK OAGI
+# ==========================================================================
+# Fonte: https://github.com/agiopen-org/oagi-python
+# 
+# from oagi import PILImage, ImageConfig
+# config = ImageConfig(
+#     format="JPEG",
+#     quality=85,
+#     width=1260,   # ← RISOLUZIONE UFFICIALE
+#     height=700    # ← RISOLUZIONE UFFICIALE
+# )
+#
+# NOTA: La versione precedente usava 1920x1200 che causava imprecisione
+# nelle coordinate dei click. Il modello Lux è trainato su 1260x700.
+# ==========================================================================
+LUX_REF_WIDTH = 1260
+LUX_REF_HEIGHT = 700
 
 # Viewport per Gemini (ottimizzato per Computer Use)
 VIEWPORT_WIDTH = 1288
@@ -274,8 +290,13 @@ class ExecutionHistory:
 class ResizedScreenshotMaker:
     """
     Screenshot maker che ridimensiona alla risoluzione di riferimento Lux.
-    Lux è stato trainato su 1920x1200, quindi le coordinate funzionano meglio
-    se gli screenshot sono in quella risoluzione.
+    
+    RISOLUZIONE UFFICIALE: 1260x700 (da documentazione SDK oagi)
+    Fonte: https://github.com/agiopen-org/oagi-python
+    
+    Il modello Lux è stato trainato su questa risoluzione, quindi le coordinate
+    restituite sono relative a 1260x700. Usare risoluzioni diverse causa
+    imprecisione nei click.
     """
     
     def __init__(self, target_width: int = LUX_REF_WIDTH, target_height: int = LUX_REF_HEIGHT):
@@ -283,15 +304,16 @@ class ResizedScreenshotMaker:
         self.target_height = target_height
         
     async def __call__(self) -> str:
-        """Cattura screenshot, ridimensiona e restituisce base64"""
+        """Cattura screenshot, ridimensiona a 1260x700 e restituisce base64"""
         try:
             from PIL import Image
             import io
             
             # Cattura screenshot
             screenshot = pyautogui.screenshot()
+            original_size = screenshot.size
             
-            # Ridimensiona alla risoluzione target
+            # Ridimensiona alla risoluzione target (1260x700)
             resized = screenshot.resize(
                 (self.target_width, self.target_height),
                 Image.Resampling.LANCZOS
@@ -301,6 +323,8 @@ class ResizedScreenshotMaker:
             buffer = io.BytesIO()
             resized.save(buffer, format='PNG')
             buffer.seek(0)
+            
+            logger.log(f"📸 Screenshot: {original_size[0]}x{original_size[1]} → {self.target_width}x{self.target_height}")
             
             return base64.b64encode(buffer.read()).decode('utf-8')
             
@@ -317,8 +341,16 @@ def scale_coordinates(x: int, y: int) -> tuple:
     """
     Scala le coordinate dalla risoluzione Lux a quella reale dello schermo.
     
-    Lux restituisce coordinate basate su 1920x1200.
-    Se il tuo schermo è diverso, le coordinate vanno scalate.
+    RISOLUZIONE LUX: 1260x700 (documentazione ufficiale SDK oagi)
+    
+    Lux restituisce coordinate basate su 1260x700.
+    Se il tuo schermo è diverso (es. 1920x1080, 2560x1440), 
+    le coordinate vanno scalate proporzionalmente.
+    
+    Esempio:
+        Lux click: (630, 350)  # Centro in 1260x700
+        Schermo: 2560x1440
+        Risultato: (1280, 720)  # Centro scalato
     """
     if not PYAUTOGUI_AVAILABLE:
         return x, y
@@ -327,6 +359,8 @@ def scale_coordinates(x: int, y: int) -> tuple:
     
     x_scaled = int(x * screen_width / LUX_REF_WIDTH)
     y_scaled = int(y * screen_height / LUX_REF_HEIGHT)
+    
+    logger.log(f"🎯 Coordinate: Lux({x}, {y}) → Screen({x_scaled}, {y_scaled})")
     
     return x_scaled, y_scaled
 
@@ -378,7 +412,7 @@ async def execute_with_actor(request: TaskRequest) -> TaskResponse:
     """
     logger.clear()
     logger.log("=" * 60)
-    logger.log(f"LUX {request.mode.upper()} MODE - v7.0")
+    logger.log(f"LUX {request.mode.upper()} MODE - v{SERVICE_VERSION}")
     logger.log("=" * 60)
     logger.log(f"Task: {request.task_description[:80]}...")
     
@@ -401,8 +435,9 @@ async def execute_with_actor(request: TaskRequest) -> TaskResponse:
     # Screen info
     if PYAUTOGUI_AVAILABLE:
         screen_width, screen_height = pyautogui.size()
-        logger.log(f"Screen: {screen_width}x{screen_height}")
-        logger.log(f"Lux reference: {LUX_REF_WIDTH}x{LUX_REF_HEIGHT}")
+        logger.log(f"Screen reale: {screen_width}x{screen_height}")
+        logger.log(f"Lux reference: {LUX_REF_WIDTH}x{LUX_REF_HEIGHT} (ufficiale)")
+        logger.log(f"Scale factor: {screen_width/LUX_REF_WIDTH:.2f}x, {screen_height/LUX_REF_HEIGHT:.2f}y")
     
     history = ExecutionHistory(request.task_description)
     
@@ -434,10 +469,10 @@ async def execute_with_actor(request: TaskRequest) -> TaskResponse:
         
         if request.enable_screenshot_resize:
             image_provider = ResizedScreenshotMaker()
-            logger.log(f"📸 Screenshot resize: {LUX_REF_WIDTH}x{LUX_REF_HEIGHT}")
+            logger.log(f"📸 Screenshot resize: {LUX_REF_WIDTH}x{LUX_REF_HEIGHT} (ufficiale)")
         else:
             image_provider = AsyncScreenshotMaker()
-            logger.log("📸 Screenshot: risoluzione nativa")
+            logger.log("📸 Screenshot: risoluzione nativa (⚠️ potrebbe causare imprecisione)")
         
         action_handler = AsyncPyautoguiActionHandler(config=pyautogui_config)
         logger.log("🎮 Action handler: PyAutoGUI")
@@ -520,7 +555,7 @@ async def execute_with_tasker(request: TaskRequest) -> TaskResponse:
     """
     logger.clear()
     logger.log("=" * 60)
-    logger.log("LUX TASKER MODE - v7.0")
+    logger.log(f"LUX TASKER MODE - v{SERVICE_VERSION}")
     logger.log("=" * 60)
     
     if not TASKER_AGENT_AVAILABLE:
@@ -546,7 +581,8 @@ async def execute_with_tasker(request: TaskRequest) -> TaskResponse:
     # Screen info
     if PYAUTOGUI_AVAILABLE:
         screen_width, screen_height = pyautogui.size()
-        logger.log(f"Screen: {screen_width}x{screen_height}")
+        logger.log(f"Screen reale: {screen_width}x{screen_height}")
+        logger.log(f"Lux reference: {LUX_REF_WIDTH}x{LUX_REF_HEIGHT} (ufficiale)")
     
     history = ExecutionHistory(request.task_description, todos)
     
@@ -573,10 +609,10 @@ async def execute_with_tasker(request: TaskRequest) -> TaskResponse:
         # Crea image provider
         if request.enable_screenshot_resize:
             image_provider = ResizedScreenshotMaker()
-            logger.log(f"📸 Screenshot resize: {LUX_REF_WIDTH}x{LUX_REF_HEIGHT}")
+            logger.log(f"📸 Screenshot resize: {LUX_REF_WIDTH}x{LUX_REF_HEIGHT} (ufficiale)")
         else:
             image_provider = AsyncScreenshotMaker()
-            logger.log("📸 Screenshot: risoluzione nativa")
+            logger.log("📸 Screenshot: risoluzione nativa (⚠️ potrebbe causare imprecisione)")
         
         # Crea action handler
         action_handler = AsyncPyautoguiActionHandler(config=pyautogui_config)
@@ -1547,6 +1583,7 @@ async def get_status():
                 "async_actor": ASYNC_ACTOR_AVAILABLE,
                 "tasker_agent": TASKER_AGENT_AVAILABLE,
                 "observer": ASYNC_AGENT_OBSERVER_AVAILABLE,
+                "reference_resolution": f"{LUX_REF_WIDTH}x{LUX_REF_HEIGHT}",  # Aggiunto per debug
             },
             "gemini": {
                 "available": GEMINI_AVAILABLE,
@@ -1711,6 +1748,7 @@ if __name__ == "__main__":
 ║    {'✅' if ASYNC_ACTOR_AVAILABLE else '❌'} actor   - AsyncActor, task single-goal             ║
 ║    {'✅' if ASYNC_ACTOR_AVAILABLE else '❌'} thinker - AsyncActor, più ragionamento            ║
 ║    {'✅' if TASKER_AGENT_AVAILABLE else '❌'} tasker  - TaskerAgent con todos                   ║
+║    📐 Risoluzione: {LUX_REF_WIDTH}x{LUX_REF_HEIGHT} (ufficiale SDK)                  ║
 ║                                                              ║
 ║  GEMINI - Browser dedicato:                                  ║
 ║    {'✅' if GEMINI_AVAILABLE and PLAYWRIGHT_AVAILABLE else '❌'} gemini_cua    - Solo Vision                       ║
