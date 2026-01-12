@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-tool_server.py v8.0 - Desktop App "Hands Only" Server
+tool_server.py v8.0.1 - Desktop App "Hands Only" Server
 ======================================================
 
 Derived from tasker_service_v7.py - REMOVED all "brain" logic.
@@ -26,6 +26,9 @@ COORDINATE SYSTEMS:
 - viewport: relative to browser viewport (0,0 = top-left of page content)
 - screen: absolute screen coordinates
 - lux_sdk: Lux SDK coordinates (1260x700 reference) - requires conversion
+
+CHANGELOG:
+- v8.0.1: Fixed accessibility tree with JavaScript fallback
 """
 
 import asyncio
@@ -51,7 +54,7 @@ from pydantic import BaseModel, Field
 # CONFIGURATION
 # ============================================================================
 
-SERVICE_VERSION = "8.0.0"
+SERVICE_VERSION = "8.0.1"
 SERVICE_PORT = 8766  # 8765 is used by tasker_service.py
 
 # Lux SDK reference resolution (model trained on this)
@@ -469,12 +472,90 @@ class BrowserSession:
             raise RuntimeError("No active page")
         
         try:
-            snapshot = await self.page.accessibility.snapshot()
-            if not snapshot:
-                return "Accessibility tree not available"
-            return self._format_a11y_tree(snapshot)
+            # Try native accessibility API first
+            if hasattr(self.page, 'accessibility'):
+                try:
+                    snapshot = await self.page.accessibility.snapshot()
+                    if snapshot:
+                        return self._format_a11y_tree(snapshot)
+                except Exception as e:
+                    logger.debug(f"Accessibility API failed: {e}, using JavaScript fallback")
+            
+            # Fallback: use JavaScript to extract DOM structure
+            dom_structure = await self.page.evaluate('''() => {
+                function extractNode(node, depth = 0) {
+                    if (!node || depth > 10) return '';
+                    
+                    let result = '';
+                    const indent = '  '.repeat(depth);
+                    
+                    if (node.nodeType === Node.ELEMENT_NODE) {
+                        const tag = node.tagName.toLowerCase();
+                        const role = node.getAttribute('role') || '';
+                        const ariaLabel = node.getAttribute('aria-label') || '';
+                        const placeholder = node.getAttribute('placeholder') || '';
+                        const title = node.getAttribute('title') || '';
+                        const type = node.getAttribute('type') || '';
+                        const href = node.getAttribute('href') || '';
+                        const id = node.id ? '#' + node.id : '';
+                        const classes = node.className && typeof node.className === 'string' ? 
+                                        '.' + node.className.split(' ')[0] : '';
+                        
+                        // Get visible text (first 50 chars)
+                        let text = '';
+                        if (node.childNodes.length > 0) {
+                            for (const child of node.childNodes) {
+                                if (child.nodeType === Node.TEXT_NODE) {
+                                    text += child.textContent.trim() + ' ';
+                                }
+                            }
+                        }
+                        text = text.trim().substring(0, 50);
+                        
+                        // Determine if element is interactive or important
+                        const isInteractive = ['a', 'button', 'input', 'select', 'textarea', 'label'].includes(tag) ||
+                                             role || 
+                                             node.onclick || 
+                                             node.getAttribute('tabindex') ||
+                                             node.getAttribute('onclick');
+                        
+                        const isContainer = ['div', 'section', 'article', 'main', 'nav', 'header', 'footer', 'aside'].includes(tag);
+                        
+                        // Always include interactive elements and shallow containers
+                        if (isInteractive || depth < 3 || (isContainer && depth < 4)) {
+                            // Build label from available sources
+                            let label = ariaLabel || placeholder || title || text;
+                            if (label.length > 50) label = label.substring(0, 50) + '...';
+                            
+                            // Build element description
+                            let roleStr = role ? '[' + role + ']' : '<' + tag + '>';
+                            let extras = [];
+                            if (type) extras.push('type=' + type);
+                            if (href) extras.push('href');
+                            
+                            result += indent + roleStr + id + classes;
+                            if (extras.length > 0) result += ' (' + extras.join(', ') + ')';
+                            if (label) result += ' "' + label + '"';
+                            result += '\\n';
+                        }
+                        
+                        // Recurse into children
+                        for (const child of node.children) {
+                            result += extractNode(child, depth + 1);
+                        }
+                    }
+                    return result;
+                }
+                return extractNode(document.body);
+            }''')
+            
+            if dom_structure and dom_structure.strip():
+                return dom_structure
+            else:
+                return "DOM tree empty or not accessible"
+            
         except Exception as e:
-            return f"Error: {e}"
+            return f"Error getting DOM tree: {e}"
     
     def _format_a11y_tree(self, node: dict, indent: int = 0) -> str:
         """Format accessibility tree as readable text"""
@@ -1394,7 +1475,7 @@ if __name__ == "__main__":
 ║    {'✅' if PLAYWRIGHT_AVAILABLE else '❌'} Click/Type/Scroll (viewport coordinates)          ║
 ║    {'✅' if PLAYWRIGHT_AVAILABLE else '❌'} Navigate/Reload/Back/Forward (API)                ║
 ║    {'✅' if PLAYWRIGHT_AVAILABLE else '❌'} Tab management (API)                              ║
-║    {'✅' if PLAYWRIGHT_AVAILABLE else '❌'} DOM tree (Accessibility)                          ║
+║    {'✅' if PLAYWRIGHT_AVAILABLE else '❌'} DOM tree (Accessibility + JS fallback)            ║
 ║                                                              ║
 ║  DESKTOP SCOPE (PyAutoGUI):                                  ║
 ║    {'✅' if PYAUTOGUI_AVAILABLE else '❌'} Screenshot (full screen)                           ║
