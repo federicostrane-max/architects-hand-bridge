@@ -21,6 +21,7 @@ SUPPORTED PROVIDERS:
 Versioni:
 - v6.0.7: Switch a Edge per evitare conflitti
 - v7.0.0: Unified con Hybrid Mode + Lux completo
+- v7.2.3: FIX - Usa ImageConfig ufficiale SDK invece di custom ResizedScreenshotMaker
 - v7.2.2: FIX CRITICO - Risoluzione Lux corretta a 1260x700 (da repo ufficiale oagi)
 """
 
@@ -47,7 +48,7 @@ from pydantic import BaseModel, Field
 # CONFIGURATION
 # ============================================================================
 
-SERVICE_VERSION = "7.2.2"
+SERVICE_VERSION = "7.2.3"
 SERVICE_PORT = 8765
 
 # ==========================================================================
@@ -152,7 +153,8 @@ try:
         AsyncAgentObserver,
         AsyncScreenshotMaker,
         AsyncPyautoguiActionHandler,
-        PyautoguiConfig
+        PyautoguiConfig,
+        ImageConfig  # Per configurare resize screenshot a 1260x700
     )
     ASYNC_ACTOR_AVAILABLE = True
     TASKER_AGENT_AVAILABLE = True
@@ -456,8 +458,15 @@ async def execute_with_actor(request: TaskRequest) -> TaskResponse:
         )
         
         if request.enable_screenshot_resize:
-            image_provider = ResizedScreenshotMaker()
-            logger.log(f"📸 Screenshot resize: {LUX_REF_WIDTH}x{LUX_REF_HEIGHT} (ufficiale)")
+            # Usa ImageConfig ufficiale dell'SDK per resize a 1260x700
+            image_config = ImageConfig(
+                format="JPEG",
+                quality=85,
+                width=LUX_REF_WIDTH,   # 1260
+                height=LUX_REF_HEIGHT  # 700
+            )
+            image_provider = AsyncScreenshotMaker(config=image_config)
+            logger.log(f"📸 Screenshot resize: {LUX_REF_WIDTH}x{LUX_REF_HEIGHT} (SDK ufficiale)")
         else:
             image_provider = AsyncScreenshotMaker()
             logger.log("📸 Screenshot: risoluzione nativa (⚠️ potrebbe causare imprecisione)")
@@ -601,8 +610,15 @@ async def execute_with_tasker(request: TaskRequest) -> TaskResponse:
         
         # Crea image provider
         if request.enable_screenshot_resize:
-            image_provider = ResizedScreenshotMaker()
-            logger.log(f"📸 Screenshot resize: {LUX_REF_WIDTH}x{LUX_REF_HEIGHT} (ufficiale)")
+            # Usa ImageConfig ufficiale dell'SDK per resize a 1260x700
+            image_config = ImageConfig(
+                format="JPEG",
+                quality=85,
+                width=LUX_REF_WIDTH,   # 1260
+                height=LUX_REF_HEIGHT  # 700
+            )
+            image_provider = AsyncScreenshotMaker(config=image_config)
+            logger.log(f"📸 Screenshot resize: {LUX_REF_WIDTH}x{LUX_REF_HEIGHT} (SDK ufficiale)")
         else:
             image_provider = AsyncScreenshotMaker()
             logger.log("📸 Screenshot: risoluzione nativa (⚠️ potrebbe causare imprecisione)")
