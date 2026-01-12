@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Test Script per Tool Server v8.0
+Test Script per Tool Server v8.1.0
 Testa tutti gli endpoint sistematicamente
 
+v1.2 - Aggiunto test per /browser/dom/element_rect (Triple Verification)
 v1.1 - Fix: keypress usa "key" invece di "keys"
      - Fix: browser_stop usa query param invece di body
 """
@@ -27,6 +28,7 @@ class Colors:
     RED = '\033[91m'
     YELLOW = '\033[93m'
     BLUE = '\033[94m'
+    CYAN = '\033[96m'
     RESET = '\033[0m'
     BOLD = '\033[1m'
 
@@ -41,6 +43,9 @@ def info(msg):
 
 def warn(msg):
     print(f"{Colors.YELLOW}⚠️  {msg}{Colors.RESET}")
+
+def detail(msg):
+    print(f"{Colors.CYAN}   └── {msg}{Colors.RESET}")
 
 def header(msg):
     print(f"\n{Colors.BOLD}{Colors.BLUE}{'='*60}")
@@ -150,7 +155,7 @@ def test_screenshot(session_id, scope="browser"):
                 if data.get("lux_optimized"):
                     lux_w = data["lux_optimized"].get("width", "?")
                     lux_h = data["lux_optimized"].get("height", "?")
-                    info(f"  └── Lux optimized: {lux_w}x{lux_h}")
+                    detail(f"Lux optimized: {lux_w}x{lux_h}")
                 return True
             elif data.get("image_base64"):
                 img_size = len(data["image_base64"])
@@ -182,7 +187,7 @@ def test_dom_tree(session_id):
                 ok(f"DOM tree: {lines} lines, {len(tree)} chars")
                 # Show first 200 chars
                 preview = tree[:200].replace("\n", " ")
-                info(f"  └── Preview: {preview}...")
+                detail(f"Preview: {preview}...")
                 return True
             elif tree.startswith("Error"):
                 warn(f"DOM tree: {tree[:100]}")
@@ -195,6 +200,131 @@ def test_dom_tree(session_id):
             return False
     except Exception as e:
         fail(f"DOM tree: {e}")
+        return False
+
+def test_element_rect(session_id):
+    """
+    Test POST /browser/dom/element_rect
+    
+    Questo endpoint è fondamentale per la Triple Verification:
+    - Restituisce le coordinate DOM di un elemento
+    - Verranno confrontate con Lux e Gemini Vision
+    """
+    test_cases = [
+        # Test 1: Cerca per testo (Google ha molti link)
+        {
+            "name": "by text 'Google'",
+            "params": {"session_id": session_id, "text": "Google"},
+            "expect_found": True
+        },
+        # Test 2: Cerca per role (cerca una textarea o input)
+        {
+            "name": "by role 'textbox'",
+            "params": {"session_id": session_id, "role": "textbox"},
+            "expect_found": True
+        },
+        # Test 3: Cerca per selector CSS
+        {
+            "name": "by selector 'input'",
+            "params": {"session_id": session_id, "selector": "input"},
+            "expect_found": True
+        },
+        # Test 4: Cerca elemento che non esiste
+        {
+            "name": "non-existent element",
+            "params": {"session_id": session_id, "text": "xyznonexistent123"},
+            "expect_found": False
+        },
+    ]
+    
+    all_passed = True
+    passed_count = 0
+    
+    for test in test_cases:
+        try:
+            r = requests.post(
+                f"{TOOL_SERVER_URL}/browser/dom/element_rect",
+                json=test["params"],
+                timeout=TIMEOUT
+            )
+            
+            if r.status_code == 200:
+                data = r.json()
+                found = data.get("found", False)
+                
+                if found == test["expect_found"]:
+                    if found:
+                        x = data.get("x", "?")
+                        y = data.get("y", "?")
+                        visible = data.get("visible", False)
+                        tag = data.get("tag", "?")
+                        detail(f"{test['name']}: found at ({x}, {y}), tag=<{tag}>, visible={visible}")
+                        passed_count += 1
+                    else:
+                        detail(f"{test['name']}: correctly reported not found")
+                        passed_count += 1
+                else:
+                    fail(f"  Element rect {test['name']}: expected found={test['expect_found']}, got {found}")
+                    all_passed = False
+            else:
+                fail(f"  Element rect {test['name']}: HTTP {r.status_code}")
+                all_passed = False
+                
+        except Exception as e:
+            fail(f"  Element rect {test['name']}: {e}")
+            all_passed = False
+    
+    if all_passed:
+        ok(f"Element rect: {passed_count}/{len(test_cases)} tests passed")
+    else:
+        warn(f"Element rect: {passed_count}/{len(test_cases)} tests passed")
+    
+    return all_passed
+
+def test_element_rect_detailed(session_id):
+    """
+    Test dettagliato di /browser/dom/element_rect con tutti i parametri
+    """
+    try:
+        # Test con ricerca per testo e opzioni aggiuntive
+        r = requests.post(
+            f"{TOOL_SERVER_URL}/browser/dom/element_rect",
+            json={
+                "session_id": session_id,
+                "role": "button",  # Cerca pulsanti
+                "must_be_visible": True,
+                "index": 0  # Primo match
+            },
+            timeout=TIMEOUT
+        )
+        
+        if r.status_code == 200:
+            data = r.json()
+            if data.get("success"):
+                if data.get("found"):
+                    ok(f"Element rect detailed: found {data.get('element_count', 1)} elements")
+                    detail(f"Center: ({data.get('x')}, {data.get('y')})")
+                    if data.get("bounding_box"):
+                        bbox = data["bounding_box"]
+                        detail(f"BBox: x={bbox.get('x'):.0f}, y={bbox.get('y'):.0f}, "
+                               f"w={bbox.get('width'):.0f}, h={bbox.get('height'):.0f}")
+                    detail(f"Tag: <{data.get('tag')}>, Visible: {data.get('visible')}, "
+                           f"Enabled: {data.get('enabled')}")
+                    if data.get("text"):
+                        detail(f"Text: {data.get('text')[:50]}...")
+                    return True
+                else:
+                    warn("Element rect detailed: no buttons found (may be expected)")
+                    return True
+            else:
+                fail(f"Element rect detailed: {data.get('error')}")
+                return False
+        else:
+            fail(f"Element rect detailed: HTTP {r.status_code}")
+            return False
+            
+    except Exception as e:
+        fail(f"Element rect detailed: {e}")
         return False
 
 def test_current_url(session_id):
@@ -300,7 +430,7 @@ def test_keypress(session_id, key="Tab"):
             f"{TOOL_SERVER_URL}/keypress",
             json={
                 "scope": "browser",
-                "key": key,  # FIX: era "keys", ora "key"
+                "key": key,  # CORRETTO: usa "key" non "keys"
                 "session_id": session_id
             },
             timeout=TIMEOUT
@@ -388,7 +518,7 @@ def run_all_tests():
     """Esegue tutti i test in sequenza"""
     
     print(f"\n{Colors.BOLD}{'='*60}")
-    print(f"  TOOL SERVER TEST SUITE v1.1")
+    print(f"  TOOL SERVER TEST SUITE v1.2")
     print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  Target: {TOOL_SERVER_URL}")
     print(f"{'='*60}{Colors.RESET}\n")
@@ -455,7 +585,7 @@ def run_all_tests():
         results["failed"] += 1
     
     # ──────────────────────────────────────────────────────
-    # DOM TREE
+    # DOM TREE & ELEMENT RECT (NEW!)
     # ──────────────────────────────────────────────────────
     
     header("4. DOM / ACCESSIBILITY TREE")
@@ -471,10 +601,28 @@ def run_all_tests():
         results["failed"] += 1
     
     # ──────────────────────────────────────────────────────
+    # ELEMENT RECT - TRIPLE VERIFICATION SUPPORT (NEW!)
+    # ──────────────────────────────────────────────────────
+    
+    header("5. ELEMENT RECT (Triple Verification Support)")
+    
+    info("Test /browser/dom/element_rect per coordinate DOM...")
+    if test_element_rect(session_id):
+        results["passed"] += 1
+    else:
+        results["failed"] += 1
+    
+    info("Test dettagliato con tutti i parametri...")
+    if test_element_rect_detailed(session_id):
+        results["passed"] += 1
+    else:
+        results["failed"] += 1
+    
+    # ──────────────────────────────────────────────────────
     # ACTIONS
     # ──────────────────────────────────────────────────────
     
-    header("5. ACTIONS (Click, Type, Scroll, Keypress)")
+    header("6. ACTIONS (Click, Type, Scroll, Keypress)")
     
     # Click sulla search box di Google (circa al centro)
     info("Click al centro della pagina...")
@@ -514,7 +662,7 @@ def run_all_tests():
     # NAVIGATION
     # ──────────────────────────────────────────────────────
     
-    header("6. NAVIGATION")
+    header("7. NAVIGATION")
     
     info("Navigo a Bing...")
     if test_navigate(session_id, "https://www.bing.com"):
@@ -531,7 +679,7 @@ def run_all_tests():
     # CLEANUP
     # ──────────────────────────────────────────────────────
     
-    header("7. CLEANUP")
+    header("8. CLEANUP")
     
     info("Chiudo browser...")
     if test_browser_stop(session_id):
@@ -553,7 +701,12 @@ def run_all_tests():
     print()
     
     if results["failed"] == 0:
-        print(f"{Colors.GREEN}{Colors.BOLD}  🎉 TUTTI I TEST PASSATI! Tool Server pronto per .exe{Colors.RESET}")
+        print(f"{Colors.GREEN}{Colors.BOLD}  🎉 TUTTI I TEST PASSATI!{Colors.RESET}")
+        print(f"{Colors.GREEN}  Tool Server v8.1.0 pronto per .exe{Colors.RESET}")
+        print()
+        print(f"{Colors.CYAN}  📦 Per creare .exe:{Colors.RESET}")
+        print(f"{Colors.CYAN}     cd python-service{Colors.RESET}")
+        print(f"{Colors.CYAN}     pyinstaller --onefile --console --name \"ToolServer\" tool_server.py{Colors.RESET}")
     else:
         print(f"{Colors.YELLOW}  ⚠️  Alcuni test falliti. Verifica i log sopra.{Colors.RESET}")
     
