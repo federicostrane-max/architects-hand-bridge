@@ -447,18 +447,6 @@ async def execute_with_actor(request: TaskRequest) -> TaskResponse:
         if not api_key:
             raise ValueError("OAGI_API_KEY non configurata")
         
-        # Crea Actor
-        actor = AsyncActor(
-            api_key=api_key,
-            model=model
-        )
-        
-        # Inizializza task
-        actor.init_task(
-            task_desc=request.task_description,
-            max_steps=request.max_steps
-        )
-        
         # Crea handlers
         pyautogui_config = PyautoguiConfig(
             drag_duration=request.drag_duration,
@@ -477,53 +465,58 @@ async def execute_with_actor(request: TaskRequest) -> TaskResponse:
         action_handler = AsyncPyautoguiActionHandler(config=pyautogui_config)
         logger.log("🎮 Action handler: PyAutoGUI")
         
-        # Execution loop
-        step = 0
+        # Execution loop con AsyncActor come context manager (API ufficiale)
+        step_count = 0
         done = False
         
-        while not done and step < request.max_steps:
-            step += 1
-            logger.log(f"\n--- Step {step}/{request.max_steps} ---")
-            
-            # Cattura screenshot
-            screenshot_b64 = await image_provider()
-            
-            # Chiedi azione a Lux
-            actions, is_done = await actor.act(
-                image=screenshot_b64,
-                action_handler=action_handler
+        async with AsyncActor(api_key=api_key, model=model) as actor:
+            # Inizializza task (deve essere awaited)
+            await actor.init_task(
+                task_desc=request.task_description,
+                max_steps=request.max_steps
             )
             
-            if is_done:
-                logger.log("✅ Task completato!")
-                done = True
-                break
-            
-            # Esegui azioni
-            for action in actions:
-                action_type = str(action.type.value) if hasattr(action.type, "value") else str(action.type)
-                argument = str(action.argument) if hasattr(action, "argument") else ""
+            while not done and step_count < request.max_steps:
+                step_count += 1
+                logger.log(f"\n--- Step {step_count}/{request.max_steps} ---")
                 
-                logger.log(f"🎯 Action: {action_type}")
+                # Cattura screenshot
+                screenshot_b64 = await image_provider()
                 
-                # Intercetta type per clipboard
-                if action_type.lower() == "type" and argument:
-                    logger.log(f"⌨️ Typing via clipboard: '{argument[:50]}...'")
-                    type_via_clipboard(argument)
-                    history.add_step(step, "type", {"text": argument[:100]})
-                else:
-                    # Esegui via SDK
-                    await action_handler([action])
-                    history.add_step(step, action_type, {"argument": argument[:100] if argument else ""})
+                # Chiedi azione a Lux (metodo step(), non act())
+                step_result = await actor.step(screenshot_b64)
                 
-                time.sleep(0.1)
+                # Controlla se task completato
+                if step_result.stop:
+                    logger.log("✅ Task completato!")
+                    done = True
+                    break
+                
+                # Esegui azioni
+                for action in step_result.actions:
+                    action_type = str(action.type.value) if hasattr(action.type, "value") else str(action.type)
+                    argument = str(action.argument) if hasattr(action, "argument") else ""
+                    
+                    logger.log(f"🎯 Action: {action_type}")
+                    
+                    # Intercetta type per clipboard
+                    if action_type.lower() == "type" and argument:
+                        logger.log(f"⌨️ Typing via clipboard: '{argument[:50]}...'")
+                        type_via_clipboard(argument)
+                        history.add_step(step_count, "type", {"text": argument[:100]})
+                    else:
+                        # Esegui via SDK (action_handler chiamato direttamente con lista)
+                        await action_handler([action])
+                        history.add_step(step_count, action_type, {"argument": argument[:100] if argument else ""})
+                    
+                    time.sleep(0.1)
         
         history.finish(done)
         
         return TaskResponse(
             success=done,
             message="Task completato" if done else f"Max steps ({request.max_steps}) raggiunto",
-            steps_executed=step,
+            steps_executed=step_count,
             mode_used=request.mode,
             actions_log=history.steps,
             logs=logger.get_logs()
