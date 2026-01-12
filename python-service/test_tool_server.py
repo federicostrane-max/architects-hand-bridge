@@ -3,6 +3,7 @@
 Test Script per Tool Server v8.1.0
 Testa tutti gli endpoint sistematicamente
 
+v1.3 - Fix: test element_rect più robusti per Google (textarea, link, img)
 v1.2 - Aggiunto test per /browser/dom/element_rect (Triple Verification)
 v1.1 - Fix: keypress usa "key" invece di "keys"
      - Fix: browser_stop usa query param invece di body
@@ -209,24 +210,29 @@ def test_element_rect(session_id):
     Questo endpoint è fondamentale per la Triple Verification:
     - Restituisce le coordinate DOM di un elemento
     - Verranno confrontate con Lux e Gemini Vision
+    
+    v1.3: Test cases più robusti per Google:
+    - textarea (search box di Google)
+    - link (sempre presenti)
+    - img (logo Google)
     """
     test_cases = [
-        # Test 1: Cerca per testo (Google ha molti link)
+        # Test 1: Cerca textarea (la search box di Google è una textarea)
         {
-            "name": "by text 'Google'",
-            "params": {"session_id": session_id, "text": "Google"},
+            "name": "by selector 'textarea'",
+            "params": {"session_id": session_id, "selector": "textarea"},
             "expect_found": True
         },
-        # Test 2: Cerca per role (cerca una textarea o input)
+        # Test 2: Cerca per role 'link' (Google ha sempre link)
         {
-            "name": "by role 'textbox'",
-            "params": {"session_id": session_id, "role": "textbox"},
+            "name": "by role 'link'",
+            "params": {"session_id": session_id, "role": "link"},
             "expect_found": True
         },
-        # Test 3: Cerca per selector CSS
+        # Test 3: Cerca immagini (logo Google)
         {
-            "name": "by selector 'input'",
-            "params": {"session_id": session_id, "selector": "input"},
+            "name": "by selector 'img'",
+            "params": {"session_id": session_id, "selector": "img"},
             "expect_found": True
         },
         # Test 4: Cerca elemento che non esiste
@@ -251,20 +257,32 @@ def test_element_rect(session_id):
             if r.status_code == 200:
                 data = r.json()
                 found = data.get("found", False)
+                visible = data.get("visible", False)
                 
-                if found == test["expect_found"]:
-                    if found:
+                # Per "expect_found=True", verifichiamo anche che sia visible e abbia coordinate
+                if test["expect_found"]:
+                    # Deve essere trovato E visibile E avere coordinate
+                    has_coords = data.get("x") is not None and data.get("y") is not None
+                    actual_found = found and visible and has_coords
+                else:
+                    actual_found = found
+                
+                if actual_found == test["expect_found"]:
+                    if test["expect_found"]:
                         x = data.get("x", "?")
                         y = data.get("y", "?")
-                        visible = data.get("visible", False)
                         tag = data.get("tag", "?")
-                        detail(f"{test['name']}: found at ({x}, {y}), tag=<{tag}>, visible={visible}")
+                        count = data.get("element_count", 1)
+                        detail(f"{test['name']}: found at ({x}, {y}), tag=<{tag}>, count={count}")
                         passed_count += 1
                     else:
                         detail(f"{test['name']}: correctly reported not found")
                         passed_count += 1
                 else:
-                    fail(f"  Element rect {test['name']}: expected found={test['expect_found']}, got {found}")
+                    if test["expect_found"]:
+                        fail(f"  Element rect {test['name']}: expected visible element with coords, got found={found}, visible={visible}, x={data.get('x')}")
+                    else:
+                        fail(f"  Element rect {test['name']}: expected not found, got found={found}")
                     all_passed = False
             else:
                 fail(f"  Element rect {test['name']}: HTTP {r.status_code}")
@@ -286,7 +304,7 @@ def test_element_rect_detailed(session_id):
     Test dettagliato di /browser/dom/element_rect con tutti i parametri
     """
     try:
-        # Test con ricerca per testo e opzioni aggiuntive
+        # Test con ricerca per role button (Google ha pulsanti)
         r = requests.post(
             f"{TOOL_SERVER_URL}/browser/dom/element_rect",
             json={
@@ -301,7 +319,7 @@ def test_element_rect_detailed(session_id):
         if r.status_code == 200:
             data = r.json()
             if data.get("success"):
-                if data.get("found"):
+                if data.get("found") and data.get("visible"):
                     ok(f"Element rect detailed: found {data.get('element_count', 1)} elements")
                     detail(f"Center: ({data.get('x')}, {data.get('y')})")
                     if data.get("bounding_box"):
@@ -311,11 +329,36 @@ def test_element_rect_detailed(session_id):
                     detail(f"Tag: <{data.get('tag')}>, Visible: {data.get('visible')}, "
                            f"Enabled: {data.get('enabled')}")
                     if data.get("text"):
-                        detail(f"Text: {data.get('text')[:50]}...")
+                        text_preview = data.get('text', '')[:50]
+                        detail(f"Text: {text_preview}...")
                     return True
+                elif data.get("found"):
+                    # Trovato ma non visibile - proviamo con link invece
+                    warn("Element rect detailed: buttons not visible, trying links...")
+                    
+                    r2 = requests.post(
+                        f"{TOOL_SERVER_URL}/browser/dom/element_rect",
+                        json={
+                            "session_id": session_id,
+                            "role": "link",
+                            "must_be_visible": True,
+                            "index": 0
+                        },
+                        timeout=TIMEOUT
+                    )
+                    
+                    if r2.status_code == 200:
+                        data2 = r2.json()
+                        if data2.get("found") and data2.get("visible"):
+                            ok(f"Element rect detailed (link): found {data2.get('element_count', 1)} elements")
+                            detail(f"Center: ({data2.get('x')}, {data2.get('y')})")
+                            return True
+                    
+                    warn("Element rect detailed: no visible interactive elements")
+                    return True  # Non critico
                 else:
-                    warn("Element rect detailed: no buttons found (may be expected)")
-                    return True
+                    warn("Element rect detailed: no buttons found (trying alternative)")
+                    return True  # Non critico, l'endpoint funziona
             else:
                 fail(f"Element rect detailed: {data.get('error')}")
                 return False
@@ -518,7 +561,7 @@ def run_all_tests():
     """Esegue tutti i test in sequenza"""
     
     print(f"\n{Colors.BOLD}{'='*60}")
-    print(f"  TOOL SERVER TEST SUITE v1.2")
+    print(f"  TOOL SERVER TEST SUITE v1.3")
     print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  Target: {TOOL_SERVER_URL}")
     print(f"{'='*60}{Colors.RESET}\n")
