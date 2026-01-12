@@ -2,6 +2,9 @@
 """
 Test Script per Tool Server v8.0
 Testa tutti gli endpoint sistematicamente
+
+v1.1 - Fix: keypress usa "key" invece di "keys"
+     - Fix: browser_stop usa query param invece di body
 """
 
 import requests
@@ -174,13 +177,16 @@ def test_dom_tree(session_id):
         if r.status_code == 200:
             data = r.json()
             tree = data.get("tree", "")
-            if tree:
+            if tree and not tree.startswith("Error"):
                 lines = tree.count("\n") + 1
                 ok(f"DOM tree: {lines} lines, {len(tree)} chars")
                 # Show first 200 chars
                 preview = tree[:200].replace("\n", " ")
                 info(f"  └── Preview: {preview}...")
                 return True
+            elif tree.startswith("Error"):
+                warn(f"DOM tree: {tree[:100]}")
+                return False
             else:
                 warn("DOM tree: empty response")
                 return True
@@ -287,21 +293,21 @@ def test_scroll(session_id, direction="down"):
         fail(f"Scroll: {e}")
         return False
 
-def test_keypress(session_id, keys="Tab"):
+def test_keypress(session_id, key="Tab"):
     """Test POST /keypress"""
     try:
         r = requests.post(
             f"{TOOL_SERVER_URL}/keypress",
             json={
                 "scope": "browser",
-                "keys": keys,
+                "key": key,  # FIX: era "keys", ora "key"
                 "session_id": session_id
             },
             timeout=TIMEOUT
         )
         if r.status_code == 200:
             data = r.json()
-            ok(f"Keypress '{keys}': {data.get('success', data)}")
+            ok(f"Keypress '{key}': {data.get('success', data)}")
             return True
         else:
             fail(f"Keypress: HTTP {r.status_code} - {r.text[:200]}")
@@ -335,9 +341,9 @@ def test_navigate(session_id, url="https://www.bing.com"):
 def test_browser_stop(session_id):
     """Test POST /browser/stop"""
     try:
+        # FIX: usa query parameter invece di body
         r = requests.post(
-            f"{TOOL_SERVER_URL}/browser/stop",
-            json={"session_id": session_id},
+            f"{TOOL_SERVER_URL}/browser/stop?session_id={session_id}",
             timeout=TIMEOUT
         )
         if r.status_code == 200:
@@ -382,7 +388,7 @@ def run_all_tests():
     """Esegue tutti i test in sequenza"""
     
     print(f"\n{Colors.BOLD}{'='*60}")
-    print(f"  TOOL SERVER TEST SUITE")
+    print(f"  TOOL SERVER TEST SUITE v1.1")
     print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  Target: {TOOL_SERVER_URL}")
     print(f"{'='*60}{Colors.RESET}\n")
@@ -547,7 +553,7 @@ def run_all_tests():
     print()
     
     if results["failed"] == 0:
-        print(f"{Colors.GREEN}{Colors.BOLD}  🎉 TUTTI I TEST PASSATI! Tool Server pronto.{Colors.RESET}")
+        print(f"{Colors.GREEN}{Colors.BOLD}  🎉 TUTTI I TEST PASSATI! Tool Server pronto per .exe{Colors.RESET}")
     else:
         print(f"{Colors.YELLOW}  ⚠️  Alcuni test falliti. Verifica i log sopra.{Colors.RESET}")
     
