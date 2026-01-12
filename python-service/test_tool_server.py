@@ -229,10 +229,10 @@ def test_element_rect(session_id):
             "params": {"session_id": session_id, "role": "link"},
             "expect_found": True
         },
-        # Test 3: Cerca immagini (logo Google)
+        # Test 3: Cerca form (Google search form è sempre visibile)
         {
-            "name": "by selector 'img'",
-            "params": {"session_id": session_id, "selector": "img"},
+            "name": "by selector 'form'",
+            "params": {"session_id": session_id, "selector": "form"},
             "expect_found": True
         },
         # Test 4: Cerca elemento che non esiste
