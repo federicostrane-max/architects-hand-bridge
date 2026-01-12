@@ -1,7 +1,7 @@
 /**
  * Lux Client for Architect's Hand Bridge
  * Handles communication with Lux API and local Tasker Service
- * v3.5 - Added Gemini Computer Use support
+ * v3.6 - Fixed mode: 'direct' → dynamic mode based on model
  */
 
 const fetch = require('node-fetch');
@@ -78,14 +78,17 @@ class LuxClient {
       startUrl = null
     } = params;
 
+    // Determine mode from model name
+    const mode = model.includes('thinker') ? 'thinker' : 'actor';
+
     console.log(`[Lux] Executing direct task with model: ${model}`);
+    console.log(`[Lux] Mode: ${mode}`);
     console.log(`[Lux] Instruction: ${instruction}`);
     if (startUrl) {
       console.log(`[Lux] Start URL: ${startUrl}`);
     }
 
     try {
-      // For direct tasks, we send a single todo with the full instruction
       const response = await fetch(`${this.taskerServiceUrl}/execute`, {
         method: 'POST',
         headers: {
@@ -94,13 +97,11 @@ class LuxClient {
         body: JSON.stringify({
           api_key: this.apiKey,
           task_description: instruction,
-          todos: [instruction], // Single todo with full instruction
           start_url: startUrl,
           max_steps: maxSteps,
-          reflection_interval: maxSteps + 10, // Disable reflection for direct tasks
           model: model,
           temperature: temperature,
-          mode: 'direct' // Flag for direct execution
+          mode: mode  // 'actor' or 'thinker' based on model
         })
       });
 
