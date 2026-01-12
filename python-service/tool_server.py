@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-tool_server.py v8.0.1 - Desktop App "Hands Only" Server
+tool_server.py v8.1.0 - Desktop App "Hands Only" Server
 ======================================================
 
 Derived from tasker_service_v7.py - REMOVED all "brain" logic.
@@ -29,6 +29,7 @@ COORDINATE SYSTEMS:
 
 CHANGELOG:
 - v8.0.1: Fixed accessibility tree with JavaScript fallback
+- v8.1.0: Added /browser/dom/element_rect for Triple Verification (DOM + Lux + Gemini)
 """
 
 import asyncio
@@ -54,7 +55,7 @@ from pydantic import BaseModel, Field
 # CONFIGURATION
 # ============================================================================
 
-SERVICE_VERSION = "8.0.1"
+SERVICE_VERSION = "8.1.0"
 SERVICE_PORT = 8766  # 8765 is used by tasker_service.py
 
 # Lux SDK reference resolution (model trained on this)
@@ -207,6 +208,28 @@ class CoordinateValidateRequest(BaseModel):
     session_id: Optional[str] = None
 
 
+class ElementRectRequest(BaseModel):
+    """
+    Request to get element bounding rectangle for Triple Verification.
+    
+    Used by Orchestrator to get DOM coordinates and compare with Vision coordinates.
+    At least one search criteria must be provided.
+    """
+    session_id: str
+    # Multiple ways to find element - at least one required
+    selector: Optional[str] = None           # CSS selector: "button.send-btn", "#submit"
+    text: Optional[str] = None               # Find by text content: "Send", "Submit"
+    text_exact: Optional[bool] = False       # True = exact match, False = contains
+    role: Optional[str] = None               # ARIA role: "button", "link", "textbox"
+    role_name: Optional[str] = None          # Role + name: role="button" with name "Send"
+    test_id: Optional[str] = None            # data-testid attribute
+    placeholder: Optional[str] = None        # Input placeholder text
+    label: Optional[str] = None              # Label text (for form fields)
+    # Options
+    index: Optional[int] = 0                 # If multiple matches, which one (0-based)
+    must_be_visible: Optional[bool] = True   # Only return if element is visible
+
+
 # ============================================================================
 # PYDANTIC MODELS - Responses
 # ============================================================================
@@ -234,6 +257,32 @@ class StatusResponse(BaseModel):
     version: str
     browser_sessions: int
     capabilities: Dict[str, bool]
+
+
+class ElementRectResponse(BaseModel):
+    """
+    Response with element bounding rectangle.
+    
+    Returns center coordinates (x, y) ready for clicking,
+    plus full bounding box and element metadata.
+    """
+    success: bool
+    error: Optional[str] = None
+    # Element state
+    found: bool = False
+    visible: bool = False
+    enabled: bool = False
+    # Coordinates (center point - ready for clicking)
+    x: Optional[int] = None
+    y: Optional[int] = None
+    # Full bounding box
+    bounding_box: Optional[Dict[str, float]] = None  # {x, y, width, height}
+    # Element info
+    tag: Optional[str] = None
+    text: Optional[str] = None
+    element_count: Optional[int] = None  # How many elements matched
+    # For debugging
+    selector_used: Optional[str] = None
 
 
 # ============================================================================
@@ -573,6 +622,149 @@ class BrowserSession:
             lines.append(self._format_a11y_tree(child, indent + 1))
         
         return "\n".join(lines)
+    
+    async def get_element_rect(self, request: ElementRectRequest) -> ElementRectResponse:
+        """
+        Get bounding rectangle of a DOM element.
+        
+        Used for Triple Verification: DOM + Lux + Gemini coordinate comparison.
+        Returns center coordinates ready for clicking.
+        """
+        if not self.page:
+            return ElementRectResponse(success=False, error="No active page")
+        
+        try:
+            locator = None
+            selector_description = ""
+            
+            # Build locator based on provided criteria (in priority order)
+            if request.selector:
+                locator = self.page.locator(request.selector)
+                selector_description = f"selector: {request.selector}"
+            
+            elif request.test_id:
+                locator = self.page.get_by_test_id(request.test_id)
+                selector_description = f"test_id: {request.test_id}"
+            
+            elif request.role and request.role_name:
+                locator = self.page.get_by_role(request.role, name=request.role_name)
+                selector_description = f"role: {request.role}, name: {request.role_name}"
+            
+            elif request.role:
+                locator = self.page.get_by_role(request.role)
+                selector_description = f"role: {request.role}"
+            
+            elif request.text:
+                if request.text_exact:
+                    locator = self.page.get_by_text(request.text, exact=True)
+                else:
+                    locator = self.page.get_by_text(request.text)
+                selector_description = f"text: '{request.text}' (exact={request.text_exact})"
+            
+            elif request.label:
+                locator = self.page.get_by_label(request.label)
+                selector_description = f"label: {request.label}"
+            
+            elif request.placeholder:
+                locator = self.page.get_by_placeholder(request.placeholder)
+                selector_description = f"placeholder: {request.placeholder}"
+            
+            else:
+                return ElementRectResponse(
+                    success=False,
+                    error="Must provide at least one: selector, text, role, test_id, label, or placeholder"
+                )
+            
+            # Count matches
+            count = await locator.count()
+            
+            if count == 0:
+                return ElementRectResponse(
+                    success=True,
+                    found=False,
+                    element_count=0,
+                    selector_used=selector_description,
+                    error="Element not found"
+                )
+            
+            # Select specific element if multiple matches
+            if count > 1 and request.index is not None:
+                if request.index >= count:
+                    return ElementRectResponse(
+                        success=True,
+                        found=True,
+                        element_count=count,
+                        selector_used=selector_description,
+                        error=f"Requested index {request.index} but only {count} elements found"
+                    )
+                locator = locator.nth(request.index)
+            elif count > 1:
+                locator = locator.first
+            
+            # Check visibility
+            is_visible = await locator.is_visible()
+            
+            if request.must_be_visible and not is_visible:
+                return ElementRectResponse(
+                    success=True,
+                    found=True,
+                    visible=False,
+                    element_count=count,
+                    selector_used=selector_description,
+                    error="Element found but not visible"
+                )
+            
+            # Check if enabled (for form elements)
+            is_enabled = await locator.is_enabled()
+            
+            # Get bounding box
+            bbox = await locator.bounding_box()
+            
+            if not bbox:
+                return ElementRectResponse(
+                    success=True,
+                    found=True,
+                    visible=False,
+                    enabled=is_enabled,
+                    element_count=count,
+                    selector_used=selector_description,
+                    error="Element has no bounding box (may be hidden or zero-size)"
+                )
+            
+            # Get element info
+            element_info = await locator.evaluate('''(el) => {
+                return {
+                    tag: el.tagName.toLowerCase(),
+                    text: el.innerText ? el.innerText.substring(0, 100) : null
+                }
+            }''')
+            
+            # Calculate center point (for clicking)
+            center_x = int(bbox['x'] + bbox['width'] / 2)
+            center_y = int(bbox['y'] + bbox['height'] / 2)
+            
+            return ElementRectResponse(
+                success=True,
+                found=True,
+                visible=is_visible,
+                enabled=is_enabled,
+                x=center_x,
+                y=center_y,
+                bounding_box={
+                    "x": bbox['x'],
+                    "y": bbox['y'],
+                    "width": bbox['width'],
+                    "height": bbox['height']
+                },
+                tag=element_info.get('tag'),
+                text=element_info.get('text'),
+                element_count=count,
+                selector_used=selector_description
+            )
+            
+        except Exception as e:
+            logger.error(f"Error getting element rect: {e}")
+            return ElementRectResponse(success=False, error=str(e))
     
     def get_tabs_info(self) -> List[Dict[str, Any]]:
         """Get info about all tabs"""
@@ -1298,6 +1490,40 @@ async def browser_dom_tree(session_id: str = Query(...)):
         return {"success": False, "error": str(e)}
 
 
+@app.post("/browser/dom/element_rect", response_model=ElementRectResponse)
+async def browser_element_rect(request: ElementRectRequest):
+    """
+    Get bounding rectangle of a DOM element.
+    
+    ┌─────────────────────────────────────────────────────────────────┐
+    │  TRIPLE VERIFICATION SUPPORT                                    │
+    │                                                                 │
+    │  This endpoint provides DOM coordinates for comparison with:   │
+    │  1. Lux Vision coordinates                                     │
+    │  2. Gemini Vision coordinates                                  │
+    │                                                                 │
+    │  If all 3 agree (< 50px distance), proceed with high confidence│
+    │  If mismatch > 150px, something is wrong (overlay, hidden, etc)│
+    └─────────────────────────────────────────────────────────────────┘
+    
+    Multiple ways to find element:
+    - selector: CSS selector (e.g., "button.send-btn", "#submit")
+    - text: Find by text content (exact or contains)
+    - role: ARIA role (e.g., "button", "link")
+    - role + role_name: Role with accessible name
+    - test_id: data-testid attribute
+    - label: Label text (for form fields)
+    - placeholder: Input placeholder
+    
+    Returns center coordinates (x, y) ready for clicking.
+    """
+    session = session_manager.get_session(request.session_id)
+    if not session or not session.is_alive():
+        return ElementRectResponse(success=False, error="Session not found")
+    
+    return await session.get_element_rect(request)
+
+
 @app.get("/browser/current_url")
 async def browser_current_url(session_id: str = Query(...)):
     """Get current page URL"""
@@ -1476,6 +1702,7 @@ if __name__ == "__main__":
 ║    {'✅' if PLAYWRIGHT_AVAILABLE else '❌'} Navigate/Reload/Back/Forward (API)                ║
 ║    {'✅' if PLAYWRIGHT_AVAILABLE else '❌'} Tab management (API)                              ║
 ║    {'✅' if PLAYWRIGHT_AVAILABLE else '❌'} DOM tree (Accessibility + JS fallback)            ║
+║    {'✅' if PLAYWRIGHT_AVAILABLE else '❌'} Element rect (Triple Verification support)        ║
 ║                                                              ║
 ║  DESKTOP SCOPE (PyAutoGUI):                                  ║
 ║    {'✅' if PYAUTOGUI_AVAILABLE else '❌'} Screenshot (full screen)                           ║
