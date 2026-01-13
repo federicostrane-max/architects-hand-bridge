@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-tool_server.py v8.4.1 - Desktop App "Hands Only" Server
+tool_server.py v8.4.2 - Desktop App "Hands Only" Server
 ======================================================
 
 PRINCIPIO ARCHITETTURALE: HANDS ONLY
@@ -11,6 +11,7 @@ TUTTA l'intelligenza (decisioni, verifiche, confidence) sta nella Web App.
 Il Tool Server:
 ✅ Cattura screenshot
 ✅ Legge coordinate DOM
+✅ Legge struttura DOM (Accessibility Tree)
 ✅ Esegue click/type/scroll
 ✅ Converte coordinate (utility)
 ❌ NON decide se procedere o meno
@@ -33,6 +34,9 @@ CHANGELOG:
          - Rimosso /coordinates/triple_verify endpoint
          - Rimossa classe TripleVerifier
          - Server torna a essere "Hands Only"
+- v8.4.2: Aggiunto /browser/dom/tree endpoint
+         - Restituisce Accessibility Tree della pagina
+         - Usato dall'agente DOM Analyzer per analizzare struttura siti
 """
 
 import asyncio
@@ -58,7 +62,7 @@ from pydantic import BaseModel, Field
 # CONFIGURATION
 # ============================================================================
 
-SERVICE_VERSION = "8.4.1"
+SERVICE_VERSION = "8.4.2"
 SERVICE_PORT = 8766
 
 # ============================================================================
@@ -505,6 +509,16 @@ class BrowserSession:
             raise RuntimeError("No active page")
         return await self.page.screenshot(type="png")
     
+    async def get_accessibility_tree(self) -> Optional[Dict[str, Any]]:
+        """Get the accessibility tree of the current page."""
+        if not self.page:
+            return None
+        try:
+            return await self.page.accessibility.snapshot()
+        except Exception as e:
+            logger.error(f"Accessibility tree error: {e}")
+            return None
+    
     async def get_element_rect(self, request: ElementRectRequest) -> ElementRectResponse:
         """Get element bounding rectangle - raw data only."""
         if not self.page:
@@ -644,7 +658,7 @@ session_manager = SessionManager()
 
 app = FastAPI(
     title="Architect's Hand - Tool Server",
-    description="Hands Only Server - Execution without Intelligence (v8.4.1)",
+    description="Hands Only Server - Execution without Intelligence (v8.4.2)",
     version=SERVICE_VERSION
 )
 
@@ -803,6 +817,7 @@ async def do_click(request: ClickRequest):
             elif request.click_type == "right":
                 await session.page.mouse.click(x, y, button="right")
             
+            logger.info(f"🖱️ Click: ({x}, {y})")
             return ActionResponse(
                 success=True,
                 executed_with="playwright",
@@ -827,6 +842,7 @@ async def do_click(request: ClickRequest):
             elif request.click_type == "right":
                 pyautogui.rightClick(x, y)
             
+            logger.info(f"🖱️ Desktop Click: ({x}, {y})")
             return ActionResponse(success=True, executed_with="pyautogui", details={"x": x, "y": y})
     
     except Exception as e:
@@ -852,6 +868,7 @@ async def do_type(request: TypeRequest):
                 await asyncio.sleep(0.1)
             
             await session.page.keyboard.type(request.text, delay=50)
+            logger.info(f"⌨️ Type: '{request.text[:20]}...' " if len(request.text) > 20 else f"⌨️ Type: '{request.text}'")
             return ActionResponse(success=True, executed_with="playwright")
         
         elif request.scope == "desktop":
@@ -863,6 +880,7 @@ async def do_type(request: TypeRequest):
             else:
                 pyautogui.typewrite(request.text, interval=0.05)
             
+            logger.info(f"⌨️ Desktop Type: '{request.text[:20]}...' " if len(request.text) > 20 else f"⌨️ Desktop Type: '{request.text}'")
             return ActionResponse(success=True, executed_with="pyautogui")
     
     except Exception as e:
@@ -893,6 +911,7 @@ async def do_scroll(request: ScrollRequest):
                 delta_x = request.amount
             
             await session.page.mouse.wheel(delta_x, delta_y)
+            logger.info(f"📜 Scroll: {request.direction} {request.amount}px")
             return ActionResponse(success=True, executed_with="playwright")
         
         elif request.scope == "desktop":
@@ -905,6 +924,7 @@ async def do_scroll(request: ScrollRequest):
             elif request.direction == "down":
                 pyautogui.scroll(-clicks)
             
+            logger.info(f"📜 Desktop Scroll: {request.direction} {clicks} clicks")
             return ActionResponse(success=True, executed_with="pyautogui")
     
     except Exception as e:
@@ -934,6 +954,7 @@ async def do_keypress(request: KeypressRequest):
             else:
                 await session.page.keyboard.press(request.key)
             
+            logger.info(f"⌨️ Keypress: {request.key}")
             return ActionResponse(success=True, executed_with="playwright")
         
         elif request.scope == "desktop":
@@ -945,6 +966,7 @@ async def do_keypress(request: KeypressRequest):
             else:
                 pyautogui.press(request.key.lower())
             
+            logger.info(f"⌨️ Desktop Keypress: {request.key}")
             return ActionResponse(success=True, executed_with="pyautogui")
     
     except Exception as e:
@@ -1012,6 +1034,7 @@ async def browser_navigate(request: NavigateRequest):
     
     try:
         await session.page.goto(request.url, wait_until="domcontentloaded", timeout=30000)
+        logger.info(f"🌐 Navigate: {request.url}")
         return {"success": True, "url": session.page.url}
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -1126,6 +1149,33 @@ async def browser_tab_switch(request: TabRequest):
 # ENDPOINTS: Browser DOM
 # ============================================================================
 
+@app.get("/browser/dom/tree")
+async def browser_dom_tree(session_id: str = Query(...)):
+    """
+    Restituisce l'Accessibility Tree della pagina corrente.
+    
+    Usato dall'agente DOM Analyzer per:
+    - Analizzare la struttura del sito
+    - Identificare elementi interattivi
+    - Pianificare strategie di automazione
+    """
+    session = session_manager.get_session(session_id)
+    if not session or not session.is_alive():
+        return {"success": False, "error": "Session not found"}
+    
+    try:
+        tree = await session.get_accessibility_tree()
+        logger.info(f"🌳 DOM Tree requested for: {session.page.url}")
+        return {
+            "success": True,
+            "url": session.page.url,
+            "tree": tree
+        }
+    except Exception as e:
+        logger.error(f"DOM tree error: {e}")
+        return {"success": False, "error": str(e)}
+
+
 @app.post("/browser/dom/element_rect", response_model=ElementRectResponse)
 async def browser_element_rect(request: ElementRectRequest):
     """
@@ -1142,7 +1192,10 @@ async def browser_element_rect(request: ElementRectRequest):
     if not session or not session.is_alive():
         return ElementRectResponse(success=False, error="Session not found")
     
-    return await session.get_element_rect(request)
+    result = await session.get_element_rect(request)
+    if result.success and result.found:
+        logger.info(f"📍 Element rect: ({result.x}, {result.y}) - {result.selector_used}")
+    return result
 
 
 @app.get("/browser/current_url")
@@ -1227,6 +1280,7 @@ if __name__ == "__main__":
 ║                                                              ║
 ║  Questo server fornisce SOLO esecuzione:                     ║
 ║  ├── Screenshot (dati grezzi)                                ║
+║  ├── DOM tree (Accessibility Tree)                           ║
 ║  ├── DOM element_rect (dati grezzi)                          ║
 ║  ├── Click/Type/Scroll/Keypress (esecuzione)                 ║
 ║  └── Coordinate conversion (utility)                         ║
