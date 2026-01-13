@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-tool_server.py v8.2.0 - Desktop App "Hands Only" Server
+tool_server.py v8.3.0 - Desktop App "Hands Only" Server
 ======================================================
 
 Derived from tasker_service_v7.py - REMOVED all "brain" logic.
@@ -11,7 +11,7 @@ All intelligence (planning, decision-making, self-healing) stays in the Web App.
 SCOPES:
 
 1. BROWSER (Playwright + Edge)
-   - Screenshot: viewport only
+   - Screenshot: viewport only (1260x700 - aligned with Lux SDK)
    - Click/Type/Scroll: coordinate-based (relative to viewport)
    - Chrome actions: API-based (navigate, reload, back, forward, tabs)
    - Used by: Lux AND Gemini (same browser instance)
@@ -25,13 +25,18 @@ SCOPES:
 COORDINATE SYSTEMS:
 - viewport: relative to browser viewport (0,0 = top-left of page content)
 - screen: absolute screen coordinates
-- lux_sdk: Lux SDK coordinates (1260x700 reference) - requires conversion
+- lux_sdk: Lux SDK coordinates (1260x700 reference) - NOW SAME AS VIEWPORT!
 - normalized: Gemini 2.5 Computer Use coordinates (0-999 range) - requires denormalization
 
 CHANGELOG:
 - v8.0.1: Fixed accessibility tree with JavaScript fallback
 - v8.1.0: Added /browser/dom/element_rect for Triple Verification (DOM + Lux + Gemini)
 - v8.2.0: Added 'normalized' coordinate_origin for Gemini 2.5 Computer Use (0-999 range)
+- v8.3.0: VIEWPORT ALIGNED TO LUX SDK (1260x700) - No more resize/conversion for browser scope!
+         - Viewport now matches Lux SDK reference exactly
+         - Eliminated resize_for_lux() overhead for browser screenshots
+         - lux_sdk → viewport conversion is now 1:1 (no scaling)
+         - Improved accuracy: no more rounding errors from coordinate conversion
 """
 
 import asyncio
@@ -57,7 +62,7 @@ from pydantic import BaseModel, Field
 # CONFIGURATION
 # ============================================================================
 
-SERVICE_VERSION = "8.2.0"
+SERVICE_VERSION = "8.3.0"
 SERVICE_PORT = 8766  # 8765 is used by tasker_service.py
 
 # Lux SDK reference resolution (model trained on this)
@@ -68,9 +73,20 @@ LUX_SDK_HEIGHT = 700
 LUX_SCREEN_REF_WIDTH = 1920
 LUX_SCREEN_REF_HEIGHT = 1200
 
-# Viewport for browser (optimized for vision models)
-VIEWPORT_WIDTH = 1280
-VIEWPORT_HEIGHT = 720
+# ============================================================================
+# v8.3.0 CHANGE: Viewport NOW MATCHES Lux SDK reference!
+# ============================================================================
+# This eliminates the need for:
+# 1. Resizing screenshots before sending to Lux
+# 2. Converting coordinates from lux_sdk to viewport
+# 3. Potential rounding errors from coordinate scaling
+#
+# The browser viewport is set to exactly 1260x700, which is the resolution
+# Lux was trained on. Screenshots are captured at this resolution and
+# coordinates from Lux can be used directly without any conversion.
+# ============================================================================
+VIEWPORT_WIDTH = LUX_SDK_WIDTH   # 1260 (was 1280)
+VIEWPORT_HEIGHT = LUX_SDK_HEIGHT  # 700 (was 720)
 
 # Gemini 2.5 Computer Use normalized coordinate range
 # The model outputs coordinates in 0-999 range regardless of image dimensions
@@ -148,6 +164,7 @@ class ClickRequest(BaseModel):
     x: int
     y: int
     # v8.2.0: Added 'normalized' for Gemini 2.5 Computer Use
+    # v8.3.0: lux_sdk is now 1:1 with viewport (no conversion needed)
     coordinate_origin: Literal["viewport", "screen", "lux_sdk", "normalized"] = "viewport"
     click_type: Literal["single", "double", "right"] = "single"
     session_id: Optional[str] = None
@@ -260,6 +277,7 @@ class ScreenshotResponse(BaseModel):
     """Response containing screenshot(s)"""
     success: bool
     error: Optional[str] = None
+    # v8.3.0: For browser scope, original IS lux_optimized (same resolution)
     original: Optional[Dict[str, Any]] = None  # {image_base64, width, height}
     lux_optimized: Optional[Dict[str, Any]] = None  # {image_base64, width, height, scale_x, scale_y}
 
@@ -307,6 +325,10 @@ def resize_for_lux(image_bytes: bytes, target_width: int = LUX_SDK_WIDTH,
     """
     Resize image to Lux SDK reference resolution.
     Returns dict with base64 image and scale factors for coordinate conversion.
+    
+    v8.3.0 NOTE: For browser scope, this is NO LONGER NEEDED since viewport
+    is already at 1260x700. This function is still used for DESKTOP scope
+    where screen resolution varies.
     """
     if not PIL_AVAILABLE:
         raise RuntimeError("PIL not available for image resizing")
@@ -384,7 +406,7 @@ def type_via_clipboard(text: str):
 
 
 # ============================================================================
-# COORDINATE CONVERTER (v8.2.0 - Added normalized support)
+# COORDINATE CONVERTER (v8.3.0 - lux_sdk ↔ viewport is now 1:1 for browser)
 # ============================================================================
 
 class CoordinateConverter:
@@ -392,10 +414,13 @@ class CoordinateConverter:
     Converts coordinates between different spaces.
     
     Supported spaces:
-    - viewport: Browser viewport coordinates (0,0 = top-left of page content)
+    - viewport: Browser viewport coordinates (1260x700 - same as Lux SDK!)
     - screen: Absolute screen coordinates
-    - lux_sdk: Lux SDK reference (1260x700)
+    - lux_sdk: Lux SDK reference (1260x700) - NOW IDENTICAL TO VIEWPORT
     - normalized: Gemini 2.5 Computer Use (0-999 range)
+    
+    v8.3.0 CHANGE: Since viewport is now 1260x700 (same as Lux SDK),
+    lux_sdk ↔ viewport conversions are 1:1 (no scaling needed).
     """
     
     # ========== LUX SDK Conversions ==========
@@ -416,14 +441,33 @@ class CoordinateConverter:
     
     @staticmethod
     def lux_sdk_to_viewport(x: int, y: int, viewport_width: int, viewport_height: int) -> tuple:
-        """Convert Lux SDK coords to viewport coords"""
+        """
+        Convert Lux SDK coords to viewport coords.
+        
+        v8.3.0: Since viewport is now 1260x700 (same as Lux SDK),
+        this is effectively a 1:1 mapping (no conversion needed).
+        We keep the function for API compatibility and for cases
+        where viewport might differ (e.g., future changes).
+        """
+        # If viewport matches Lux SDK (the default now), no conversion needed
+        if viewport_width == LUX_SDK_WIDTH and viewport_height == LUX_SDK_HEIGHT:
+            return x, y
+        
+        # Fallback for non-standard viewports
         scale_x = viewport_width / LUX_SDK_WIDTH
         scale_y = viewport_height / LUX_SDK_HEIGHT
         return int(x * scale_x), int(y * scale_y)
     
     @staticmethod
     def viewport_to_lux_sdk(x: int, y: int, viewport_width: int, viewport_height: int) -> tuple:
-        """Convert viewport coords to Lux SDK coords"""
+        """
+        Convert viewport coords to Lux SDK coords.
+        
+        v8.3.0: 1:1 mapping when viewport is 1260x700.
+        """
+        if viewport_width == LUX_SDK_WIDTH and viewport_height == LUX_SDK_HEIGHT:
+            return x, y
+        
         scale_x = LUX_SDK_WIDTH / viewport_width
         scale_y = LUX_SDK_HEIGHT / viewport_height
         return int(x * scale_x), int(y * scale_y)
@@ -440,10 +484,10 @@ class CoordinateConverter:
         
         Formula: pixel = normalized / 1000 * dimension
         
-        Example for 1280x720 viewport:
-        - (500, 500) normalized → (640, 360) viewport (center)
+        Example for 1260x700 viewport (v8.3.0 default):
+        - (500, 500) normalized → (630, 350) viewport (center)
         - (0, 0) normalized → (0, 0) viewport (top-left)
-        - (999, 999) normalized → (1279, 719) viewport (bottom-right)
+        - (999, 999) normalized → (1259, 699) viewport (bottom-right)
         """
         # Use 1000 as divisor (normalized range is 0-999, so 999 maps to ~99.9%)
         pixel_x = int(x / 1000 * viewport_width)
@@ -525,11 +569,17 @@ class BrowserSession:
         return None
     
     async def start(self, start_url: Optional[str] = None, headless: bool = False):
-        """Start browser with Edge and persistent profile"""
+        """
+        Start browser with Edge and persistent profile.
+        
+        v8.3.0: Viewport is now 1260x700 (matching Lux SDK reference).
+        This eliminates the need for screenshot resizing and coordinate conversion.
+        """
         self.playwright = await async_playwright().start()
         BROWSER_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
         
-        logger.info(f"🌐 Starting Edge browser: {BROWSER_PROFILE_DIR}")
+        logger.info(f"🌐 Starting Edge browser with viewport {VIEWPORT_WIDTH}x{VIEWPORT_HEIGHT} (Lux SDK native)")
+        logger.info(f"📁 Profile: {BROWSER_PROFILE_DIR}")
         
         self.context = await self.playwright.chromium.launch_persistent_context(
             user_data_dir=str(BROWSER_PROFILE_DIR),
@@ -580,6 +630,8 @@ class BrowserSession:
         """
         Get exact viewport position on screen using JavaScript.
         Used for coordinate validation.
+        
+        v8.3.0: viewport_width and viewport_height should be 1260x700.
         """
         if not self.page:
             raise RuntimeError("No active page")
@@ -606,7 +658,12 @@ class BrowserSession:
         }
     
     async def capture_screenshot(self) -> bytes:
-        """Capture viewport screenshot"""
+        """
+        Capture viewport screenshot.
+        
+        v8.3.0: Screenshot is now captured at 1260x700 (Lux SDK native resolution).
+        No resizing needed before sending to Lux!
+        """
         if not self.page:
             raise RuntimeError("No active page")
         return await self.page.screenshot(type="png")
@@ -725,6 +782,9 @@ class BrowserSession:
         
         Used for Triple Verification: DOM + Lux + Gemini coordinate comparison.
         Returns center coordinates ready for clicking.
+        
+        v8.3.0: Returned coordinates are in viewport space (1260x700),
+        which is now identical to Lux SDK space. No conversion needed!
         """
         if not self.page:
             return ElementRectResponse(success=False, error="No active page")
@@ -836,6 +896,7 @@ class BrowserSession:
             }''')
             
             # Calculate center point (for clicking)
+            # v8.3.0: These are viewport coords = Lux SDK coords (1:1)
             center_x = int(bbox['x'] + bbox['width'] / 2)
             center_y = int(bbox['y'] + bbox['height'] / 2)
             
@@ -931,7 +992,7 @@ session_manager = SessionManager()
 
 app = FastAPI(
     title="Architect's Hand - Tool Server",
-    description="Desktop App 'Hands Only' Server - Execution without Intelligence",
+    description="Desktop App 'Hands Only' Server - Execution without Intelligence (v8.3.0: Lux-native viewport)",
     version=SERVICE_VERSION
 )
 
@@ -950,7 +1011,11 @@ app.add_middleware(
 
 @app.get("/")
 async def root():
-    return {"service": "Architect's Hand Tool Server", "version": SERVICE_VERSION}
+    return {
+        "service": "Architect's Hand Tool Server", 
+        "version": SERVICE_VERSION,
+        "viewport": f"{VIEWPORT_WIDTH}x{VIEWPORT_HEIGHT} (Lux SDK native)"
+    }
 
 
 @app.get("/status", response_model=StatusResponse)
@@ -975,6 +1040,7 @@ async def get_screen_info():
     info = {
         "lux_sdk_reference": {"width": LUX_SDK_WIDTH, "height": LUX_SDK_HEIGHT},
         "viewport_reference": {"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
+        "viewport_matches_lux": VIEWPORT_WIDTH == LUX_SDK_WIDTH and VIEWPORT_HEIGHT == LUX_SDK_HEIGHT,
         "normalized_range": {"min": 0, "max": NORMALIZED_COORD_MAX}
     }
     
@@ -994,15 +1060,18 @@ async def get_screen_info():
 
 
 # ============================================================================
-# ENDPOINTS: Screenshot
+# ENDPOINTS: Screenshot (v8.3.0 - Simplified for browser scope)
 # ============================================================================
 
 @app.post("/screenshot", response_model=ScreenshotResponse)
 async def take_screenshot(request: ScreenshotRequest):
     """
     Take screenshot based on scope.
-    - browser: viewport only (for Lux/Gemini web automation)
-    - desktop: full screen (for Lux desktop automation)
+    - browser: viewport only (1260x700 - Lux SDK native, NO RESIZE NEEDED!)
+    - desktop: full screen (requires resize for Lux)
+    
+    v8.3.0 CHANGE: For browser scope, screenshot is already at Lux SDK resolution.
+    The lux_optimized field returns the same image with scale factors of 1.0.
     """
     try:
         if request.scope == "browser":
@@ -1019,23 +1088,33 @@ async def take_screenshot(request: ScreenshotRequest):
                     error="No active browser session. Start one with POST /browser/start"
                 )
             
-            # Capture viewport screenshot
+            # Capture viewport screenshot (already at 1260x700!)
             screenshot_bytes = await session.capture_screenshot()
             viewport = await session.get_viewport_bounds()
             
             result = ScreenshotResponse(success=True)
             
-            # Original (full resolution)
-            if request.optimize_for in [None, "gemini", "both"]:
-                result.original = screenshot_to_base64(
-                    screenshot_bytes, 
-                    viewport["width"], 
-                    viewport["height"]
-                )
+            # Original screenshot (1260x700 - same as Lux SDK!)
+            original_data = screenshot_to_base64(
+                screenshot_bytes, 
+                viewport["width"], 
+                viewport["height"]
+            )
             
-            # Lux optimized (resized to 1260x700)
+            # For Gemini or general use
+            if request.optimize_for in [None, "gemini", "both"]:
+                result.original = original_data
+            
+            # For Lux: NO RESIZE NEEDED! Just add scale factors for API compatibility
             if request.optimize_for in ["lux", "both"]:
-                result.lux_optimized = resize_for_lux(screenshot_bytes)
+                result.lux_optimized = {
+                    **original_data,
+                    "original_width": viewport["width"],
+                    "original_height": viewport["height"],
+                    "scale_x": 1.0,  # No scaling needed!
+                    "scale_y": 1.0   # Viewport = Lux SDK resolution
+                }
+                logger.info(f"📸 Browser screenshot {viewport['width']}x{viewport['height']} (Lux-native, no resize)")
             
             return result
         
@@ -1046,7 +1125,7 @@ async def take_screenshot(request: ScreenshotRequest):
                     error="PyAutoGUI not available for desktop screenshots"
                 )
             
-            # Capture full screen
+            # Capture full screen (varies by user's monitor)
             screenshot = pyautogui.screenshot()
             
             # Convert to bytes
@@ -1059,7 +1138,7 @@ async def take_screenshot(request: ScreenshotRequest):
             
             result = ScreenshotResponse(success=True)
             
-            # Original
+            # Original (full screen resolution)
             if request.optimize_for in [None, "gemini", "both"]:
                 result.original = screenshot_to_base64(
                     screenshot_bytes,
@@ -1067,9 +1146,10 @@ async def take_screenshot(request: ScreenshotRequest):
                     screen_height
                 )
             
-            # Lux optimized
+            # Lux optimized: RESIZE STILL NEEDED for desktop (screen varies)
             if request.optimize_for in ["lux", "both"]:
                 result.lux_optimized = resize_for_lux(screenshot_bytes)
+                logger.info(f"📸 Desktop screenshot {screen_width}x{screen_height} → resized to {LUX_SDK_WIDTH}x{LUX_SDK_HEIGHT}")
             
             return result
         
@@ -1079,7 +1159,7 @@ async def take_screenshot(request: ScreenshotRequest):
 
 
 # ============================================================================
-# ENDPOINTS: Click (v8.2.0 - Added normalized coordinate support)
+# ENDPOINTS: Click (v8.3.0 - lux_sdk is now 1:1 with viewport)
 # ============================================================================
 
 @app.post("/click", response_model=ActionResponse)
@@ -1090,14 +1170,18 @@ async def do_click(request: ClickRequest):
     - desktop scope: uses PyAutoGUI (screen coordinates)
     
     Supports coordinate_origin:
-    - viewport: Browser viewport coordinates (default)
+    - viewport: Browser viewport coordinates (1260x700)
     - screen: Absolute screen coordinates
-    - lux_sdk: Lux SDK coordinates (1260x700 reference)
+    - lux_sdk: Lux SDK coordinates (1260x700) - NOW SAME AS VIEWPORT!
     - normalized: Gemini 2.5 Computer Use (0-999 range)
+    
+    v8.3.0: For browser scope, lux_sdk coordinates are used directly
+    without conversion (viewport = Lux SDK resolution).
     """
     try:
         x, y = request.x, request.y
         original_x, original_y = x, y
+        conversion_applied = "none"
         
         if request.scope == "browser":
             # Get browser session
@@ -1117,16 +1201,27 @@ async def do_click(request: ClickRequest):
             
             # Convert coordinates if needed
             if request.coordinate_origin == "lux_sdk":
-                x, y = CoordinateConverter.lux_sdk_to_viewport(
-                    x, y, viewport["width"], viewport["height"]
-                )
-                logger.info(f"🔄 Lux SDK ({original_x}, {original_y}) → Viewport ({x}, {y})")
+                # v8.3.0: Check if viewport matches Lux SDK (should be true now)
+                if viewport["width"] == LUX_SDK_WIDTH and viewport["height"] == LUX_SDK_HEIGHT:
+                    # NO CONVERSION NEEDED! Direct 1:1 mapping
+                    conversion_applied = "none (viewport = Lux SDK)"
+                    logger.info(f"🎯 Lux SDK ({x}, {y}) → Viewport ({x}, {y}) [1:1, no conversion]")
+                else:
+                    # Fallback if viewport is different (shouldn't happen in v8.3.0)
+                    x, y = CoordinateConverter.lux_sdk_to_viewport(
+                        x, y, viewport["width"], viewport["height"]
+                    )
+                    conversion_applied = f"lux_sdk→viewport (scale: {viewport['width']/LUX_SDK_WIDTH:.3f}, {viewport['height']/LUX_SDK_HEIGHT:.3f})"
+                    logger.warning(f"⚠️ Viewport mismatch! Lux SDK ({original_x}, {original_y}) → Viewport ({x}, {y})")
             
             elif request.coordinate_origin == "normalized":
                 x, y = CoordinateConverter.normalized_to_viewport(
                     x, y, viewport["width"], viewport["height"]
                 )
+                conversion_applied = "normalized→viewport"
                 logger.info(f"🔄 Normalized ({original_x}, {original_y}) → Viewport ({x}, {y})")
+            
+            # viewport and screen coordinates pass through directly for browser scope
             
             # Validate coordinates are within viewport
             if not (0 <= x <= viewport["width"] and 0 <= y <= viewport["height"]):
@@ -1137,7 +1232,8 @@ async def do_click(request: ClickRequest):
                         "viewport": viewport, 
                         "requested": {"x": original_x, "y": original_y},
                         "converted": {"x": x, "y": y},
-                        "coordinate_origin": request.coordinate_origin
+                        "coordinate_origin": request.coordinate_origin,
+                        "conversion_applied": conversion_applied
                     }
                 )
             
@@ -1157,7 +1253,9 @@ async def do_click(request: ClickRequest):
                     "click_type": request.click_type,
                     "viewport_coords": {"x": x, "y": y},
                     "original_coords": {"x": original_x, "y": original_y},
-                    "coordinate_origin": request.coordinate_origin
+                    "coordinate_origin": request.coordinate_origin,
+                    "conversion_applied": conversion_applied,
+                    "viewport_size": {"width": viewport["width"], "height": viewport["height"]}
                 }
             )
         
@@ -1170,17 +1268,19 @@ async def do_click(request: ClickRequest):
             
             screen_width, screen_height = pyautogui.size()
             
-            # Convert coordinates if needed
+            # Convert coordinates if needed (desktop ALWAYS needs conversion for lux_sdk)
             if request.coordinate_origin == "lux_sdk":
                 x, y = CoordinateConverter.lux_sdk_to_screen(
                     x, y, screen_width, screen_height
                 )
+                conversion_applied = f"lux_sdk→screen (scale: {screen_width/LUX_SDK_WIDTH:.3f}, {screen_height/LUX_SDK_HEIGHT:.3f})"
                 logger.info(f"🔄 Lux SDK ({original_x}, {original_y}) → Screen ({x}, {y})")
             
             elif request.coordinate_origin == "normalized":
                 x, y = CoordinateConverter.normalized_to_screen(
                     x, y, screen_width, screen_height
                 )
+                conversion_applied = "normalized→screen"
                 logger.info(f"🔄 Normalized ({original_x}, {original_y}) → Screen ({x}, {y})")
             
             # Execute click with PyAutoGUI
@@ -1199,7 +1299,8 @@ async def do_click(request: ClickRequest):
                     "click_type": request.click_type,
                     "screen_coords": {"x": x, "y": y},
                     "original_coords": {"x": original_x, "y": original_y},
-                    "coordinate_origin": request.coordinate_origin
+                    "coordinate_origin": request.coordinate_origin,
+                    "conversion_applied": conversion_applied
                 }
             )
     
@@ -1403,7 +1504,7 @@ async def do_keypress(request: KeypressRequest):
 
 @app.post("/browser/start")
 async def browser_start(request: BrowserStartRequest):
-    """Start a new browser session"""
+    """Start a new browser session with Lux-native viewport (1260x700)"""
     if not PLAYWRIGHT_AVAILABLE:
         raise HTTPException(status_code=500, detail="Playwright not available")
     
@@ -1419,7 +1520,12 @@ async def browser_start(request: BrowserStartRequest):
         return {
             "success": True,
             "session_id": session_id,
-            "current_url": current_url
+            "current_url": current_url,
+            "viewport": {
+                "width": VIEWPORT_WIDTH,
+                "height": VIEWPORT_HEIGHT,
+                "matches_lux_sdk": True
+            }
         }
     except Exception as e:
         logger.error(f"Browser start error: {e}")
@@ -1439,11 +1545,19 @@ async def browser_status(session_id: Optional[str] = None):
     if session_id:
         session = session_manager.get_session(session_id)
         if session:
+            viewport = None
+            try:
+                if session.is_alive():
+                    viewport = await session.get_viewport_bounds()
+            except:
+                pass
+            
             return {
                 "session_id": session_id,
                 "is_alive": session.is_alive(),
                 "current_url": session.page.url if session.page else None,
-                "tabs_count": len(session.pages)
+                "tabs_count": len(session.pages),
+                "viewport": viewport
             }
         return {"error": "Session not found"}
     
@@ -1626,8 +1740,11 @@ async def browser_element_rect(request: ElementRectRequest):
     ┌─────────────────────────────────────────────────────────────────┐
     │  TRIPLE VERIFICATION SUPPORT                                    │
     │                                                                 │
+    │  v8.3.0: Coordinates are in viewport space (1260x700)          │
+    │  which is NOW IDENTICAL to Lux SDK space!                       │
+    │                                                                 │
     │  This endpoint provides DOM coordinates for comparison with:   │
-    │  1. Lux Vision coordinates (lux_sdk: 1260x700)                 │
+    │  1. Lux Vision coordinates (lux_sdk = viewport: 1260x700)      │
     │  2. Gemini Vision coordinates (normalized: 0-999)              │
     │                                                                 │
     │  If all 3 agree (< 50px distance), proceed with high confidence│
@@ -1663,7 +1780,7 @@ async def browser_current_url(session_id: str = Query(...)):
 
 
 # ============================================================================
-# ENDPOINTS: Coordinate Utilities (v8.2.0 - Added normalized support)
+# ENDPOINTS: Coordinate Utilities (v8.3.0 - Updated for Lux-native viewport)
 # ============================================================================
 
 @app.post("/coordinates/convert")
@@ -1672,10 +1789,12 @@ async def coordinates_convert(request: CoordinateConvertRequest):
     Convert coordinates between different spaces.
     
     Supported spaces:
-    - viewport: Browser viewport (1280x720 default)
+    - viewport: Browser viewport (1260x700 - same as Lux SDK!)
     - screen: Absolute screen coordinates
-    - lux_sdk: Lux SDK reference (1260x700)
+    - lux_sdk: Lux SDK reference (1260x700) - NOW SAME AS VIEWPORT
     - normalized: Gemini 2.5 Computer Use (0-999 range)
+    
+    v8.3.0: viewport ↔ lux_sdk conversions are now 1:1 (no scaling).
     """
     try:
         x, y = request.x, request.y
@@ -1697,11 +1816,14 @@ async def coordinates_convert(request: CoordinateConvertRequest):
         
         # Perform conversion
         result_x, result_y = x, y
+        conversion_note = ""
         
         # ===== FROM lux_sdk =====
         if request.from_space == "lux_sdk":
             if request.to_space == "viewport":
-                result_x, result_y = CoordinateConverter.lux_sdk_to_viewport(x, y, ref_width, ref_height)
+                result_x, result_y = CoordinateConverter.lux_sdk_to_viewport(x, y, VIEWPORT_WIDTH, VIEWPORT_HEIGHT)
+                if VIEWPORT_WIDTH == LUX_SDK_WIDTH and VIEWPORT_HEIGHT == LUX_SDK_HEIGHT:
+                    conversion_note = "1:1 mapping (viewport = Lux SDK)"
             elif request.to_space == "screen":
                 result_x, result_y = CoordinateConverter.lux_sdk_to_screen(x, y, ref_width, ref_height)
             elif request.to_space == "normalized":
@@ -1710,12 +1832,14 @@ async def coordinates_convert(request: CoordinateConvertRequest):
         # ===== FROM viewport =====
         elif request.from_space == "viewport":
             if request.to_space == "lux_sdk":
-                result_x, result_y = CoordinateConverter.viewport_to_lux_sdk(x, y, ref_width, ref_height)
+                result_x, result_y = CoordinateConverter.viewport_to_lux_sdk(x, y, VIEWPORT_WIDTH, VIEWPORT_HEIGHT)
+                if VIEWPORT_WIDTH == LUX_SDK_WIDTH and VIEWPORT_HEIGHT == LUX_SDK_HEIGHT:
+                    conversion_note = "1:1 mapping (viewport = Lux SDK)"
             elif request.to_space == "normalized":
-                result_x, result_y = CoordinateConverter.viewport_to_normalized(x, y, ref_width, ref_height)
+                result_x, result_y = CoordinateConverter.viewport_to_normalized(x, y, VIEWPORT_WIDTH, VIEWPORT_HEIGHT)
             elif request.to_space == "screen":
-                # viewport == screen for our purposes (browser is positioned)
-                pass
+                # For this conversion, need to know browser window position
+                conversion_note = "viewport→screen requires browser window position"
         
         # ===== FROM screen =====
         elif request.from_space == "screen":
@@ -1724,26 +1848,33 @@ async def coordinates_convert(request: CoordinateConvertRequest):
             elif request.to_space == "normalized":
                 result_x, result_y = CoordinateConverter.screen_to_normalized(x, y, ref_width, ref_height)
             elif request.to_space == "viewport":
-                pass  # Same as screen
+                conversion_note = "screen→viewport requires browser window position"
         
         # ===== FROM normalized =====
         elif request.from_space == "normalized":
             if request.to_space == "viewport":
-                result_x, result_y = CoordinateConverter.normalized_to_viewport(x, y, ref_width, ref_height)
+                result_x, result_y = CoordinateConverter.normalized_to_viewport(x, y, VIEWPORT_WIDTH, VIEWPORT_HEIGHT)
             elif request.to_space == "screen":
                 result_x, result_y = CoordinateConverter.normalized_to_screen(x, y, ref_width, ref_height)
             elif request.to_space == "lux_sdk":
                 result_x, result_y = CoordinateConverter.normalized_to_lux_sdk(x, y)
         
-        return {
+        response = {
             "success": True,
             "x": result_x,
             "y": result_y,
             "from_space": request.from_space,
             "to_space": request.to_space,
             "original": {"x": x, "y": y},
-            "reference_dimensions": {"width": ref_width, "height": ref_height}
+            "reference_dimensions": {"width": ref_width, "height": ref_height},
+            "viewport_dimensions": {"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
+            "viewport_matches_lux": VIEWPORT_WIDTH == LUX_SDK_WIDTH and VIEWPORT_HEIGHT == LUX_SDK_HEIGHT
         }
+        
+        if conversion_note:
+            response["note"] = conversion_note
+        
+        return response
     
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -1755,6 +1886,7 @@ async def coordinates_validate(request: CoordinateValidateRequest):
     try:
         x, y = request.x, request.y
         original_x, original_y = x, y
+        conversion_applied = "none"
         
         if request.scope == "browser":
             session = None
@@ -1770,13 +1902,18 @@ async def coordinates_validate(request: CoordinateValidateRequest):
             
             # Convert coordinates if needed
             if request.coordinate_origin == "lux_sdk":
-                x, y = CoordinateConverter.lux_sdk_to_viewport(
-                    x, y, viewport["width"], viewport["height"]
-                )
+                if viewport["width"] == LUX_SDK_WIDTH and viewport["height"] == LUX_SDK_HEIGHT:
+                    conversion_applied = "none (1:1 mapping)"
+                else:
+                    x, y = CoordinateConverter.lux_sdk_to_viewport(
+                        x, y, viewport["width"], viewport["height"]
+                    )
+                    conversion_applied = "lux_sdk→viewport"
             elif request.coordinate_origin == "normalized":
                 x, y = CoordinateConverter.normalized_to_viewport(
                     x, y, viewport["width"], viewport["height"]
                 )
+                conversion_applied = "normalized→viewport"
             
             # Check if within viewport
             in_viewport = (0 <= x <= viewport["width"] and 0 <= y <= viewport["height"])
@@ -1812,8 +1949,10 @@ async def coordinates_validate(request: CoordinateValidateRequest):
                 "viewport_coords": {"x": x, "y": y},
                 "original_coords": {"x": original_x, "y": original_y},
                 "coordinate_origin": request.coordinate_origin,
+                "conversion_applied": conversion_applied,
                 "element_info": element_info,
-                "viewport_bounds": viewport
+                "viewport_bounds": viewport,
+                "viewport_matches_lux": viewport["width"] == LUX_SDK_WIDTH and viewport["height"] == LUX_SDK_HEIGHT
             }
         
         elif request.scope == "desktop":
@@ -1825,8 +1964,10 @@ async def coordinates_validate(request: CoordinateValidateRequest):
             # Convert if needed
             if request.coordinate_origin == "lux_sdk":
                 x, y = CoordinateConverter.lux_sdk_to_screen(x, y, screen_width, screen_height)
+                conversion_applied = "lux_sdk→screen"
             elif request.coordinate_origin == "normalized":
                 x, y = CoordinateConverter.normalized_to_screen(x, y, screen_width, screen_height)
+                conversion_applied = "normalized→screen"
             
             in_screen = (0 <= x <= screen_width and 0 <= y <= screen_height)
             
@@ -1846,6 +1987,7 @@ async def coordinates_validate(request: CoordinateValidateRequest):
                 "screen_coords": {"x": x, "y": y},
                 "original_coords": {"x": original_x, "y": original_y},
                 "coordinate_origin": request.coordinate_origin,
+                "conversion_applied": conversion_applied,
                 "pixel_color": pixel_color,
                 "screen_bounds": {"width": screen_width, "height": screen_height}
             }
@@ -1865,14 +2007,19 @@ if __name__ == "__main__":
 ╠══════════════════════════════════════════════════════════════╣
 ║  "Hands Only" - Pure Execution, No Intelligence              ║
 ║                                                              ║
+║  🎯 v8.3.0: VIEWPORT = LUX SDK (1260x700)                    ║
+║     • No screenshot resize for browser scope                 ║
+║     • No coordinate conversion for lux_sdk → viewport        ║
+║     • Direct 1:1 mapping = maximum accuracy!                 ║
+║                                                              ║
 ║  COORDINATE SYSTEMS SUPPORTED:                               ║
-║    • viewport   - Browser viewport (1280x720)                ║
+║    • viewport   - Browser viewport (1260x700 = Lux SDK!)     ║
 ║    • screen     - Absolute screen coordinates                ║
-║    • lux_sdk    - Lux SDK reference (1260x700)               ║
+║    • lux_sdk    - Lux SDK reference (1260x700 = viewport!)   ║
 ║    • normalized - Gemini 2.5 Computer Use (0-999)            ║
 ║                                                              ║
 ║  BROWSER SCOPE (Playwright + Edge):                         ║
-║    {'✅' if PLAYWRIGHT_AVAILABLE else '❌'} Screenshot (viewport only)                        ║
+║    {'✅' if PLAYWRIGHT_AVAILABLE else '❌'} Screenshot (1260x700 - Lux native!)               ║
 ║    {'✅' if PLAYWRIGHT_AVAILABLE else '❌'} Click/Type/Scroll (all coordinate systems)        ║
 ║    {'✅' if PLAYWRIGHT_AVAILABLE else '❌'} Navigate/Reload/Back/Forward (API)                ║
 ║    {'✅' if PLAYWRIGHT_AVAILABLE else '❌'} Tab management (API)                              ║
@@ -1880,7 +2027,7 @@ if __name__ == "__main__":
 ║    {'✅' if PLAYWRIGHT_AVAILABLE else '❌'} Element rect (Triple Verification support)        ║
 ║                                                              ║
 ║  DESKTOP SCOPE (PyAutoGUI):                                  ║
-║    {'✅' if PYAUTOGUI_AVAILABLE else '❌'} Screenshot (full screen)                           ║
+║    {'✅' if PYAUTOGUI_AVAILABLE else '❌'} Screenshot (full screen + resize for Lux)          ║
 ║    {'✅' if PYAUTOGUI_AVAILABLE else '❌'} Click/Type/Keypress (all coordinate systems)       ║
 ║    {'✅' if PYPERCLIP_AVAILABLE else '❌'} Clipboard typing (Italian keyboard support)        ║
 ║                                                              ║
