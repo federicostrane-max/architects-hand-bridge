@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
 """
-tool_server.py v8.4.3 - Desktop App "Hands Only" Server + ngrok
+tool_server.py v8.4.4 - Desktop App "Hands Only" Server + ngrok
 ===============================================================
 
-NOVITÀ v8.4.3: NGROK INTEGRATO
-==============================
-Il server avvia automaticamente un tunnel ngrok per essere raggiungibile
-via HTTPS dalla Web App Lovable (che gira su HTTPS e non può chiamare HTTP).
-
-Basta avviare questo file e l'URL pubblico apparirà nel banner!
+NOVITÀ v8.4.4: FIX DOM TREE
+============================
+Risolto errore "Page object has no attribute 'accessibility'" usando
+JavaScript per estrarre elementi interattivi invece dell'API deprecata.
 
 CHANGELOG:
 - v8.4.2: Aggiunto /browser/dom/tree endpoint
 - v8.4.3: Integrato ngrok tunnel automatico
+- v8.4.4: Fix accessibility API deprecata → estrazione DOM via JavaScript
 """
 
 import asyncio
@@ -51,7 +50,7 @@ except ImportError:
 # CONFIGURATION
 # ============================================================================
 
-SERVICE_VERSION = "8.4.3"
+SERVICE_VERSION = "8.4.4"
 SERVICE_PORT = 8766
 
 LUX_SDK_WIDTH = 1260
@@ -343,9 +342,115 @@ class BrowserSession:
             return False
     
     async def get_accessibility_tree(self):
-        if self.page:
-            return await self.page.accessibility.snapshot()
-        return None
+        """Get DOM tree using JavaScript (accessibility API is deprecated)"""
+        if not self.page:
+            return None
+        
+        try:
+            # Try new aria_snapshot first (Playwright 1.40+)
+            try:
+                snapshot = await self.page.locator('body').aria_snapshot()
+                return {"type": "aria_snapshot", "tree": snapshot}
+            except (AttributeError, Exception):
+                pass
+            
+            # Fallback: Extract interactive elements via JavaScript
+            tree = await self.page.evaluate('''() => {
+                function extractNode(el, depth = 0) {
+                    if (depth > 10) return null;  // Limit depth
+                    
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    const isVisible = style.display !== 'none' && 
+                                     style.visibility !== 'hidden' && 
+                                     rect.width > 0 && rect.height > 0;
+                    
+                    if (!isVisible) return null;
+                    
+                    const node = {
+                        tag: el.tagName.toLowerCase(),
+                        role: el.getAttribute('role') || el.tagName.toLowerCase(),
+                        name: el.getAttribute('aria-label') || 
+                              el.getAttribute('title') || 
+                              el.getAttribute('placeholder') ||
+                              (el.tagName === 'INPUT' ? el.getAttribute('name') : null) ||
+                              (el.tagName === 'BUTTON' || el.tagName === 'A' ? el.textContent?.trim().slice(0, 50) : null),
+                        text: el.textContent?.trim().slice(0, 100) || null,
+                        x: Math.round(rect.x + rect.width / 2),
+                        y: Math.round(rect.y + rect.height / 2),
+                        width: Math.round(rect.width),
+                        height: Math.round(rect.height),
+                    };
+                    
+                    // Add specific attributes
+                    if (el.id) node.id = el.id;
+                    if (el.href) node.href = el.href;
+                    if (el.type) node.type = el.type;
+                    if (el.disabled) node.disabled = true;
+                    if (el.getAttribute('data-testid')) node.testId = el.getAttribute('data-testid');
+                    
+                    // Get interactive children
+                    const interactiveSelectors = 'a, button, input, select, textarea, [role="button"], [role="link"], [onclick]';
+                    const children = [];
+                    
+                    for (const child of el.querySelectorAll(':scope > *')) {
+                        const isInteractive = child.matches(interactiveSelectors);
+                        const hasInteractiveChildren = child.querySelector(interactiveSelectors);
+                        
+                        if (isInteractive || hasInteractiveChildren) {
+                            const childNode = extractNode(child, depth + 1);
+                            if (childNode) children.push(childNode);
+                        }
+                    }
+                    
+                    if (children.length > 0) node.children = children;
+                    
+                    return node;
+                }
+                
+                // Get all interactive elements at top level
+                const interactive = document.querySelectorAll('a, button, input, select, textarea, [role="button"], [role="link"], [role="textbox"], [role="menuitem"], nav, header, main, form');
+                const elements = [];
+                
+                interactive.forEach(el => {
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    const isVisible = style.display !== 'none' && 
+                                     style.visibility !== 'hidden' && 
+                                     rect.width > 0 && rect.height > 0;
+                    
+                    if (isVisible && rect.top < window.innerHeight && rect.bottom > 0) {
+                        elements.push({
+                            tag: el.tagName.toLowerCase(),
+                            role: el.getAttribute('role') || el.tagName.toLowerCase(),
+                            name: el.getAttribute('aria-label') || 
+                                  el.getAttribute('title') || 
+                                  el.getAttribute('placeholder') ||
+                                  el.textContent?.trim().slice(0, 50) || null,
+                            x: Math.round(rect.x + rect.width / 2),
+                            y: Math.round(rect.y + rect.height / 2),
+                            width: Math.round(rect.width),
+                            height: Math.round(rect.height),
+                            id: el.id || null,
+                            testId: el.getAttribute('data-testid') || null,
+                        });
+                    }
+                });
+                
+                return {
+                    type: 'interactive_elements',
+                    url: window.location.href,
+                    title: document.title,
+                    viewport: { width: window.innerWidth, height: window.innerHeight },
+                    elements: elements
+                };
+            }''')
+            
+            return tree
+            
+        except Exception as e:
+            logger.error(f"❌ DOM tree extraction failed: {e}")
+            return {"error": str(e)}
     
     async def get_element_rect(self, req: ElementRectRequest) -> ElementRectResponse:
         if not self.page:
