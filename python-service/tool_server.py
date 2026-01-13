@@ -1,42 +1,34 @@
 #!/usr/bin/env python3
 """
-tool_server.py v8.3.0 - Desktop App "Hands Only" Server
+tool_server.py v8.4.0 - Desktop App "Hands Only" Server
 ======================================================
 
-Derived from tasker_service_v7.py - REMOVED all "brain" logic.
+TRIPLE VERIFICATION ARCHITECTURE
+================================
+This version adds comprehensive support for comparing coordinates from:
+1. DOM (Playwright element rect)
+2. Lux Vision (OpenAGI Lux SDK)
+3. Gemini Vision (Google Gemini 2.5 Computer Use)
 
-This server provides ONLY execution capabilities ("hands").
-All intelligence (planning, decision-making, self-healing) stays in the Web App.
+VIEWPORT STRATEGY:
+- Single viewport: 1260×700 (Lux SDK native)
+- Lux: 1:1 mapping, no conversion needed
+- Gemini: normalized coords (0-999) denormalized to viewport
+- DOM: native viewport coords
 
-SCOPES:
-
-1. BROWSER (Playwright + Edge)
-   - Screenshot: viewport only (1260x700 - aligned with Lux SDK)
-   - Click/Type/Scroll: coordinate-based (relative to viewport)
-   - Chrome actions: API-based (navigate, reload, back, forward, tabs)
-   - Used by: Lux AND Gemini (same browser instance)
-
-2. DESKTOP (PyAutoGUI)
-   - Screenshot: full screen
-   - Click/Type/Keypress: screen coordinates (with lux_sdk conversion)
-   - Used by: Lux only
-   - Can control: Excel, Outlook, any app
-
-COORDINATE SYSTEMS:
-- viewport: relative to browser viewport (0,0 = top-left of page content)
-- screen: absolute screen coordinates
-- lux_sdk: Lux SDK coordinates (1260x700 reference) - NOW SAME AS VIEWPORT!
-- normalized: Gemini 2.5 Computer Use coordinates (0-999 range) - requires denormalization
+This compromise prioritizes Lux accuracy while Gemini's normalized
+coordinate system adapts to any resolution.
 
 CHANGELOG:
 - v8.0.1: Fixed accessibility tree with JavaScript fallback
-- v8.1.0: Added /browser/dom/element_rect for Triple Verification (DOM + Lux + Gemini)
-- v8.2.0: Added 'normalized' coordinate_origin for Gemini 2.5 Computer Use (0-999 range)
-- v8.3.0: VIEWPORT ALIGNED TO LUX SDK (1260x700) - No more resize/conversion for browser scope!
-         - Viewport now matches Lux SDK reference exactly
-         - Eliminated resize_for_lux() overhead for browser screenshots
-         - lux_sdk → viewport conversion is now 1:1 (no scaling)
-         - Improved accuracy: no more rounding errors from coordinate conversion
+- v8.1.0: Added /browser/dom/element_rect for Triple Verification
+- v8.2.0: Added 'normalized' coordinate_origin for Gemini 2.5
+- v8.3.0: Viewport aligned to Lux SDK (1260×700)
+- v8.4.0: TRIPLE VERIFICATION SUPPORT
+         - Added /coordinates/triple_verify endpoint
+         - Added /screenshot with multi-model optimization
+         - Added confidence scoring and distance matrix
+         - Added Gemini-specific screenshot resize option
 """
 
 import asyncio
@@ -44,6 +36,7 @@ import base64
 import io
 import json
 import logging
+import math
 import os
 import sys
 import time
@@ -51,7 +44,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Optional, Literal, List, Dict
+from typing import Any, Optional, Literal, List, Dict, Tuple
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query
@@ -62,37 +55,45 @@ from pydantic import BaseModel, Field
 # CONFIGURATION
 # ============================================================================
 
-SERVICE_VERSION = "8.3.0"
-SERVICE_PORT = 8766  # 8765 is used by tasker_service.py
+SERVICE_VERSION = "8.4.0"
+SERVICE_PORT = 8766
 
-# Lux SDK reference resolution (model trained on this)
+# ============================================================================
+# MODEL REFERENCE RESOLUTIONS
+# ============================================================================
+
+# Lux SDK reference (model trained on this)
 LUX_SDK_WIDTH = 1260
 LUX_SDK_HEIGHT = 700
+
+# Gemini 2.5 Computer Use recommended resolution
+GEMINI_RECOMMENDED_WIDTH = 1440
+GEMINI_RECOMMENDED_HEIGHT = 900
 
 # Lux full screen reference (for desktop scope)
 LUX_SCREEN_REF_WIDTH = 1920
 LUX_SCREEN_REF_HEIGHT = 1200
 
 # ============================================================================
-# v8.3.0 CHANGE: Viewport NOW MATCHES Lux SDK reference!
+# VIEWPORT CONFIGURATION (Lux-native for Triple Verification)
 # ============================================================================
-# This eliminates the need for:
-# 1. Resizing screenshots before sending to Lux
-# 2. Converting coordinates from lux_sdk to viewport
-# 3. Potential rounding errors from coordinate scaling
-#
-# The browser viewport is set to exactly 1260x700, which is the resolution
-# Lux was trained on. Screenshots are captured at this resolution and
-# coordinates from Lux can be used directly without any conversion.
+# We use Lux SDK resolution as the common coordinate space because:
+# 1. Lux requires exact 1260×700 for optimal accuracy
+# 2. Gemini's normalized coords (0-999) adapt to any resolution
+# 3. DOM coords are always in viewport space
 # ============================================================================
-VIEWPORT_WIDTH = LUX_SDK_WIDTH   # 1260 (was 1280)
-VIEWPORT_HEIGHT = LUX_SDK_HEIGHT  # 700 (was 720)
+VIEWPORT_WIDTH = LUX_SDK_WIDTH   # 1260
+VIEWPORT_HEIGHT = LUX_SDK_HEIGHT  # 700
 
-# Gemini 2.5 Computer Use normalized coordinate range
-# The model outputs coordinates in 0-999 range regardless of image dimensions
+# Gemini normalized coordinate range (0-999)
 NORMALIZED_COORD_MAX = 999
 
-# Browser profile directory (shared between Lux and Gemini)
+# Triple Verification thresholds
+TRIPLE_VERIFY_MATCH_THRESHOLD = 50      # pixels - coords within this = MATCH
+TRIPLE_VERIFY_WARNING_THRESHOLD = 100   # pixels - coords within this = WARNING
+TRIPLE_VERIFY_MISMATCH_THRESHOLD = 150  # pixels - coords beyond this = MISMATCH
+
+# Browser profile directory
 BROWSER_PROFILE_DIR = Path.home() / ".edge-automation-profile"
 
 # ============================================================================
@@ -110,7 +111,6 @@ logger = logging.getLogger(__name__)
 # DEPENDENCY CHECKS
 # ============================================================================
 
-# PyAutoGUI
 try:
     import pyautogui
     pyautogui.FAILSAFE = False
@@ -120,7 +120,6 @@ except ImportError:
     PYAUTOGUI_AVAILABLE = False
     logger.warning("⚠️ PyAutoGUI not available")
 
-# Pyperclip (for clipboard typing - Italian keyboard support)
 try:
     import pyperclip
     PYPERCLIP_AVAILABLE = True
@@ -129,7 +128,6 @@ except ImportError:
     PYPERCLIP_AVAILABLE = False
     logger.warning("⚠️ Pyperclip not available")
 
-# PIL for image processing
 try:
     from PIL import Image
     PIL_AVAILABLE = True
@@ -138,7 +136,6 @@ except ImportError:
     PIL_AVAILABLE = False
     logger.warning("⚠️ PIL not available")
 
-# Playwright
 try:
     from playwright.async_api import async_playwright, Browser, Page, BrowserContext
     PLAYWRIGHT_AVAILABLE = True
@@ -147,15 +144,19 @@ except ImportError:
     PLAYWRIGHT_AVAILABLE = False
     logger.warning("⚠️ Playwright not available")
 
+
 # ============================================================================
 # PYDANTIC MODELS - Requests
 # ============================================================================
 
 class ScreenshotRequest(BaseModel):
-    """Request for screenshot"""
+    """Request for screenshot with multi-model support"""
     scope: Literal["browser", "desktop"] = "browser"
     session_id: Optional[str] = None
-    optimize_for: Optional[Literal["lux", "gemini", "both"]] = None
+    # v8.4.0: Enhanced optimization options
+    optimize_for: Optional[Literal["lux", "gemini", "both", "triple_verify"]] = None
+    # v8.4.0: Option to include Gemini-optimized resize
+    include_gemini_optimized: bool = False
 
 
 class ClickRequest(BaseModel):
@@ -163,8 +164,6 @@ class ClickRequest(BaseModel):
     scope: Literal["browser", "desktop"] = "browser"
     x: int
     y: int
-    # v8.2.0: Added 'normalized' for Gemini 2.5 Computer Use
-    # v8.3.0: lux_sdk is now 1:1 with viewport (no conversion needed)
     coordinate_origin: Literal["viewport", "screen", "lux_sdk", "normalized"] = "viewport"
     click_type: Literal["single", "double", "right"] = "single"
     session_id: Optional[str] = None
@@ -176,7 +175,6 @@ class TypeRequest(BaseModel):
     text: str
     method: Literal["clipboard", "keystrokes"] = "clipboard"
     session_id: Optional[str] = None
-    # For browser: optional selector to focus first
     selector: Optional[str] = None
 
 
@@ -185,7 +183,6 @@ class ScrollRequest(BaseModel):
     scope: Literal["browser", "desktop"] = "browser"
     direction: Literal["up", "down", "left", "right"] = "down"
     amount: int = 300
-    # v8.2.0: Added coordinate_origin for scroll position
     x: Optional[int] = None
     y: Optional[int] = None
     coordinate_origin: Literal["viewport", "screen", "lux_sdk", "normalized"] = "viewport"
@@ -195,7 +192,7 @@ class ScrollRequest(BaseModel):
 class KeypressRequest(BaseModel):
     """Request for keypress action"""
     scope: Literal["browser", "desktop"] = "browser"
-    key: str  # e.g., "Enter", "Escape", "Ctrl+C", "Alt+Tab"
+    key: str
     session_id: Optional[str] = None
 
 
@@ -218,46 +215,55 @@ class TabRequest(BaseModel):
     url: Optional[str] = None
 
 
+class ElementRectRequest(BaseModel):
+    """Request to get element bounding rectangle"""
+    session_id: str
+    selector: Optional[str] = None
+    text: Optional[str] = None
+    text_exact: Optional[bool] = False
+    role: Optional[str] = None
+    role_name: Optional[str] = None
+    test_id: Optional[str] = None
+    placeholder: Optional[str] = None
+    label: Optional[str] = None
+    index: Optional[int] = 0
+    must_be_visible: Optional[bool] = True
+
+
+class TripleVerifyRequest(BaseModel):
+    """
+    Request to verify coordinates from multiple sources.
+    
+    Provide coordinates from any combination of sources:
+    - dom: From /browser/dom/element_rect (viewport coords)
+    - lux: From Lux Vision API (lux_sdk coords, 1260×700)
+    - gemini: From Gemini Computer Use (normalized 0-999)
+    
+    At least 2 sources required for verification.
+    """
+    # DOM coordinates (already in viewport space)
+    dom_x: Optional[int] = None
+    dom_y: Optional[int] = None
+    
+    # Lux SDK coordinates (1260×700 reference)
+    lux_x: Optional[int] = None
+    lux_y: Optional[int] = None
+    
+    # Gemini normalized coordinates (0-999)
+    gemini_x: Optional[int] = None
+    gemini_y: Optional[int] = None
+    
+    # Optional: element description for logging
+    element_description: Optional[str] = None
+
+
 class CoordinateConvertRequest(BaseModel):
     """Request to convert coordinates between spaces"""
     x: int
     y: int
-    # v8.2.0: Added 'normalized' option
     from_space: Literal["viewport", "screen", "lux_sdk", "normalized"]
     to_space: Literal["viewport", "screen", "lux_sdk", "normalized"]
     session_id: Optional[str] = None
-
-
-class CoordinateValidateRequest(BaseModel):
-    """Request to validate if coordinates are clickable"""
-    scope: Literal["browser", "desktop"] = "browser"
-    x: int
-    y: int
-    # v8.2.0: Added 'normalized' option
-    coordinate_origin: Literal["viewport", "screen", "lux_sdk", "normalized"] = "viewport"
-    session_id: Optional[str] = None
-
-
-class ElementRectRequest(BaseModel):
-    """
-    Request to get element bounding rectangle for Triple Verification.
-    
-    Used by Orchestrator to get DOM coordinates and compare with Vision coordinates.
-    At least one search criteria must be provided.
-    """
-    session_id: str
-    # Multiple ways to find element - at least one required
-    selector: Optional[str] = None           # CSS selector: "button.send-btn", "#submit"
-    text: Optional[str] = None               # Find by text content: "Send", "Submit"
-    text_exact: Optional[bool] = False       # True = exact match, False = contains
-    role: Optional[str] = None               # ARIA role: "button", "link", "textbox"
-    role_name: Optional[str] = None          # Role + name: role="button" with name "Send"
-    test_id: Optional[str] = None            # data-testid attribute
-    placeholder: Optional[str] = None        # Input placeholder text
-    label: Optional[str] = None              # Label text (for form fields)
-    # Options
-    index: Optional[int] = 0                 # If multiple matches, which one (0-based)
-    must_be_visible: Optional[bool] = True   # Only return if element is visible
 
 
 # ============================================================================
@@ -268,18 +274,77 @@ class ActionResponse(BaseModel):
     """Generic response for actions"""
     success: bool
     error: Optional[str] = None
-    # Additional info depending on action
-    executed_with: Optional[str] = None  # "playwright" or "pyautogui"
+    executed_with: Optional[str] = None
     details: Optional[Dict[str, Any]] = None
 
 
 class ScreenshotResponse(BaseModel):
-    """Response containing screenshot(s)"""
+    """Response containing screenshot(s) optimized for different models"""
     success: bool
     error: Optional[str] = None
-    # v8.3.0: For browser scope, original IS lux_optimized (same resolution)
-    original: Optional[Dict[str, Any]] = None  # {image_base64, width, height}
-    lux_optimized: Optional[Dict[str, Any]] = None  # {image_base64, width, height, scale_x, scale_y}
+    # Original screenshot (viewport resolution)
+    original: Optional[Dict[str, Any]] = None
+    # Lux optimized (1260×700 - same as viewport in v8.4.0)
+    lux_optimized: Optional[Dict[str, Any]] = None
+    # v8.4.0: Gemini optimized (1440×900)
+    gemini_optimized: Optional[Dict[str, Any]] = None
+
+
+class ElementRectResponse(BaseModel):
+    """Response with element bounding rectangle"""
+    success: bool
+    error: Optional[str] = None
+    found: bool = False
+    visible: bool = False
+    enabled: bool = False
+    x: Optional[int] = None
+    y: Optional[int] = None
+    bounding_box: Optional[Dict[str, float]] = None
+    tag: Optional[str] = None
+    text: Optional[str] = None
+    element_count: Optional[int] = None
+    selector_used: Optional[str] = None
+
+
+class TripleVerifyResponse(BaseModel):
+    """
+    Response from triple verification with confidence scoring.
+    
+    Confidence levels:
+    - HIGH: All sources agree within 50px
+    - MEDIUM: Sources agree within 100px
+    - LOW: Sources disagree by 100-150px
+    - FAILED: Sources disagree by >150px or insufficient data
+    """
+    success: bool
+    error: Optional[str] = None
+    
+    # Verification result
+    confidence: Literal["HIGH", "MEDIUM", "LOW", "FAILED"]
+    recommended_action: Literal["PROCEED", "RETRY", "FALLBACK", "ABORT"]
+    
+    # Coordinates in common space (viewport)
+    viewport_coords: Optional[Dict[str, int]] = None  # Best estimate {x, y}
+    
+    # Individual source coords (converted to viewport)
+    dom_viewport: Optional[Dict[str, int]] = None
+    lux_viewport: Optional[Dict[str, int]] = None
+    gemini_viewport: Optional[Dict[str, int]] = None
+    
+    # Distance matrix
+    distances: Optional[Dict[str, float]] = None  # dom_lux, dom_gemini, lux_gemini
+    
+    # Sources used
+    sources_provided: List[str] = []
+    sources_count: int = 0
+    
+    # Debug info
+    element_description: Optional[str] = None
+    thresholds: Dict[str, int] = {
+        "match": TRIPLE_VERIFY_MATCH_THRESHOLD,
+        "warning": TRIPLE_VERIFY_WARNING_THRESHOLD,
+        "mismatch": TRIPLE_VERIFY_MISMATCH_THRESHOLD
+    }
 
 
 class StatusResponse(BaseModel):
@@ -288,47 +353,156 @@ class StatusResponse(BaseModel):
     version: str
     browser_sessions: int
     capabilities: Dict[str, bool]
-
-
-class ElementRectResponse(BaseModel):
-    """
-    Response with element bounding rectangle.
-    
-    Returns center coordinates (x, y) ready for clicking,
-    plus full bounding box and element metadata.
-    """
-    success: bool
-    error: Optional[str] = None
-    # Element state
-    found: bool = False
-    visible: bool = False
-    enabled: bool = False
-    # Coordinates (center point - ready for clicking)
-    x: Optional[int] = None
-    y: Optional[int] = None
-    # Full bounding box
-    bounding_box: Optional[Dict[str, float]] = None  # {x, y, width, height}
-    # Element info
-    tag: Optional[str] = None
-    text: Optional[str] = None
-    element_count: Optional[int] = None  # How many elements matched
-    # For debugging
-    selector_used: Optional[str] = None
+    # v8.4.0: Model reference info
+    model_references: Dict[str, Dict[str, int]]
 
 
 # ============================================================================
-# SCREENSHOT UTILITIES
+# COORDINATE CONVERTER (v8.4.0 - Enhanced for Triple Verification)
 # ============================================================================
 
-def resize_for_lux(image_bytes: bytes, target_width: int = LUX_SDK_WIDTH, 
-                   target_height: int = LUX_SDK_HEIGHT) -> Dict[str, Any]:
+class CoordinateConverter:
     """
-    Resize image to Lux SDK reference resolution.
-    Returns dict with base64 image and scale factors for coordinate conversion.
+    Converts coordinates between different spaces.
     
-    v8.3.0 NOTE: For browser scope, this is NO LONGER NEEDED since viewport
-    is already at 1260x700. This function is still used for DESKTOP scope
-    where screen resolution varies.
+    Spaces:
+    - viewport: Browser viewport (1260×700 in v8.4.0)
+    - screen: Absolute screen coordinates
+    - lux_sdk: Lux SDK reference (1260×700) - SAME AS VIEWPORT
+    - normalized: Gemini 2.5 Computer Use (0-999)
+    """
+    
+    @staticmethod
+    def euclidean_distance(x1: int, y1: int, x2: int, y2: int) -> float:
+        """Calculate Euclidean distance between two points"""
+        return math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+    
+    # ========== LUX SDK Conversions ==========
+    
+    @staticmethod
+    def lux_sdk_to_screen(x: int, y: int, screen_width: int, screen_height: int) -> Tuple[int, int]:
+        """Convert Lux SDK coords (1260×700) to screen coords"""
+        scale_x = screen_width / LUX_SDK_WIDTH
+        scale_y = screen_height / LUX_SDK_HEIGHT
+        return int(x * scale_x), int(y * scale_y)
+    
+    @staticmethod
+    def screen_to_lux_sdk(x: int, y: int, screen_width: int, screen_height: int) -> Tuple[int, int]:
+        """Convert screen coords to Lux SDK coords"""
+        scale_x = LUX_SDK_WIDTH / screen_width
+        scale_y = LUX_SDK_HEIGHT / screen_height
+        return int(x * scale_x), int(y * scale_y)
+    
+    @staticmethod
+    def lux_sdk_to_viewport(x: int, y: int, viewport_width: int = VIEWPORT_WIDTH, 
+                           viewport_height: int = VIEWPORT_HEIGHT) -> Tuple[int, int]:
+        """
+        Convert Lux SDK coords to viewport coords.
+        In v8.4.0 with viewport=1260×700, this is 1:1 mapping.
+        """
+        if viewport_width == LUX_SDK_WIDTH and viewport_height == LUX_SDK_HEIGHT:
+            return x, y
+        scale_x = viewport_width / LUX_SDK_WIDTH
+        scale_y = viewport_height / LUX_SDK_HEIGHT
+        return int(x * scale_x), int(y * scale_y)
+    
+    @staticmethod
+    def viewport_to_lux_sdk(x: int, y: int, viewport_width: int = VIEWPORT_WIDTH,
+                           viewport_height: int = VIEWPORT_HEIGHT) -> Tuple[int, int]:
+        """Convert viewport coords to Lux SDK coords. 1:1 in v8.4.0."""
+        if viewport_width == LUX_SDK_WIDTH and viewport_height == LUX_SDK_HEIGHT:
+            return x, y
+        scale_x = LUX_SDK_WIDTH / viewport_width
+        scale_y = LUX_SDK_HEIGHT / viewport_height
+        return int(x * scale_x), int(y * scale_y)
+    
+    # ========== NORMALIZED (Gemini) Conversions ==========
+    
+    @staticmethod
+    def normalized_to_viewport(x: int, y: int, viewport_width: int = VIEWPORT_WIDTH,
+                              viewport_height: int = VIEWPORT_HEIGHT) -> Tuple[int, int]:
+        """
+        Convert Gemini normalized coords (0-999) to viewport coords.
+        Formula: pixel = normalized / 1000 * dimension
+        
+        Example for 1260×700 viewport:
+        - (500, 500) → (630, 350) center
+        - (0, 0) → (0, 0) top-left
+        - (999, 999) → (1259, 699) bottom-right
+        """
+        pixel_x = int(x / 1000 * viewport_width)
+        pixel_y = int(y / 1000 * viewport_height)
+        return pixel_x, pixel_y
+    
+    @staticmethod
+    def viewport_to_normalized(x: int, y: int, viewport_width: int = VIEWPORT_WIDTH,
+                              viewport_height: int = VIEWPORT_HEIGHT) -> Tuple[int, int]:
+        """Convert viewport coords to Gemini normalized coords (0-999)."""
+        norm_x = int(x / viewport_width * 1000)
+        norm_y = int(y / viewport_height * 1000)
+        norm_x = max(0, min(NORMALIZED_COORD_MAX, norm_x))
+        norm_y = max(0, min(NORMALIZED_COORD_MAX, norm_y))
+        return norm_x, norm_y
+    
+    @staticmethod
+    def normalized_to_screen(x: int, y: int, screen_width: int, screen_height: int) -> Tuple[int, int]:
+        """Convert Gemini normalized coords (0-999) to screen coords."""
+        pixel_x = int(x / 1000 * screen_width)
+        pixel_y = int(y / 1000 * screen_height)
+        return pixel_x, pixel_y
+    
+    @staticmethod
+    def screen_to_normalized(x: int, y: int, screen_width: int, screen_height: int) -> Tuple[int, int]:
+        """Convert screen coords to Gemini normalized coords (0-999)."""
+        norm_x = int(x / screen_width * 1000)
+        norm_y = int(y / screen_height * 1000)
+        norm_x = max(0, min(NORMALIZED_COORD_MAX, norm_x))
+        norm_y = max(0, min(NORMALIZED_COORD_MAX, norm_y))
+        return norm_x, norm_y
+    
+    @staticmethod
+    def normalized_to_lux_sdk(x: int, y: int) -> Tuple[int, int]:
+        """Convert Gemini normalized coords (0-999) to Lux SDK coords."""
+        lux_x = int(x / 1000 * LUX_SDK_WIDTH)
+        lux_y = int(y / 1000 * LUX_SDK_HEIGHT)
+        return lux_x, lux_y
+    
+    @staticmethod
+    def lux_sdk_to_normalized(x: int, y: int) -> Tuple[int, int]:
+        """Convert Lux SDK coords to Gemini normalized coords (0-999)."""
+        norm_x = int(x / LUX_SDK_WIDTH * 1000)
+        norm_y = int(y / LUX_SDK_HEIGHT * 1000)
+        norm_x = max(0, min(NORMALIZED_COORD_MAX, norm_x))
+        norm_y = max(0, min(NORMALIZED_COORD_MAX, norm_y))
+        return norm_x, norm_y
+    
+    # ========== v8.4.0: Gemini Recommended Resolution ==========
+    
+    @staticmethod
+    def viewport_to_gemini_recommended(x: int, y: int, viewport_width: int = VIEWPORT_WIDTH,
+                                       viewport_height: int = VIEWPORT_HEIGHT) -> Tuple[int, int]:
+        """Convert viewport coords to Gemini recommended resolution (1440×900)."""
+        scale_x = GEMINI_RECOMMENDED_WIDTH / viewport_width
+        scale_y = GEMINI_RECOMMENDED_HEIGHT / viewport_height
+        return int(x * scale_x), int(y * scale_y)
+    
+    @staticmethod
+    def gemini_recommended_to_viewport(x: int, y: int, viewport_width: int = VIEWPORT_WIDTH,
+                                       viewport_height: int = VIEWPORT_HEIGHT) -> Tuple[int, int]:
+        """Convert Gemini recommended resolution coords to viewport."""
+        scale_x = viewport_width / GEMINI_RECOMMENDED_WIDTH
+        scale_y = viewport_height / GEMINI_RECOMMENDED_HEIGHT
+        return int(x * scale_x), int(y * scale_y)
+
+
+# ============================================================================
+# IMAGE UTILITIES
+# ============================================================================
+
+def resize_image(image_bytes: bytes, target_width: int, target_height: int) -> Dict[str, Any]:
+    """
+    Resize image to target resolution.
+    Returns dict with base64 image and scale factors.
     """
     if not PIL_AVAILABLE:
         raise RuntimeError("PIL not available for image resizing")
@@ -336,10 +510,8 @@ def resize_for_lux(image_bytes: bytes, target_width: int = LUX_SDK_WIDTH,
     img = Image.open(io.BytesIO(image_bytes))
     original_width, original_height = img.size
     
-    # Resize to Lux SDK reference
     resized = img.resize((target_width, target_height), Image.Resampling.LANCZOS)
     
-    # Convert to base64
     buffer = io.BytesIO()
     resized.save(buffer, format='PNG')
     buffer.seek(0)
@@ -365,36 +537,27 @@ def screenshot_to_base64(image_bytes: bytes, width: int, height: int) -> Dict[st
 
 
 # ============================================================================
-# CLIPBOARD TYPING (for non-US keyboards)
+# CLIPBOARD TYPING
 # ============================================================================
 
 def type_via_clipboard(text: str):
-    """
-    Type text using clipboard (Ctrl+V) instead of typewrite().
-    Required for non-US keyboards (e.g., Italian) where special 
-    characters don't type correctly with pyautogui.typewrite().
-    """
+    """Type text using clipboard (Ctrl+V) for non-US keyboards."""
     if not PYPERCLIP_AVAILABLE:
         logger.warning("Pyperclip not available, using typewrite")
         pyautogui.typewrite(text, interval=0.05)
         return
     
     try:
-        # Save current clipboard
         old_clipboard = ""
         try:
             old_clipboard = pyperclip.paste()
         except:
             pass
         
-        # Copy text to clipboard
         pyperclip.copy(text)
-        
-        # Paste with Ctrl+V
         pyautogui.hotkey('ctrl', 'v')
         time.sleep(0.1)
         
-        # Restore clipboard
         try:
             pyperclip.copy(old_clipboard)
         except:
@@ -406,144 +569,132 @@ def type_via_clipboard(text: str):
 
 
 # ============================================================================
-# COORDINATE CONVERTER (v8.3.0 - lux_sdk ↔ viewport is now 1:1 for browser)
+# TRIPLE VERIFICATION LOGIC (v8.4.0)
 # ============================================================================
 
-class CoordinateConverter:
+class TripleVerifier:
     """
-    Converts coordinates between different spaces.
+    Verifies coordinates from multiple sources (DOM, Lux, Gemini).
     
-    Supported spaces:
-    - viewport: Browser viewport coordinates (1260x700 - same as Lux SDK!)
-    - screen: Absolute screen coordinates
-    - lux_sdk: Lux SDK reference (1260x700) - NOW IDENTICAL TO VIEWPORT
-    - normalized: Gemini 2.5 Computer Use (0-999 range)
-    
-    v8.3.0 CHANGE: Since viewport is now 1260x700 (same as Lux SDK),
-    lux_sdk ↔ viewport conversions are 1:1 (no scaling needed).
+    All coordinates are converted to viewport space for comparison.
+    Returns confidence level and recommended action.
     """
     
-    # ========== LUX SDK Conversions ==========
-    
     @staticmethod
-    def lux_sdk_to_screen(x: int, y: int, screen_width: int, screen_height: int) -> tuple:
-        """Convert Lux SDK coords (1260x700) to screen coords"""
-        scale_x = screen_width / LUX_SDK_WIDTH
-        scale_y = screen_height / LUX_SDK_HEIGHT
-        return int(x * scale_x), int(y * scale_y)
-    
-    @staticmethod
-    def screen_to_lux_sdk(x: int, y: int, screen_width: int, screen_height: int) -> tuple:
-        """Convert screen coords to Lux SDK coords"""
-        scale_x = LUX_SDK_WIDTH / screen_width
-        scale_y = LUX_SDK_HEIGHT / screen_height
-        return int(x * scale_x), int(y * scale_y)
-    
-    @staticmethod
-    def lux_sdk_to_viewport(x: int, y: int, viewport_width: int, viewport_height: int) -> tuple:
+    def verify(request: TripleVerifyRequest, viewport_width: int = VIEWPORT_WIDTH,
+               viewport_height: int = VIEWPORT_HEIGHT) -> TripleVerifyResponse:
         """
-        Convert Lux SDK coords to viewport coords.
+        Verify coordinates from multiple sources.
         
-        v8.3.0: Since viewport is now 1260x700 (same as Lux SDK),
-        this is effectively a 1:1 mapping (no conversion needed).
-        We keep the function for API compatibility and for cases
-        where viewport might differ (e.g., future changes).
+        Returns confidence based on agreement:
+        - HIGH: All agree within 50px → PROCEED
+        - MEDIUM: Agree within 100px → PROCEED with caution
+        - LOW: Disagree 100-150px → RETRY
+        - FAILED: Disagree >150px → ABORT
         """
-        # If viewport matches Lux SDK (the default now), no conversion needed
-        if viewport_width == LUX_SDK_WIDTH and viewport_height == LUX_SDK_HEIGHT:
-            return x, y
+        sources = []
+        viewport_coords = {}
         
-        # Fallback for non-standard viewports
-        scale_x = viewport_width / LUX_SDK_WIDTH
-        scale_y = viewport_height / LUX_SDK_HEIGHT
-        return int(x * scale_x), int(y * scale_y)
-    
-    @staticmethod
-    def viewport_to_lux_sdk(x: int, y: int, viewport_width: int, viewport_height: int) -> tuple:
-        """
-        Convert viewport coords to Lux SDK coords.
+        # Convert DOM coords (already in viewport space)
+        if request.dom_x is not None and request.dom_y is not None:
+            sources.append("dom")
+            viewport_coords["dom"] = {"x": request.dom_x, "y": request.dom_y}
         
-        v8.3.0: 1:1 mapping when viewport is 1260x700.
-        """
-        if viewport_width == LUX_SDK_WIDTH and viewport_height == LUX_SDK_HEIGHT:
-            return x, y
+        # Convert Lux coords (1:1 with viewport in v8.4.0)
+        if request.lux_x is not None and request.lux_y is not None:
+            sources.append("lux")
+            lux_vp = CoordinateConverter.lux_sdk_to_viewport(
+                request.lux_x, request.lux_y, viewport_width, viewport_height
+            )
+            viewport_coords["lux"] = {"x": lux_vp[0], "y": lux_vp[1]}
         
-        scale_x = LUX_SDK_WIDTH / viewport_width
-        scale_y = LUX_SDK_HEIGHT / viewport_height
-        return int(x * scale_x), int(y * scale_y)
-    
-    # ========== NORMALIZED Conversions (Gemini 2.5 Computer Use) ==========
-    
-    @staticmethod
-    def normalized_to_viewport(x: int, y: int, viewport_width: int, viewport_height: int) -> tuple:
-        """
-        Convert Gemini 2.5 normalized coords (0-999) to viewport coords.
+        # Convert Gemini normalized coords
+        if request.gemini_x is not None and request.gemini_y is not None:
+            sources.append("gemini")
+            gemini_vp = CoordinateConverter.normalized_to_viewport(
+                request.gemini_x, request.gemini_y, viewport_width, viewport_height
+            )
+            viewport_coords["gemini"] = {"x": gemini_vp[0], "y": gemini_vp[1]}
         
-        Gemini 2.5 Computer Use outputs coordinates in 0-999 range
-        regardless of input image dimensions.
+        # Need at least 2 sources
+        if len(sources) < 2:
+            return TripleVerifyResponse(
+                success=False,
+                error=f"Need at least 2 coordinate sources, got {len(sources)}: {sources}",
+                confidence="FAILED",
+                recommended_action="ABORT",
+                sources_provided=sources,
+                sources_count=len(sources),
+                element_description=request.element_description
+            )
         
-        Formula: pixel = normalized / 1000 * dimension
+        # Calculate distances
+        distances = {}
+        max_distance = 0.0
         
-        Example for 1260x700 viewport (v8.3.0 default):
-        - (500, 500) normalized → (630, 350) viewport (center)
-        - (0, 0) normalized → (0, 0) viewport (top-left)
-        - (999, 999) normalized → (1259, 699) viewport (bottom-right)
-        """
-        # Use 1000 as divisor (normalized range is 0-999, so 999 maps to ~99.9%)
-        pixel_x = int(x / 1000 * viewport_width)
-        pixel_y = int(y / 1000 * viewport_height)
-        return pixel_x, pixel_y
-    
-    @staticmethod
-    def viewport_to_normalized(x: int, y: int, viewport_width: int, viewport_height: int) -> tuple:
-        """
-        Convert viewport coords to Gemini 2.5 normalized coords (0-999).
+        if "dom" in viewport_coords and "lux" in viewport_coords:
+            d = CoordinateConverter.euclidean_distance(
+                viewport_coords["dom"]["x"], viewport_coords["dom"]["y"],
+                viewport_coords["lux"]["x"], viewport_coords["lux"]["y"]
+            )
+            distances["dom_lux"] = round(d, 2)
+            max_distance = max(max_distance, d)
         
-        Formula: normalized = pixel / dimension * 1000
-        """
-        norm_x = int(x / viewport_width * 1000)
-        norm_y = int(y / viewport_height * 1000)
-        # Clamp to 0-999 range
-        norm_x = max(0, min(NORMALIZED_COORD_MAX, norm_x))
-        norm_y = max(0, min(NORMALIZED_COORD_MAX, norm_y))
-        return norm_x, norm_y
-    
-    @staticmethod
-    def normalized_to_screen(x: int, y: int, screen_width: int, screen_height: int) -> tuple:
-        """Convert Gemini 2.5 normalized coords (0-999) to screen coords."""
-        pixel_x = int(x / 1000 * screen_width)
-        pixel_y = int(y / 1000 * screen_height)
-        return pixel_x, pixel_y
-    
-    @staticmethod
-    def screen_to_normalized(x: int, y: int, screen_width: int, screen_height: int) -> tuple:
-        """Convert screen coords to Gemini 2.5 normalized coords (0-999)."""
-        norm_x = int(x / screen_width * 1000)
-        norm_y = int(y / screen_height * 1000)
-        norm_x = max(0, min(NORMALIZED_COORD_MAX, norm_x))
-        norm_y = max(0, min(NORMALIZED_COORD_MAX, norm_y))
-        return norm_x, norm_y
-    
-    @staticmethod
-    def normalized_to_lux_sdk(x: int, y: int) -> tuple:
-        """
-        Convert Gemini 2.5 normalized coords (0-999) to Lux SDK coords (1260x700).
+        if "dom" in viewport_coords and "gemini" in viewport_coords:
+            d = CoordinateConverter.euclidean_distance(
+                viewport_coords["dom"]["x"], viewport_coords["dom"]["y"],
+                viewport_coords["gemini"]["x"], viewport_coords["gemini"]["y"]
+            )
+            distances["dom_gemini"] = round(d, 2)
+            max_distance = max(max_distance, d)
         
-        This is a direct conversion without needing actual dimensions,
-        since both are relative coordinate systems.
-        """
-        lux_x = int(x / 1000 * LUX_SDK_WIDTH)
-        lux_y = int(y / 1000 * LUX_SDK_HEIGHT)
-        return lux_x, lux_y
-    
-    @staticmethod
-    def lux_sdk_to_normalized(x: int, y: int) -> tuple:
-        """Convert Lux SDK coords (1260x700) to Gemini 2.5 normalized coords (0-999)."""
-        norm_x = int(x / LUX_SDK_WIDTH * 1000)
-        norm_y = int(y / LUX_SDK_HEIGHT * 1000)
-        norm_x = max(0, min(NORMALIZED_COORD_MAX, norm_x))
-        norm_y = max(0, min(NORMALIZED_COORD_MAX, norm_y))
-        return norm_x, norm_y
+        if "lux" in viewport_coords and "gemini" in viewport_coords:
+            d = CoordinateConverter.euclidean_distance(
+                viewport_coords["lux"]["x"], viewport_coords["lux"]["y"],
+                viewport_coords["gemini"]["x"], viewport_coords["gemini"]["y"]
+            )
+            distances["lux_gemini"] = round(d, 2)
+            max_distance = max(max_distance, d)
+        
+        # Determine confidence
+        if max_distance <= TRIPLE_VERIFY_MATCH_THRESHOLD:
+            confidence = "HIGH"
+            recommended_action = "PROCEED"
+        elif max_distance <= TRIPLE_VERIFY_WARNING_THRESHOLD:
+            confidence = "MEDIUM"
+            recommended_action = "PROCEED"
+        elif max_distance <= TRIPLE_VERIFY_MISMATCH_THRESHOLD:
+            confidence = "LOW"
+            recommended_action = "RETRY"
+        else:
+            confidence = "FAILED"
+            recommended_action = "FALLBACK"
+        
+        # Calculate best estimate (average of all sources)
+        avg_x = sum(c["x"] for c in viewport_coords.values()) / len(viewport_coords)
+        avg_y = sum(c["y"] for c in viewport_coords.values()) / len(viewport_coords)
+        
+        # If DOM is available and distances are small, prefer DOM (most reliable)
+        if "dom" in viewport_coords and max_distance <= TRIPLE_VERIFY_WARNING_THRESHOLD:
+            best_x, best_y = viewport_coords["dom"]["x"], viewport_coords["dom"]["y"]
+        else:
+            best_x, best_y = int(avg_x), int(avg_y)
+        
+        logger.info(f"🔍 Triple Verify: {sources} → confidence={confidence}, max_dist={max_distance:.1f}px")
+        
+        return TripleVerifyResponse(
+            success=True,
+            confidence=confidence,
+            recommended_action=recommended_action,
+            viewport_coords={"x": best_x, "y": best_y},
+            dom_viewport=viewport_coords.get("dom"),
+            lux_viewport=viewport_coords.get("lux"),
+            gemini_viewport=viewport_coords.get("gemini"),
+            distances=distances,
+            sources_provided=sources,
+            sources_count=len(sources),
+            element_description=request.element_description
+        )
 
 
 # ============================================================================
@@ -569,16 +720,11 @@ class BrowserSession:
         return None
     
     async def start(self, start_url: Optional[str] = None, headless: bool = False):
-        """
-        Start browser with Edge and persistent profile.
-        
-        v8.3.0: Viewport is now 1260x700 (matching Lux SDK reference).
-        This eliminates the need for screenshot resizing and coordinate conversion.
-        """
+        """Start browser with Edge and persistent profile."""
         self.playwright = await async_playwright().start()
         BROWSER_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
         
-        logger.info(f"🌐 Starting Edge browser with viewport {VIEWPORT_WIDTH}x{VIEWPORT_HEIGHT} (Lux SDK native)")
+        logger.info(f"🌐 Starting Edge browser with viewport {VIEWPORT_WIDTH}x{VIEWPORT_HEIGHT}")
         logger.info(f"📁 Profile: {BROWSER_PROFILE_DIR}")
         
         self.context = await self.playwright.chromium.launch_persistent_context(
@@ -593,7 +739,6 @@ class BrowserSession:
             ]
         )
         
-        # Get or create first page
         if self.context.pages:
             self.pages = list(self.context.pages)
         else:
@@ -627,12 +772,7 @@ class BrowserSession:
             return False
     
     async def get_viewport_bounds(self) -> Dict[str, Any]:
-        """
-        Get exact viewport position on screen using JavaScript.
-        Used for coordinate validation.
-        
-        v8.3.0: viewport_width and viewport_height should be 1260x700.
-        """
+        """Get exact viewport position on screen."""
         if not self.page:
             raise RuntimeError("No active page")
         
@@ -658,12 +798,7 @@ class BrowserSession:
         }
     
     async def capture_screenshot(self) -> bytes:
-        """
-        Capture viewport screenshot.
-        
-        v8.3.0: Screenshot is now captured at 1260x700 (Lux SDK native resolution).
-        No resizing needed before sending to Lux!
-        """
+        """Capture viewport screenshot at native resolution (1260×700)."""
         if not self.page:
             raise RuntimeError("No active page")
         return await self.page.screenshot(type="png")
@@ -674,20 +809,17 @@ class BrowserSession:
             raise RuntimeError("No active page")
         
         try:
-            # Try native accessibility API first
             if hasattr(self.page, 'accessibility'):
                 try:
                     snapshot = await self.page.accessibility.snapshot()
                     if snapshot:
                         return self._format_a11y_tree(snapshot)
                 except Exception as e:
-                    logger.debug(f"Accessibility API failed: {e}, using JavaScript fallback")
+                    logger.debug(f"Accessibility API failed: {e}")
             
-            # Fallback: use JavaScript to extract DOM structure
             dom_structure = await self.page.evaluate('''() => {
                 function extractNode(node, depth = 0) {
                     if (!node || depth > 10) return '';
-                    
                     let result = '';
                     const indent = '  '.repeat(depth);
                     
@@ -703,7 +835,6 @@ class BrowserSession:
                         const classes = node.className && typeof node.className === 'string' ? 
                                         '.' + node.className.split(' ')[0] : '';
                         
-                        // Get visible text (first 50 chars)
                         let text = '';
                         if (node.childNodes.length > 0) {
                             for (const child of node.childNodes) {
@@ -714,34 +845,23 @@ class BrowserSession:
                         }
                         text = text.trim().substring(0, 50);
                         
-                        // Determine if element is interactive or important
                         const isInteractive = ['a', 'button', 'input', 'select', 'textarea', 'label'].includes(tag) ||
-                                             role || 
-                                             node.onclick || 
-                                             node.getAttribute('tabindex') ||
-                                             node.getAttribute('onclick');
-                        
+                                             role || node.onclick || node.getAttribute('tabindex') || node.getAttribute('onclick');
                         const isContainer = ['div', 'section', 'article', 'main', 'nav', 'header', 'footer', 'aside'].includes(tag);
                         
-                        // Always include interactive elements and shallow containers
                         if (isInteractive || depth < 3 || (isContainer && depth < 4)) {
-                            // Build label from available sources
                             let label = ariaLabel || placeholder || title || text;
                             if (label.length > 50) label = label.substring(0, 50) + '...';
-                            
-                            // Build element description
                             let roleStr = role ? '[' + role + ']' : '<' + tag + '>';
                             let extras = [];
                             if (type) extras.push('type=' + type);
                             if (href) extras.push('href');
-                            
                             result += indent + roleStr + id + classes;
                             if (extras.length > 0) result += ' (' + extras.join(', ') + ')';
                             if (label) result += ' "' + label + '"';
                             result += '\\n';
                         }
                         
-                        // Recurse into children
                         for (const child of node.children) {
                             result += extractNode(child, depth + 1);
                         }
@@ -751,10 +871,7 @@ class BrowserSession:
                 return extractNode(document.body);
             }''')
             
-            if dom_structure and dom_structure.strip():
-                return dom_structure
-            else:
-                return "DOM tree empty or not accessible"
+            return dom_structure if dom_structure and dom_structure.strip() else "DOM tree empty"
             
         except Exception as e:
             return f"Error getting DOM tree: {e}"
@@ -777,15 +894,7 @@ class BrowserSession:
         return "\n".join(lines)
     
     async def get_element_rect(self, request: ElementRectRequest) -> ElementRectResponse:
-        """
-        Get bounding rectangle of a DOM element.
-        
-        Used for Triple Verification: DOM + Lux + Gemini coordinate comparison.
-        Returns center coordinates ready for clicking.
-        
-        v8.3.0: Returned coordinates are in viewport space (1260x700),
-        which is now identical to Lux SDK space. No conversion needed!
-        """
+        """Get bounding rectangle of a DOM element for Triple Verification."""
         if not self.page:
             return ElementRectResponse(success=False, error="No active page")
         
@@ -793,130 +902,85 @@ class BrowserSession:
             locator = None
             selector_description = ""
             
-            # Build locator based on provided criteria (in priority order)
             if request.selector:
                 locator = self.page.locator(request.selector)
                 selector_description = f"selector: {request.selector}"
-            
             elif request.test_id:
                 locator = self.page.get_by_test_id(request.test_id)
                 selector_description = f"test_id: {request.test_id}"
-            
             elif request.role and request.role_name:
                 locator = self.page.get_by_role(request.role, name=request.role_name)
                 selector_description = f"role: {request.role}, name: {request.role_name}"
-            
             elif request.role:
                 locator = self.page.get_by_role(request.role)
                 selector_description = f"role: {request.role}"
-            
             elif request.text:
-                if request.text_exact:
-                    locator = self.page.get_by_text(request.text, exact=True)
-                else:
-                    locator = self.page.get_by_text(request.text)
-                selector_description = f"text: '{request.text}' (exact={request.text_exact})"
-            
+                locator = self.page.get_by_text(request.text, exact=request.text_exact)
+                selector_description = f"text: '{request.text}'"
             elif request.label:
                 locator = self.page.get_by_label(request.label)
                 selector_description = f"label: {request.label}"
-            
             elif request.placeholder:
                 locator = self.page.get_by_placeholder(request.placeholder)
                 selector_description = f"placeholder: {request.placeholder}"
-            
             else:
                 return ElementRectResponse(
                     success=False,
-                    error="Must provide at least one: selector, text, role, test_id, label, or placeholder"
+                    error="Must provide at least one search criteria"
                 )
             
-            # Count matches
             count = await locator.count()
             
             if count == 0:
                 return ElementRectResponse(
-                    success=True,
-                    found=False,
-                    element_count=0,
-                    selector_used=selector_description,
-                    error="Element not found"
+                    success=True, found=False, element_count=0,
+                    selector_used=selector_description, error="Element not found"
                 )
             
-            # Select specific element if multiple matches
             if count > 1 and request.index is not None:
                 if request.index >= count:
                     return ElementRectResponse(
-                        success=True,
-                        found=True,
-                        element_count=count,
+                        success=True, found=True, element_count=count,
                         selector_used=selector_description,
-                        error=f"Requested index {request.index} but only {count} elements found"
+                        error=f"Index {request.index} out of range ({count} elements)"
                     )
                 locator = locator.nth(request.index)
             elif count > 1:
                 locator = locator.first
             
-            # Check visibility
             is_visible = await locator.is_visible()
             
             if request.must_be_visible and not is_visible:
                 return ElementRectResponse(
-                    success=True,
-                    found=True,
-                    visible=False,
-                    element_count=count,
-                    selector_used=selector_description,
-                    error="Element found but not visible"
+                    success=True, found=True, visible=False, element_count=count,
+                    selector_used=selector_description, error="Element not visible"
                 )
             
-            # Check if enabled (for form elements)
             is_enabled = await locator.is_enabled()
-            
-            # Get bounding box
             bbox = await locator.bounding_box()
             
             if not bbox:
                 return ElementRectResponse(
-                    success=True,
-                    found=True,
-                    visible=False,
-                    enabled=is_enabled,
-                    element_count=count,
-                    selector_used=selector_description,
-                    error="Element has no bounding box (may be hidden or zero-size)"
+                    success=True, found=True, visible=False, enabled=is_enabled,
+                    element_count=count, selector_used=selector_description,
+                    error="No bounding box"
                 )
             
-            # Get element info
-            element_info = await locator.evaluate('''(el) => {
-                return {
-                    tag: el.tagName.toLowerCase(),
-                    text: el.innerText ? el.innerText.substring(0, 100) : null
-                }
-            }''')
+            element_info = await locator.evaluate('''(el) => ({
+                tag: el.tagName.toLowerCase(),
+                text: el.innerText ? el.innerText.substring(0, 100) : null
+            })''')
             
-            # Calculate center point (for clicking)
-            # v8.3.0: These are viewport coords = Lux SDK coords (1:1)
             center_x = int(bbox['x'] + bbox['width'] / 2)
             center_y = int(bbox['y'] + bbox['height'] / 2)
             
             return ElementRectResponse(
-                success=True,
-                found=True,
-                visible=is_visible,
-                enabled=is_enabled,
-                x=center_x,
-                y=center_y,
-                bounding_box={
-                    "x": bbox['x'],
-                    "y": bbox['y'],
-                    "width": bbox['width'],
-                    "height": bbox['height']
-                },
-                tag=element_info.get('tag'),
-                text=element_info.get('text'),
-                element_count=count,
-                selector_used=selector_description
+                success=True, found=True, visible=is_visible, enabled=is_enabled,
+                x=center_x, y=center_y,
+                bounding_box={"x": bbox['x'], "y": bbox['y'], 
+                             "width": bbox['width'], "height": bbox['height']},
+                tag=element_info.get('tag'), text=element_info.get('text'),
+                element_count=count, selector_used=selector_description
             )
             
         except Exception as e:
@@ -929,7 +993,7 @@ class BrowserSession:
             {
                 "id": i,
                 "url": page.url if not page.is_closed() else None,
-                "title": "",  # Would need async call
+                "title": "",
                 "is_current": i == self.current_page_index
             }
             for i, page in enumerate(self.pages)
@@ -944,7 +1008,6 @@ class SessionManager:
         self._lock = asyncio.Lock()
     
     async def create_session(self, start_url: Optional[str] = None, headless: bool = False) -> str:
-        """Create new browser session"""
         async with self._lock:
             session_id = f"session-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
             session = BrowserSession(session_id)
@@ -953,11 +1016,9 @@ class SessionManager:
             return session_id
     
     def get_session(self, session_id: str) -> Optional[BrowserSession]:
-        """Get session by ID"""
         return self.sessions.get(session_id)
     
     async def close_session(self, session_id: str) -> bool:
-        """Close and remove session"""
         async with self._lock:
             session = self.sessions.pop(session_id, None)
             if session:
@@ -966,19 +1027,16 @@ class SessionManager:
             return False
     
     async def close_all(self):
-        """Close all sessions"""
         for session_id in list(self.sessions.keys()):
             await self.close_session(session_id)
     
     def get_active_session(self) -> Optional[BrowserSession]:
-        """Get the first active session (convenience method)"""
         for session in self.sessions.values():
             if session.is_alive():
                 return session
         return None
     
     def count(self) -> int:
-        """Count active sessions"""
         return len([s for s in self.sessions.values() if s.is_alive()])
 
 
@@ -992,7 +1050,7 @@ session_manager = SessionManager()
 
 app = FastAPI(
     title="Architect's Hand - Tool Server",
-    description="Desktop App 'Hands Only' Server - Execution without Intelligence (v8.3.0: Lux-native viewport)",
+    description="Desktop App with Triple Verification Support (v8.4.0)",
     version=SERVICE_VERSION
 )
 
@@ -1014,13 +1072,14 @@ async def root():
     return {
         "service": "Architect's Hand Tool Server", 
         "version": SERVICE_VERSION,
-        "viewport": f"{VIEWPORT_WIDTH}x{VIEWPORT_HEIGHT} (Lux SDK native)"
+        "viewport": f"{VIEWPORT_WIDTH}x{VIEWPORT_HEIGHT}",
+        "features": ["triple_verification", "multi_model_screenshots"]
     }
 
 
 @app.get("/status", response_model=StatusResponse)
 async def get_status():
-    """Get service status"""
+    """Get service status with model reference info"""
     return StatusResponse(
         status="running",
         version=SERVICE_VERSION,
@@ -1029,53 +1088,60 @@ async def get_status():
             "pyautogui": PYAUTOGUI_AVAILABLE,
             "pyperclip": PYPERCLIP_AVAILABLE,
             "playwright": PLAYWRIGHT_AVAILABLE,
-            "pil": PIL_AVAILABLE
+            "pil": PIL_AVAILABLE,
+            "triple_verification": True
+        },
+        model_references={
+            "viewport": {"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
+            "lux_sdk": {"width": LUX_SDK_WIDTH, "height": LUX_SDK_HEIGHT},
+            "gemini_recommended": {"width": GEMINI_RECOMMENDED_WIDTH, "height": GEMINI_RECOMMENDED_HEIGHT},
+            "normalized_range": {"min": 0, "max": NORMALIZED_COORD_MAX}
         }
     )
 
 
 @app.get("/screen")
 async def get_screen_info():
-    """Get screen information"""
+    """Get screen and model reference information"""
     info = {
-        "lux_sdk_reference": {"width": LUX_SDK_WIDTH, "height": LUX_SDK_HEIGHT},
-        "viewport_reference": {"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
+        "viewport": {"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
+        "lux_sdk": {"width": LUX_SDK_WIDTH, "height": LUX_SDK_HEIGHT},
+        "gemini_recommended": {"width": GEMINI_RECOMMENDED_WIDTH, "height": GEMINI_RECOMMENDED_HEIGHT},
         "viewport_matches_lux": VIEWPORT_WIDTH == LUX_SDK_WIDTH and VIEWPORT_HEIGHT == LUX_SDK_HEIGHT,
-        "normalized_range": {"min": 0, "max": NORMALIZED_COORD_MAX}
+        "normalized_range": {"min": 0, "max": NORMALIZED_COORD_MAX},
+        "triple_verify_thresholds": {
+            "match": TRIPLE_VERIFY_MATCH_THRESHOLD,
+            "warning": TRIPLE_VERIFY_WARNING_THRESHOLD,
+            "mismatch": TRIPLE_VERIFY_MISMATCH_THRESHOLD
+        }
     }
     
     if PYAUTOGUI_AVAILABLE:
         size = pyautogui.size()
         info["screen"] = {"width": size.width, "height": size.height}
-        info["lux_scale"] = {
-            "x": size.width / LUX_SDK_WIDTH,
-            "y": size.height / LUX_SDK_HEIGHT
-        }
-        info["normalized_scale"] = {
-            "x": size.width / 1000,
-            "y": size.height / 1000
-        }
     
     return info
 
 
 # ============================================================================
-# ENDPOINTS: Screenshot (v8.3.0 - Simplified for browser scope)
+# ENDPOINTS: Screenshot (v8.4.0 - Multi-model support)
 # ============================================================================
 
 @app.post("/screenshot", response_model=ScreenshotResponse)
 async def take_screenshot(request: ScreenshotRequest):
     """
-    Take screenshot based on scope.
-    - browser: viewport only (1260x700 - Lux SDK native, NO RESIZE NEEDED!)
-    - desktop: full screen (requires resize for Lux)
+    Take screenshot with optional multi-model optimization.
     
-    v8.3.0 CHANGE: For browser scope, screenshot is already at Lux SDK resolution.
-    The lux_optimized field returns the same image with scale factors of 1.0.
+    optimize_for options:
+    - lux: Returns lux_optimized (1260×700, same as viewport)
+    - gemini: Returns original (use with normalized coords)
+    - both: Returns both lux_optimized and original
+    - triple_verify: Returns all variants for verification
+    
+    include_gemini_optimized: If true, also resize to 1440×900 for Gemini
     """
     try:
         if request.scope == "browser":
-            # Get browser session
             session = None
             if request.session_id:
                 session = session_manager.get_session(request.session_id)
@@ -1085,50 +1151,51 @@ async def take_screenshot(request: ScreenshotRequest):
             if not session or not session.is_alive():
                 return ScreenshotResponse(
                     success=False,
-                    error="No active browser session. Start one with POST /browser/start"
+                    error="No active browser session"
                 )
             
-            # Capture viewport screenshot (already at 1260x700!)
             screenshot_bytes = await session.capture_screenshot()
             viewport = await session.get_viewport_bounds()
             
             result = ScreenshotResponse(success=True)
             
-            # Original screenshot (1260x700 - same as Lux SDK!)
+            # Original (viewport resolution = 1260×700)
             original_data = screenshot_to_base64(
-                screenshot_bytes, 
-                viewport["width"], 
-                viewport["height"]
+                screenshot_bytes, viewport["width"], viewport["height"]
             )
             
-            # For Gemini or general use
-            if request.optimize_for in [None, "gemini", "both"]:
+            # Always include original for Gemini (it uses normalized coords)
+            if request.optimize_for in [None, "gemini", "both", "triple_verify"]:
                 result.original = original_data
             
-            # For Lux: NO RESIZE NEEDED! Just add scale factors for API compatibility
-            if request.optimize_for in ["lux", "both"]:
+            # Lux optimized (same as viewport in v8.4.0)
+            if request.optimize_for in ["lux", "both", "triple_verify"]:
                 result.lux_optimized = {
                     **original_data,
                     "original_width": viewport["width"],
                     "original_height": viewport["height"],
-                    "scale_x": 1.0,  # No scaling needed!
-                    "scale_y": 1.0   # Viewport = Lux SDK resolution
+                    "scale_x": 1.0,
+                    "scale_y": 1.0
                 }
-                logger.info(f"📸 Browser screenshot {viewport['width']}x{viewport['height']} (Lux-native, no resize)")
             
+            # v8.4.0: Optional Gemini-optimized resize
+            if request.include_gemini_optimized and PIL_AVAILABLE:
+                gemini_data = resize_image(
+                    screenshot_bytes,
+                    GEMINI_RECOMMENDED_WIDTH,
+                    GEMINI_RECOMMENDED_HEIGHT
+                )
+                result.gemini_optimized = gemini_data
+                logger.info(f"📸 Screenshot with Gemini resize: {VIEWPORT_WIDTH}x{VIEWPORT_HEIGHT} → {GEMINI_RECOMMENDED_WIDTH}x{GEMINI_RECOMMENDED_HEIGHT}")
+            
+            logger.info(f"📸 Screenshot captured: {viewport['width']}x{viewport['height']}")
             return result
         
         elif request.scope == "desktop":
             if not PYAUTOGUI_AVAILABLE:
-                return ScreenshotResponse(
-                    success=False,
-                    error="PyAutoGUI not available for desktop screenshots"
-                )
+                return ScreenshotResponse(success=False, error="PyAutoGUI not available")
             
-            # Capture full screen (varies by user's monitor)
             screenshot = pyautogui.screenshot()
-            
-            # Convert to bytes
             buffer = io.BytesIO()
             screenshot.save(buffer, format='PNG')
             buffer.seek(0)
@@ -1138,18 +1205,22 @@ async def take_screenshot(request: ScreenshotRequest):
             
             result = ScreenshotResponse(success=True)
             
-            # Original (full screen resolution)
-            if request.optimize_for in [None, "gemini", "both"]:
+            if request.optimize_for in [None, "gemini", "both", "triple_verify"]:
                 result.original = screenshot_to_base64(
-                    screenshot_bytes,
-                    screen_width,
-                    screen_height
+                    screenshot_bytes, screen_width, screen_height
                 )
             
-            # Lux optimized: RESIZE STILL NEEDED for desktop (screen varies)
-            if request.optimize_for in ["lux", "both"]:
-                result.lux_optimized = resize_for_lux(screenshot_bytes)
-                logger.info(f"📸 Desktop screenshot {screen_width}x{screen_height} → resized to {LUX_SDK_WIDTH}x{LUX_SDK_HEIGHT}")
+            if request.optimize_for in ["lux", "both", "triple_verify"]:
+                result.lux_optimized = resize_image(
+                    screenshot_bytes, LUX_SDK_WIDTH, LUX_SDK_HEIGHT
+                )
+            
+            if request.include_gemini_optimized and PIL_AVAILABLE:
+                result.gemini_optimized = resize_image(
+                    screenshot_bytes,
+                    GEMINI_RECOMMENDED_WIDTH,
+                    GEMINI_RECOMMENDED_HEIGHT
+                )
             
             return result
         
@@ -1159,32 +1230,51 @@ async def take_screenshot(request: ScreenshotRequest):
 
 
 # ============================================================================
-# ENDPOINTS: Click (v8.3.0 - lux_sdk is now 1:1 with viewport)
+# ENDPOINTS: Triple Verification (v8.4.0)
+# ============================================================================
+
+@app.post("/coordinates/triple_verify", response_model=TripleVerifyResponse)
+async def triple_verify(request: TripleVerifyRequest):
+    """
+    Verify coordinates from multiple sources (DOM, Lux, Gemini).
+    
+    ┌─────────────────────────────────────────────────────────────────┐
+    │  TRIPLE VERIFICATION                                            │
+    │                                                                 │
+    │  Provide coords from 2-3 sources:                              │
+    │  - dom_x, dom_y: From /browser/dom/element_rect               │
+    │  - lux_x, lux_y: From Lux Vision API (1260×700)               │
+    │  - gemini_x, gemini_y: From Gemini Computer Use (0-999)       │
+    │                                                                 │
+    │  Returns:                                                       │
+    │  - confidence: HIGH/MEDIUM/LOW/FAILED                          │
+    │  - recommended_action: PROCEED/RETRY/FALLBACK/ABORT            │
+    │  - viewport_coords: Best estimate for clicking                 │
+    │  - distances: Pairwise distances for debugging                 │
+    └─────────────────────────────────────────────────────────────────┘
+    
+    Thresholds:
+    - HIGH confidence: max distance ≤ 50px → PROCEED
+    - MEDIUM confidence: max distance ≤ 100px → PROCEED with caution
+    - LOW confidence: max distance ≤ 150px → RETRY
+    - FAILED: max distance > 150px → FALLBACK or ABORT
+    """
+    return TripleVerifier.verify(request, VIEWPORT_WIDTH, VIEWPORT_HEIGHT)
+
+
+# ============================================================================
+# ENDPOINTS: Click
 # ============================================================================
 
 @app.post("/click", response_model=ActionResponse)
 async def do_click(request: ClickRequest):
-    """
-    Perform click action.
-    - browser scope: uses Playwright (coordinates relative to viewport)
-    - desktop scope: uses PyAutoGUI (screen coordinates)
-    
-    Supports coordinate_origin:
-    - viewport: Browser viewport coordinates (1260x700)
-    - screen: Absolute screen coordinates
-    - lux_sdk: Lux SDK coordinates (1260x700) - NOW SAME AS VIEWPORT!
-    - normalized: Gemini 2.5 Computer Use (0-999 range)
-    
-    v8.3.0: For browser scope, lux_sdk coordinates are used directly
-    without conversion (viewport = Lux SDK resolution).
-    """
+    """Perform click action with coordinate conversion."""
     try:
         x, y = request.x, request.y
         original_x, original_y = x, y
         conversion_applied = "none"
         
         if request.scope == "browser":
-            # Get browser session
             session = None
             if request.session_id:
                 session = session_manager.get_session(request.session_id)
@@ -1192,52 +1282,35 @@ async def do_click(request: ClickRequest):
                 session = session_manager.get_active_session()
             
             if not session or not session.is_alive():
-                return ActionResponse(
-                    success=False,
-                    error="No active browser session"
-                )
+                return ActionResponse(success=False, error="No active browser session")
             
             viewport = await session.get_viewport_bounds()
             
-            # Convert coordinates if needed
+            # Convert coordinates
             if request.coordinate_origin == "lux_sdk":
-                # v8.3.0: Check if viewport matches Lux SDK (should be true now)
+                x, y = CoordinateConverter.lux_sdk_to_viewport(
+                    x, y, viewport["width"], viewport["height"]
+                )
                 if viewport["width"] == LUX_SDK_WIDTH and viewport["height"] == LUX_SDK_HEIGHT:
-                    # NO CONVERSION NEEDED! Direct 1:1 mapping
-                    conversion_applied = "none (viewport = Lux SDK)"
-                    logger.info(f"🎯 Lux SDK ({x}, {y}) → Viewport ({x}, {y}) [1:1, no conversion]")
+                    conversion_applied = "none (1:1 mapping)"
                 else:
-                    # Fallback if viewport is different (shouldn't happen in v8.3.0)
-                    x, y = CoordinateConverter.lux_sdk_to_viewport(
-                        x, y, viewport["width"], viewport["height"]
-                    )
-                    conversion_applied = f"lux_sdk→viewport (scale: {viewport['width']/LUX_SDK_WIDTH:.3f}, {viewport['height']/LUX_SDK_HEIGHT:.3f})"
-                    logger.warning(f"⚠️ Viewport mismatch! Lux SDK ({original_x}, {original_y}) → Viewport ({x}, {y})")
+                    conversion_applied = "lux_sdk→viewport"
             
             elif request.coordinate_origin == "normalized":
                 x, y = CoordinateConverter.normalized_to_viewport(
                     x, y, viewport["width"], viewport["height"]
                 )
                 conversion_applied = "normalized→viewport"
-                logger.info(f"🔄 Normalized ({original_x}, {original_y}) → Viewport ({x}, {y})")
             
-            # viewport and screen coordinates pass through directly for browser scope
-            
-            # Validate coordinates are within viewport
+            # Validate
             if not (0 <= x <= viewport["width"] and 0 <= y <= viewport["height"]):
                 return ActionResponse(
                     success=False,
-                    error=f"Coordinates ({x}, {y}) outside viewport bounds ({viewport['width']}x{viewport['height']})",
-                    details={
-                        "viewport": viewport, 
-                        "requested": {"x": original_x, "y": original_y},
-                        "converted": {"x": x, "y": y},
-                        "coordinate_origin": request.coordinate_origin,
-                        "conversion_applied": conversion_applied
-                    }
+                    error=f"Coordinates ({x}, {y}) outside viewport",
+                    details={"viewport": viewport}
                 )
             
-            # Execute click with Playwright
+            # Execute
             if request.click_type == "single":
                 await session.page.mouse.click(x, y)
             elif request.click_type == "double":
@@ -1249,41 +1322,26 @@ async def do_click(request: ClickRequest):
                 success=True,
                 executed_with="playwright",
                 details={
-                    "scope": "browser",
-                    "click_type": request.click_type,
                     "viewport_coords": {"x": x, "y": y},
                     "original_coords": {"x": original_x, "y": original_y},
                     "coordinate_origin": request.coordinate_origin,
-                    "conversion_applied": conversion_applied,
-                    "viewport_size": {"width": viewport["width"], "height": viewport["height"]}
+                    "conversion": conversion_applied
                 }
             )
         
         elif request.scope == "desktop":
             if not PYAUTOGUI_AVAILABLE:
-                return ActionResponse(
-                    success=False,
-                    error="PyAutoGUI not available"
-                )
+                return ActionResponse(success=False, error="PyAutoGUI not available")
             
             screen_width, screen_height = pyautogui.size()
             
-            # Convert coordinates if needed (desktop ALWAYS needs conversion for lux_sdk)
             if request.coordinate_origin == "lux_sdk":
-                x, y = CoordinateConverter.lux_sdk_to_screen(
-                    x, y, screen_width, screen_height
-                )
-                conversion_applied = f"lux_sdk→screen (scale: {screen_width/LUX_SDK_WIDTH:.3f}, {screen_height/LUX_SDK_HEIGHT:.3f})"
-                logger.info(f"🔄 Lux SDK ({original_x}, {original_y}) → Screen ({x}, {y})")
-            
+                x, y = CoordinateConverter.lux_sdk_to_screen(x, y, screen_width, screen_height)
+                conversion_applied = "lux_sdk→screen"
             elif request.coordinate_origin == "normalized":
-                x, y = CoordinateConverter.normalized_to_screen(
-                    x, y, screen_width, screen_height
-                )
+                x, y = CoordinateConverter.normalized_to_screen(x, y, screen_width, screen_height)
                 conversion_applied = "normalized→screen"
-                logger.info(f"🔄 Normalized ({original_x}, {original_y}) → Screen ({x}, {y})")
             
-            # Execute click with PyAutoGUI
             if request.click_type == "single":
                 pyautogui.click(x, y)
             elif request.click_type == "double":
@@ -1295,12 +1353,9 @@ async def do_click(request: ClickRequest):
                 success=True,
                 executed_with="pyautogui",
                 details={
-                    "scope": "desktop",
-                    "click_type": request.click_type,
                     "screen_coords": {"x": x, "y": y},
                     "original_coords": {"x": original_x, "y": original_y},
-                    "coordinate_origin": request.coordinate_origin,
-                    "conversion_applied": conversion_applied
+                    "conversion": conversion_applied
                 }
             )
     
@@ -1315,59 +1370,32 @@ async def do_click(request: ClickRequest):
 
 @app.post("/type", response_model=ActionResponse)
 async def do_type(request: TypeRequest):
-    """
-    Type text.
-    - browser scope: uses Playwright keyboard
-    - desktop scope: uses PyAutoGUI with clipboard support
-    """
+    """Type text."""
     try:
         if request.scope == "browser":
-            session = None
-            if request.session_id:
-                session = session_manager.get_session(request.session_id)
-            else:
-                session = session_manager.get_active_session()
-            
+            session = session_manager.get_session(request.session_id) if request.session_id else session_manager.get_active_session()
             if not session or not session.is_alive():
-                return ActionResponse(
-                    success=False,
-                    error="No active browser session"
-                )
+                return ActionResponse(success=False, error="No active browser session")
             
-            # Focus on selector if provided
             if request.selector:
                 await session.page.click(request.selector)
                 await asyncio.sleep(0.1)
             
-            # Type text
             await session.page.keyboard.type(request.text, delay=50)
-            
-            return ActionResponse(
-                success=True,
-                executed_with="playwright",
-                details={"text_length": len(request.text), "selector": request.selector}
-            )
+            return ActionResponse(success=True, executed_with="playwright")
         
         elif request.scope == "desktop":
             if not PYAUTOGUI_AVAILABLE:
-                return ActionResponse(
-                    success=False,
-                    error="PyAutoGUI not available"
-                )
+                return ActionResponse(success=False, error="PyAutoGUI not available")
             
             if request.method == "clipboard":
                 type_via_clipboard(request.text)
             else:
                 pyautogui.typewrite(request.text, interval=0.05)
             
-            return ActionResponse(
-                success=True,
-                executed_with="pyautogui",
-                details={"text_length": len(request.text), "method": request.method}
-            )
+            return ActionResponse(success=True, executed_with="pyautogui")
     
     except Exception as e:
-        logger.error(f"Type error: {e}")
         return ActionResponse(success=False, error=str(e))
 
 
@@ -1377,20 +1405,12 @@ async def do_type(request: TypeRequest):
 
 @app.post("/scroll", response_model=ActionResponse)
 async def do_scroll(request: ScrollRequest):
-    """Scroll in the specified direction"""
+    """Scroll in the specified direction."""
     try:
         if request.scope == "browser":
-            session = None
-            if request.session_id:
-                session = session_manager.get_session(request.session_id)
-            else:
-                session = session_manager.get_active_session()
-            
+            session = session_manager.get_session(request.session_id) if request.session_id else session_manager.get_active_session()
             if not session or not session.is_alive():
-                return ActionResponse(
-                    success=False,
-                    error="No active browser session"
-                )
+                return ActionResponse(success=False, error="No active browser session")
             
             delta_x, delta_y = 0, 0
             if request.direction == "up":
@@ -1403,35 +1423,21 @@ async def do_scroll(request: ScrollRequest):
                 delta_x = request.amount
             
             await session.page.mouse.wheel(delta_x, delta_y)
-            
-            return ActionResponse(
-                success=True,
-                executed_with="playwright",
-                details={"direction": request.direction, "amount": request.amount}
-            )
+            return ActionResponse(success=True, executed_with="playwright")
         
         elif request.scope == "desktop":
             if not PYAUTOGUI_AVAILABLE:
-                return ActionResponse(
-                    success=False,
-                    error="PyAutoGUI not available"
-                )
+                return ActionResponse(success=False, error="PyAutoGUI not available")
             
-            clicks = request.amount // 100  # Convert pixels to scroll clicks
+            clicks = request.amount // 100
             if request.direction == "up":
                 pyautogui.scroll(clicks)
             elif request.direction == "down":
                 pyautogui.scroll(-clicks)
-            # Left/right scroll not well supported by pyautogui
             
-            return ActionResponse(
-                success=True,
-                executed_with="pyautogui",
-                details={"direction": request.direction, "clicks": clicks}
-            )
+            return ActionResponse(success=True, executed_with="pyautogui")
     
     except Exception as e:
-        logger.error(f"Scroll error: {e}")
         return ActionResponse(success=False, error=str(e))
 
 
@@ -1441,22 +1447,13 @@ async def do_scroll(request: ScrollRequest):
 
 @app.post("/keypress", response_model=ActionResponse)
 async def do_keypress(request: KeypressRequest):
-    """Press a key or key combination"""
+    """Press a key or key combination."""
     try:
         if request.scope == "browser":
-            session = None
-            if request.session_id:
-                session = session_manager.get_session(request.session_id)
-            else:
-                session = session_manager.get_active_session()
-            
+            session = session_manager.get_session(request.session_id) if request.session_id else session_manager.get_active_session()
             if not session or not session.is_alive():
-                return ActionResponse(
-                    success=False,
-                    error="No active browser session"
-                )
+                return ActionResponse(success=False, error="No active browser session")
             
-            # Handle key combinations (e.g., "Ctrl+C")
             if "+" in request.key:
                 keys = request.key.split("+")
                 for key in keys[:-1]:
@@ -1467,34 +1464,21 @@ async def do_keypress(request: KeypressRequest):
             else:
                 await session.page.keyboard.press(request.key)
             
-            return ActionResponse(
-                success=True,
-                executed_with="playwright",
-                details={"key": request.key}
-            )
+            return ActionResponse(success=True, executed_with="playwright")
         
         elif request.scope == "desktop":
             if not PYAUTOGUI_AVAILABLE:
-                return ActionResponse(
-                    success=False,
-                    error="PyAutoGUI not available"
-                )
+                return ActionResponse(success=False, error="PyAutoGUI not available")
             
-            # Handle key combinations
             if "+" in request.key:
                 keys = request.key.lower().split("+")
                 pyautogui.hotkey(*keys)
             else:
                 pyautogui.press(request.key.lower())
             
-            return ActionResponse(
-                success=True,
-                executed_with="pyautogui",
-                details={"key": request.key}
-            )
+            return ActionResponse(success=True, executed_with="pyautogui")
     
     except Exception as e:
-        logger.error(f"Keypress error: {e}")
         return ActionResponse(success=False, error=str(e))
 
 
@@ -1504,23 +1488,18 @@ async def do_keypress(request: KeypressRequest):
 
 @app.post("/browser/start")
 async def browser_start(request: BrowserStartRequest):
-    """Start a new browser session with Lux-native viewport (1260x700)"""
+    """Start a new browser session."""
     if not PLAYWRIGHT_AVAILABLE:
         raise HTTPException(status_code=500, detail="Playwright not available")
     
     try:
-        session_id = await session_manager.create_session(
-            start_url=request.start_url,
-            headless=request.headless
-        )
-        
+        session_id = await session_manager.create_session(request.start_url, request.headless)
         session = session_manager.get_session(session_id)
-        current_url = session.page.url if session and session.page else None
         
         return {
             "success": True,
             "session_id": session_id,
-            "current_url": current_url,
+            "current_url": session.page.url if session and session.page else None,
             "viewport": {
                 "width": VIEWPORT_WIDTH,
                 "height": VIEWPORT_HEIGHT,
@@ -1528,20 +1507,19 @@ async def browser_start(request: BrowserStartRequest):
             }
         }
     except Exception as e:
-        logger.error(f"Browser start error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/browser/stop")
 async def browser_stop(session_id: str = Query(...)):
-    """Stop a browser session"""
+    """Stop a browser session."""
     success = await session_manager.close_session(session_id)
-    return {"success": success, "session_id": session_id}
+    return {"success": success}
 
 
 @app.get("/browser/status")
 async def browser_status(session_id: Optional[str] = None):
-    """Get browser session status"""
+    """Get browser session status."""
     if session_id:
         session = session_manager.get_session(session_id)
         if session:
@@ -1556,38 +1534,31 @@ async def browser_status(session_id: Optional[str] = None):
                 "session_id": session_id,
                 "is_alive": session.is_alive(),
                 "current_url": session.page.url if session.page else None,
-                "tabs_count": len(session.pages),
                 "viewport": viewport
             }
         return {"error": "Session not found"}
     
-    # Return all sessions
     return {
         "sessions": [
-            {
-                "session_id": sid,
-                "is_alive": s.is_alive(),
-                "current_url": s.page.url if s.page else None
-            }
+            {"session_id": sid, "is_alive": s.is_alive()}
             for sid, s in session_manager.sessions.items()
         ]
     }
 
 
 # ============================================================================
-# ENDPOINTS: Browser Navigation (API-based, no coordinates)
+# ENDPOINTS: Browser Navigation
 # ============================================================================
 
 @app.post("/browser/navigate")
 async def browser_navigate(request: NavigateRequest):
-    """Navigate to URL using Playwright API"""
+    """Navigate to URL."""
     session = session_manager.get_session(request.session_id)
     if not session or not session.is_alive():
-        return {"success": False, "error": "Session not found or not alive"}
+        return {"success": False, "error": "Session not found"}
     
     try:
         await session.page.goto(request.url, wait_until="domcontentloaded", timeout=30000)
-        await asyncio.sleep(0.5)
         return {"success": True, "url": session.page.url}
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -1595,42 +1566,42 @@ async def browser_navigate(request: NavigateRequest):
 
 @app.post("/browser/reload")
 async def browser_reload(session_id: str = Query(...)):
-    """Reload current page"""
+    """Reload current page."""
     session = session_manager.get_session(session_id)
     if not session or not session.is_alive():
         return {"success": False, "error": "Session not found"}
     
     try:
-        await session.page.reload(wait_until="domcontentloaded", timeout=30000)
-        return {"success": True, "url": session.page.url}
+        await session.page.reload(wait_until="domcontentloaded")
+        return {"success": True}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 
 @app.post("/browser/back")
 async def browser_back(session_id: str = Query(...)):
-    """Go back in history"""
+    """Go back in history."""
     session = session_manager.get_session(session_id)
     if not session or not session.is_alive():
         return {"success": False, "error": "Session not found"}
     
     try:
-        await session.page.go_back(wait_until="domcontentloaded", timeout=30000)
-        return {"success": True, "url": session.page.url}
+        await session.page.go_back()
+        return {"success": True}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 
 @app.post("/browser/forward")
 async def browser_forward(session_id: str = Query(...)):
-    """Go forward in history"""
+    """Go forward in history."""
     session = session_manager.get_session(session_id)
     if not session or not session.is_alive():
         return {"success": False, "error": "Session not found"}
     
     try:
-        await session.page.go_forward(wait_until="domcontentloaded", timeout=30000)
-        return {"success": True, "url": session.page.url}
+        await session.page.go_forward()
+        return {"success": True}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -1641,17 +1612,16 @@ async def browser_forward(session_id: str = Query(...)):
 
 @app.get("/browser/tabs")
 async def browser_tabs(session_id: str = Query(...)):
-    """List all tabs"""
+    """List all tabs."""
     session = session_manager.get_session(session_id)
     if not session:
         return {"success": False, "error": "Session not found"}
-    
     return {"success": True, "tabs": session.get_tabs_info()}
 
 
 @app.post("/browser/tab/new")
 async def browser_tab_new(request: TabRequest):
-    """Open new tab"""
+    """Open new tab."""
     session = session_manager.get_session(request.session_id)
     if not session or not session.is_alive():
         return {"success": False, "error": "Session not found"}
@@ -1662,20 +1632,16 @@ async def browser_tab_new(request: TabRequest):
         session.current_page_index = len(session.pages) - 1
         
         if request.url:
-            await new_page.goto(request.url, wait_until="domcontentloaded", timeout=30000)
+            await new_page.goto(request.url, wait_until="domcontentloaded")
         
-        return {
-            "success": True,
-            "tab_id": session.current_page_index,
-            "url": new_page.url
-        }
+        return {"success": True, "tab_id": session.current_page_index}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 
 @app.post("/browser/tab/close")
 async def browser_tab_close(request: TabRequest):
-    """Close a tab"""
+    """Close a tab."""
     session = session_manager.get_session(request.session_id)
     if not session:
         return {"success": False, "error": "Session not found"}
@@ -1688,7 +1654,7 @@ async def browser_tab_close(request: TabRequest):
             session.pages.pop(tab_id)
             if session.current_page_index >= len(session.pages):
                 session.current_page_index = max(0, len(session.pages) - 1)
-            return {"success": True, "remaining_tabs": len(session.pages)}
+            return {"success": True}
         except Exception as e:
             return {"success": False, "error": str(e)}
     
@@ -1697,7 +1663,7 @@ async def browser_tab_close(request: TabRequest):
 
 @app.post("/browser/tab/switch")
 async def browser_tab_switch(request: TabRequest):
-    """Switch to a different tab"""
+    """Switch to a different tab."""
     session = session_manager.get_session(request.session_id)
     if not session:
         return {"success": False, "error": "Session not found"}
@@ -1705,11 +1671,7 @@ async def browser_tab_switch(request: TabRequest):
     if request.tab_id is not None and 0 <= request.tab_id < len(session.pages):
         session.current_page_index = request.tab_id
         await session.pages[request.tab_id].bring_to_front()
-        return {
-            "success": True,
-            "tab_id": request.tab_id,
-            "url": session.page.url
-        }
+        return {"success": True, "tab_id": request.tab_id}
     
     return {"success": False, "error": "Tab not found"}
 
@@ -1720,7 +1682,7 @@ async def browser_tab_switch(request: TabRequest):
 
 @app.get("/browser/dom/tree")
 async def browser_dom_tree(session_id: str = Query(...)):
-    """Get accessibility tree"""
+    """Get accessibility tree."""
     session = session_manager.get_session(session_id)
     if not session or not session.is_alive():
         return {"success": False, "error": "Session not found"}
@@ -1735,32 +1697,10 @@ async def browser_dom_tree(session_id: str = Query(...)):
 @app.post("/browser/dom/element_rect", response_model=ElementRectResponse)
 async def browser_element_rect(request: ElementRectRequest):
     """
-    Get bounding rectangle of a DOM element.
+    Get element bounding rectangle for Triple Verification.
     
-    ┌─────────────────────────────────────────────────────────────────┐
-    │  TRIPLE VERIFICATION SUPPORT                                    │
-    │                                                                 │
-    │  v8.3.0: Coordinates are in viewport space (1260x700)          │
-    │  which is NOW IDENTICAL to Lux SDK space!                       │
-    │                                                                 │
-    │  This endpoint provides DOM coordinates for comparison with:   │
-    │  1. Lux Vision coordinates (lux_sdk = viewport: 1260x700)      │
-    │  2. Gemini Vision coordinates (normalized: 0-999)              │
-    │                                                                 │
-    │  If all 3 agree (< 50px distance), proceed with high confidence│
-    │  If mismatch > 150px, something is wrong (overlay, hidden, etc)│
-    └─────────────────────────────────────────────────────────────────┘
-    
-    Multiple ways to find element:
-    - selector: CSS selector (e.g., "button.send-btn", "#submit")
-    - text: Find by text content (exact or contains)
-    - role: ARIA role (e.g., "button", "link")
-    - role + role_name: Role with accessible name
-    - test_id: data-testid attribute
-    - label: Label text (for form fields)
-    - placeholder: Input placeholder
-    
-    Returns center coordinates (x, y) ready for clicking.
+    Returns center coordinates (x, y) in viewport space.
+    Use with /coordinates/triple_verify to compare with Lux and Gemini.
     """
     session = session_manager.get_session(request.session_id)
     if not session or not session.is_alive():
@@ -1771,226 +1711,71 @@ async def browser_element_rect(request: ElementRectRequest):
 
 @app.get("/browser/current_url")
 async def browser_current_url(session_id: str = Query(...)):
-    """Get current page URL"""
+    """Get current page URL."""
     session = session_manager.get_session(session_id)
     if not session or not session.is_alive():
         return {"success": False, "error": "Session not found"}
-    
     return {"success": True, "url": session.page.url}
 
 
 # ============================================================================
-# ENDPOINTS: Coordinate Utilities (v8.3.0 - Updated for Lux-native viewport)
+# ENDPOINTS: Coordinate Utilities
 # ============================================================================
 
 @app.post("/coordinates/convert")
 async def coordinates_convert(request: CoordinateConvertRequest):
-    """
-    Convert coordinates between different spaces.
-    
-    Supported spaces:
-    - viewport: Browser viewport (1260x700 - same as Lux SDK!)
-    - screen: Absolute screen coordinates
-    - lux_sdk: Lux SDK reference (1260x700) - NOW SAME AS VIEWPORT
-    - normalized: Gemini 2.5 Computer Use (0-999 range)
-    
-    v8.3.0: viewport ↔ lux_sdk conversions are now 1:1 (no scaling).
-    """
+    """Convert coordinates between spaces."""
     try:
         x, y = request.x, request.y
-        
-        # Get reference dimensions
-        if request.session_id:
-            session = session_manager.get_session(request.session_id)
-            if session and session.is_alive():
-                viewport = await session.get_viewport_bounds()
-                ref_width = viewport["width"]
-                ref_height = viewport["height"]
-            else:
-                ref_width, ref_height = VIEWPORT_WIDTH, VIEWPORT_HEIGHT
-        else:
-            if PYAUTOGUI_AVAILABLE:
-                ref_width, ref_height = pyautogui.size()
-            else:
-                ref_width, ref_height = 1920, 1080
-        
-        # Perform conversion
         result_x, result_y = x, y
-        conversion_note = ""
         
-        # ===== FROM lux_sdk =====
+        # Get dimensions
+        viewport_width, viewport_height = VIEWPORT_WIDTH, VIEWPORT_HEIGHT
+        if PYAUTOGUI_AVAILABLE:
+            screen_width, screen_height = pyautogui.size()
+        else:
+            screen_width, screen_height = 1920, 1080
+        
+        # FROM lux_sdk
         if request.from_space == "lux_sdk":
             if request.to_space == "viewport":
-                result_x, result_y = CoordinateConverter.lux_sdk_to_viewport(x, y, VIEWPORT_WIDTH, VIEWPORT_HEIGHT)
-                if VIEWPORT_WIDTH == LUX_SDK_WIDTH and VIEWPORT_HEIGHT == LUX_SDK_HEIGHT:
-                    conversion_note = "1:1 mapping (viewport = Lux SDK)"
+                result_x, result_y = CoordinateConverter.lux_sdk_to_viewport(x, y)
             elif request.to_space == "screen":
-                result_x, result_y = CoordinateConverter.lux_sdk_to_screen(x, y, ref_width, ref_height)
+                result_x, result_y = CoordinateConverter.lux_sdk_to_screen(x, y, screen_width, screen_height)
             elif request.to_space == "normalized":
                 result_x, result_y = CoordinateConverter.lux_sdk_to_normalized(x, y)
         
-        # ===== FROM viewport =====
+        # FROM viewport
         elif request.from_space == "viewport":
             if request.to_space == "lux_sdk":
-                result_x, result_y = CoordinateConverter.viewport_to_lux_sdk(x, y, VIEWPORT_WIDTH, VIEWPORT_HEIGHT)
-                if VIEWPORT_WIDTH == LUX_SDK_WIDTH and VIEWPORT_HEIGHT == LUX_SDK_HEIGHT:
-                    conversion_note = "1:1 mapping (viewport = Lux SDK)"
+                result_x, result_y = CoordinateConverter.viewport_to_lux_sdk(x, y)
             elif request.to_space == "normalized":
-                result_x, result_y = CoordinateConverter.viewport_to_normalized(x, y, VIEWPORT_WIDTH, VIEWPORT_HEIGHT)
-            elif request.to_space == "screen":
-                # For this conversion, need to know browser window position
-                conversion_note = "viewport→screen requires browser window position"
+                result_x, result_y = CoordinateConverter.viewport_to_normalized(x, y)
         
-        # ===== FROM screen =====
+        # FROM screen
         elif request.from_space == "screen":
             if request.to_space == "lux_sdk":
-                result_x, result_y = CoordinateConverter.screen_to_lux_sdk(x, y, ref_width, ref_height)
+                result_x, result_y = CoordinateConverter.screen_to_lux_sdk(x, y, screen_width, screen_height)
             elif request.to_space == "normalized":
-                result_x, result_y = CoordinateConverter.screen_to_normalized(x, y, ref_width, ref_height)
-            elif request.to_space == "viewport":
-                conversion_note = "screen→viewport requires browser window position"
+                result_x, result_y = CoordinateConverter.screen_to_normalized(x, y, screen_width, screen_height)
         
-        # ===== FROM normalized =====
+        # FROM normalized
         elif request.from_space == "normalized":
             if request.to_space == "viewport":
-                result_x, result_y = CoordinateConverter.normalized_to_viewport(x, y, VIEWPORT_WIDTH, VIEWPORT_HEIGHT)
+                result_x, result_y = CoordinateConverter.normalized_to_viewport(x, y)
             elif request.to_space == "screen":
-                result_x, result_y = CoordinateConverter.normalized_to_screen(x, y, ref_width, ref_height)
+                result_x, result_y = CoordinateConverter.normalized_to_screen(x, y, screen_width, screen_height)
             elif request.to_space == "lux_sdk":
                 result_x, result_y = CoordinateConverter.normalized_to_lux_sdk(x, y)
         
-        response = {
+        return {
             "success": True,
             "x": result_x,
             "y": result_y,
             "from_space": request.from_space,
             "to_space": request.to_space,
-            "original": {"x": x, "y": y},
-            "reference_dimensions": {"width": ref_width, "height": ref_height},
-            "viewport_dimensions": {"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
-            "viewport_matches_lux": VIEWPORT_WIDTH == LUX_SDK_WIDTH and VIEWPORT_HEIGHT == LUX_SDK_HEIGHT
+            "original": {"x": x, "y": y}
         }
-        
-        if conversion_note:
-            response["note"] = conversion_note
-        
-        return response
-    
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
-@app.post("/coordinates/validate")
-async def coordinates_validate(request: CoordinateValidateRequest):
-    """Validate if coordinates point to a clickable area"""
-    try:
-        x, y = request.x, request.y
-        original_x, original_y = x, y
-        conversion_applied = "none"
-        
-        if request.scope == "browser":
-            session = None
-            if request.session_id:
-                session = session_manager.get_session(request.session_id)
-            else:
-                session = session_manager.get_active_session()
-            
-            if not session or not session.is_alive():
-                return {"success": False, "error": "No active browser session"}
-            
-            viewport = await session.get_viewport_bounds()
-            
-            # Convert coordinates if needed
-            if request.coordinate_origin == "lux_sdk":
-                if viewport["width"] == LUX_SDK_WIDTH and viewport["height"] == LUX_SDK_HEIGHT:
-                    conversion_applied = "none (1:1 mapping)"
-                else:
-                    x, y = CoordinateConverter.lux_sdk_to_viewport(
-                        x, y, viewport["width"], viewport["height"]
-                    )
-                    conversion_applied = "lux_sdk→viewport"
-            elif request.coordinate_origin == "normalized":
-                x, y = CoordinateConverter.normalized_to_viewport(
-                    x, y, viewport["width"], viewport["height"]
-                )
-                conversion_applied = "normalized→viewport"
-            
-            # Check if within viewport
-            in_viewport = (0 <= x <= viewport["width"] and 0 <= y <= viewport["height"])
-            
-            # Get element at coordinates
-            element_info = None
-            if in_viewport:
-                try:
-                    element_info = await session.page.evaluate('''(coords) => {
-                        const el = document.elementFromPoint(coords.x, coords.y);
-                        if (el) {
-                            const rect = el.getBoundingClientRect();
-                            const style = window.getComputedStyle(el);
-                            return {
-                                found: true,
-                                tag: el.tagName.toLowerCase(),
-                                id: el.id || null,
-                                className: el.className || null,
-                                text: el.innerText ? el.innerText.substring(0, 50) : null,
-                                clickable: style.pointerEvents !== 'none' && style.visibility !== 'hidden',
-                                rect: {x: rect.x, y: rect.y, width: rect.width, height: rect.height}
-                            };
-                        }
-                        return { found: false };
-                    }''', {"x": x, "y": y})
-                except:
-                    pass
-            
-            return {
-                "success": True,
-                "valid": in_viewport,
-                "in_viewport": in_viewport,
-                "viewport_coords": {"x": x, "y": y},
-                "original_coords": {"x": original_x, "y": original_y},
-                "coordinate_origin": request.coordinate_origin,
-                "conversion_applied": conversion_applied,
-                "element_info": element_info,
-                "viewport_bounds": viewport,
-                "viewport_matches_lux": viewport["width"] == LUX_SDK_WIDTH and viewport["height"] == LUX_SDK_HEIGHT
-            }
-        
-        elif request.scope == "desktop":
-            if not PYAUTOGUI_AVAILABLE:
-                return {"success": False, "error": "PyAutoGUI not available"}
-            
-            screen_width, screen_height = pyautogui.size()
-            
-            # Convert if needed
-            if request.coordinate_origin == "lux_sdk":
-                x, y = CoordinateConverter.lux_sdk_to_screen(x, y, screen_width, screen_height)
-                conversion_applied = "lux_sdk→screen"
-            elif request.coordinate_origin == "normalized":
-                x, y = CoordinateConverter.normalized_to_screen(x, y, screen_width, screen_height)
-                conversion_applied = "normalized→screen"
-            
-            in_screen = (0 <= x <= screen_width and 0 <= y <= screen_height)
-            
-            # Get pixel color at coordinates
-            pixel_color = None
-            if in_screen:
-                try:
-                    screenshot = pyautogui.screenshot(region=(x, y, 1, 1))
-                    pixel_color = screenshot.getpixel((0, 0))
-                except:
-                    pass
-            
-            return {
-                "success": True,
-                "valid": in_screen,
-                "in_screen": in_screen,
-                "screen_coords": {"x": x, "y": y},
-                "original_coords": {"x": original_x, "y": original_y},
-                "coordinate_origin": request.coordinate_origin,
-                "conversion_applied": conversion_applied,
-                "pixel_color": pixel_color,
-                "screen_bounds": {"width": screen_width, "height": screen_height}
-            }
     
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -2005,31 +1790,30 @@ if __name__ == "__main__":
 ╔══════════════════════════════════════════════════════════════╗
 ║      ARCHITECT'S HAND - TOOL SERVER v{SERVICE_VERSION}                ║
 ╠══════════════════════════════════════════════════════════════╣
-║  "Hands Only" - Pure Execution, No Intelligence              ║
+║  🎯 TRIPLE VERIFICATION SUPPORT                              ║
 ║                                                              ║
-║  🎯 v8.3.0: VIEWPORT = LUX SDK (1260x700)                    ║
-║     • No screenshot resize for browser scope                 ║
-║     • No coordinate conversion for lux_sdk → viewport        ║
-║     • Direct 1:1 mapping = maximum accuracy!                 ║
+║  Common Coordinate Space: VIEWPORT (1260×700)                ║
+║  ├── DOM:    Native viewport coords                          ║
+║  ├── Lux:    1:1 mapping (1260×700 = viewport)              ║
+║  └── Gemini: Normalized (0-999) → denormalize to viewport   ║
 ║                                                              ║
-║  COORDINATE SYSTEMS SUPPORTED:                               ║
-║    • viewport   - Browser viewport (1260x700 = Lux SDK!)     ║
-║    • screen     - Absolute screen coordinates                ║
-║    • lux_sdk    - Lux SDK reference (1260x700 = viewport!)   ║
-║    • normalized - Gemini 2.5 Computer Use (0-999)            ║
+║  Model References:                                           ║
+║  ├── Lux SDK:    1260×700 (viewport-native)                 ║
+║  └── Gemini:     1440×900 (recommended, optional resize)    ║
 ║                                                              ║
-║  BROWSER SCOPE (Playwright + Edge):                         ║
-║    {'✅' if PLAYWRIGHT_AVAILABLE else '❌'} Screenshot (1260x700 - Lux native!)               ║
-║    {'✅' if PLAYWRIGHT_AVAILABLE else '❌'} Click/Type/Scroll (all coordinate systems)        ║
-║    {'✅' if PLAYWRIGHT_AVAILABLE else '❌'} Navigate/Reload/Back/Forward (API)                ║
-║    {'✅' if PLAYWRIGHT_AVAILABLE else '❌'} Tab management (API)                              ║
-║    {'✅' if PLAYWRIGHT_AVAILABLE else '❌'} DOM tree (Accessibility + JS fallback)            ║
-║    {'✅' if PLAYWRIGHT_AVAILABLE else '❌'} Element rect (Triple Verification support)        ║
+║  Verification Thresholds:                                    ║
+║  ├── HIGH:   ≤{TRIPLE_VERIFY_MATCH_THRESHOLD}px  → PROCEED                            ║
+║  ├── MEDIUM: ≤{TRIPLE_VERIFY_WARNING_THRESHOLD}px → PROCEED with caution               ║
+║  ├── LOW:    ≤{TRIPLE_VERIFY_MISMATCH_THRESHOLD}px → RETRY                              ║
+║  └── FAILED: >{TRIPLE_VERIFY_MISMATCH_THRESHOLD}px → FALLBACK/ABORT                     ║
 ║                                                              ║
-║  DESKTOP SCOPE (PyAutoGUI):                                  ║
-║    {'✅' if PYAUTOGUI_AVAILABLE else '❌'} Screenshot (full screen + resize for Lux)          ║
-║    {'✅' if PYAUTOGUI_AVAILABLE else '❌'} Click/Type/Keypress (all coordinate systems)       ║
-║    {'✅' if PYPERCLIP_AVAILABLE else '❌'} Clipboard typing (Italian keyboard support)        ║
+║  New Endpoint:                                               ║
+║    POST /coordinates/triple_verify                           ║
+║                                                              ║
+║  Capabilities:                                               ║
+║    {'✅' if PLAYWRIGHT_AVAILABLE else '❌'} Playwright (Browser)                             ║
+║    {'✅' if PYAUTOGUI_AVAILABLE else '❌'} PyAutoGUI (Desktop)                               ║
+║    {'✅' if PIL_AVAILABLE else '❌'} PIL (Image processing)                             ║
 ║                                                              ║
 ║  Endpoint: http://127.0.0.1:{SERVICE_PORT}                            ║
 ╚══════════════════════════════════════════════════════════════╝
