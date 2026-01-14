@@ -25,3 +25,6 @@ python-service/lux_analysis/
 python-service/kernel-oagi/
 python-service/oagi-lux-samples/
 python-service/oagi-python/
+
+# Execution logs (screenshots, reports)
+python-service/execution_logs/
