@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 """
-tool_server.py v8.5.0 - Desktop App "Hands Only" Server + ngrok + Pairing
-=========================================================================
+tool_server.py v9.0.0 - Desktop App "Hands Only" Server + Claude Computer Use
+=============================================================================
 
-NOVITÀ v8.5.0: PAIRING AUTOMATICO
-=================================
-Nuovo sistema di pairing one-time con la Web App:
-- python tool_server.py --pair ABC123
-- Salva config in ~/.tool_server_config.json
-- Aggiorna automaticamente l'URL ngrok ad ogni avvio
+NOVITÀ v9.0.0: CLAUDE COMPUTER USE COMPATIBILITY
+================================================
+Nuovi endpoint e funzionalità per compatibilità con Claude Computer Use:
+- /hold_key: Tieni premuto un tasto per una durata
+- /wait: Attendi per una durata specificata
+- Triple click support
+- Auto-screenshot dopo ogni azione (opzionale)
+- Dynamic scaling basato su risoluzione schermo
 
 CHANGELOG:
 - v8.4.2: Aggiunto /browser/dom/tree endpoint
 - v8.4.3: Integrato ngrok tunnel automatico
 - v8.4.4: Fix accessibility API deprecata → estrazione DOM via JavaScript
 - v8.5.0: Sistema di pairing automatico con Web App
+- v9.0.0: Claude Computer Use compatibility (hold_key, wait, triple_click, auto-screenshot)
 """
 
 import argparse
@@ -55,7 +58,7 @@ except ImportError:
 # CONFIGURATION
 # ============================================================================
 
-SERVICE_VERSION = "8.5.0"
+SERVICE_VERSION = "9.0.0"
 SERVICE_PORT = 8766
 
 # ============================================================================
@@ -340,8 +343,9 @@ class ClickRequest(BaseModel):
     x: int
     y: int
     coordinate_origin: Literal["viewport", "screen", "lux_sdk", "normalized"] = "viewport"
-    click_type: Literal["single", "double", "right"] = "single"
+    click_type: Literal["single", "double", "right", "triple"] = "single"
     session_id: Optional[str] = None
+    include_screenshot: bool = False  # v9.0.0: Auto-screenshot after action
 
 class TypeRequest(BaseModel):
     scope: Literal["browser", "desktop"] = "browser"
@@ -349,17 +353,33 @@ class TypeRequest(BaseModel):
     method: Literal["clipboard", "keystrokes"] = "clipboard"
     session_id: Optional[str] = None
     selector: Optional[str] = None
+    include_screenshot: bool = False
 
 class ScrollRequest(BaseModel):
     scope: Literal["browser", "desktop"] = "browser"
     direction: Literal["up", "down", "left", "right"] = "down"
     amount: int = 300
     session_id: Optional[str] = None
+    include_screenshot: bool = False
 
 class KeypressRequest(BaseModel):
     scope: Literal["browser", "desktop"] = "browser"
     key: str
     session_id: Optional[str] = None
+    include_screenshot: bool = False
+
+# v9.0.0: New actions for Claude Computer Use compatibility
+class HoldKeyRequest(BaseModel):
+    scope: Literal["browser", "desktop"] = "browser"
+    key: str
+    duration: float = 1.0  # seconds
+    session_id: Optional[str] = None
+    include_screenshot: bool = False
+
+class WaitRequest(BaseModel):
+    duration: float = 1.0  # seconds
+    include_screenshot: bool = False
+    session_id: Optional[str] = None  # For browser screenshot after wait
 
 class BrowserStartRequest(BaseModel):
     start_url: Optional[str] = None
@@ -392,6 +412,10 @@ class ActionResponse(BaseModel):
     error: Optional[str] = None
     executed_with: Optional[str] = None
     details: Optional[Dict[str, Any]] = None
+    # v9.0.0: Auto-screenshot after action
+    screenshot_base64: Optional[str] = None
+    screenshot_width: Optional[int] = None
+    screenshot_height: Optional[int] = None
 
 class ScreenshotResponse(BaseModel):
     success: bool
@@ -470,6 +494,27 @@ def type_via_clipboard(text: str):
             pass
     else:
         pyautogui.typewrite(text, interval=0.05)
+
+# v9.0.0: Auto-screenshot helper
+async def take_auto_screenshot(session: Optional['BrowserSession'] = None, scope: str = "browser") -> Tuple[Optional[str], Optional[int], Optional[int]]:
+    """Take a screenshot and return (base64, width, height)"""
+    try:
+        if scope == "browser" and session and session.is_alive():
+            # Small delay to let UI update
+            await asyncio.sleep(0.3)
+            data = await session.page.screenshot(type="png")
+            vp = await session.page.evaluate("() => ({w: window.innerWidth, h: window.innerHeight})")
+            return base64.b64encode(data).decode(), vp['w'], vp['h']
+        elif scope == "desktop" and PYAUTOGUI_AVAILABLE:
+            await asyncio.sleep(0.3)
+            shot = pyautogui.screenshot()
+            buf = io.BytesIO()
+            shot.save(buf, format='PNG')
+            sw, sh = pyautogui.size()
+            return base64.b64encode(buf.getvalue()).decode(), sw, sh
+    except Exception as e:
+        logger.warning(f"⚠️ Auto-screenshot failed: {e}")
+    return None, None, None
 
 # ============================================================================
 # BROWSER SESSION
@@ -784,45 +829,63 @@ async def take_screenshot(req: ScreenshotRequest):
 async def do_click(req: ClickRequest):
     try:
         x, y = req.x, req.y
+        session = None
+
         if req.scope == "browser":
             session = session_manager.get_session(req.session_id) if req.session_id else session_manager.get_active_session()
             if not session or not session.is_alive():
                 return ActionResponse(success=False, error="No active browser session")
-            
+
             if req.coordinate_origin == "normalized":
                 x, y = CoordinateConverter.normalized_to_viewport(x, y)
-            
+
             if req.click_type == "double":
                 await session.page.mouse.dblclick(x, y)
+            elif req.click_type == "triple":
+                await session.page.mouse.click(x, y, click_count=3)
             elif req.click_type == "right":
                 await session.page.mouse.click(x, y, button="right")
             else:
                 await session.page.mouse.click(x, y)
-            
-            logger.info(f"🖱️ Click: ({x}, {y})")
-            return ActionResponse(success=True, executed_with="playwright", details={"x": x, "y": y})
-        
+
+            logger.info(f"🖱️ Click: ({x}, {y}) [{req.click_type}]")
+            response = ActionResponse(success=True, executed_with="playwright", details={"x": x, "y": y, "click_type": req.click_type})
+
         elif req.scope == "desktop" and PYAUTOGUI_AVAILABLE:
             sw, sh = pyautogui.size()
             if req.coordinate_origin == "normalized":
                 x, y = CoordinateConverter.normalized_to_screen(x, y, sw, sh)
             elif req.coordinate_origin == "lux_sdk":
                 x, y = CoordinateConverter.lux_sdk_to_screen(x, y, sw, sh)
-            
+
             if req.click_type == "double":
                 pyautogui.doubleClick(x, y)
+            elif req.click_type == "triple":
+                pyautogui.tripleClick(x, y)
             elif req.click_type == "right":
                 pyautogui.rightClick(x, y)
             else:
                 pyautogui.click(x, y)
-            
-            return ActionResponse(success=True, executed_with="pyautogui", details={"x": x, "y": y})
+
+            response = ActionResponse(success=True, executed_with="pyautogui", details={"x": x, "y": y, "click_type": req.click_type})
+        else:
+            return ActionResponse(success=False, error="Invalid scope or PyAutoGUI not available")
+
+        # v9.0.0: Auto-screenshot after action
+        if req.include_screenshot:
+            ss_b64, ss_w, ss_h = await take_auto_screenshot(session, req.scope)
+            response.screenshot_base64 = ss_b64
+            response.screenshot_width = ss_w
+            response.screenshot_height = ss_h
+
+        return response
     except Exception as e:
         return ActionResponse(success=False, error=str(e))
 
 @app.post("/type", response_model=ActionResponse)
 async def do_type(req: TypeRequest):
     try:
+        session = None
         if req.scope == "browser":
             session = session_manager.get_session(req.session_id) if req.session_id else session_manager.get_active_session()
             if not session or not session.is_alive():
@@ -831,16 +894,27 @@ async def do_type(req: TypeRequest):
                 await session.page.click(req.selector)
             await session.page.keyboard.type(req.text, delay=50)
             logger.info(f"⌨️ Type: '{req.text[:20]}...'")
-            return ActionResponse(success=True, executed_with="playwright")
+            response = ActionResponse(success=True, executed_with="playwright")
         elif req.scope == "desktop" and PYAUTOGUI_AVAILABLE:
             type_via_clipboard(req.text) if req.method == "clipboard" else pyautogui.typewrite(req.text)
-            return ActionResponse(success=True, executed_with="pyautogui")
+            response = ActionResponse(success=True, executed_with="pyautogui")
+        else:
+            return ActionResponse(success=False, error="Invalid scope")
+
+        if req.include_screenshot:
+            ss_b64, ss_w, ss_h = await take_auto_screenshot(session, req.scope)
+            response.screenshot_base64 = ss_b64
+            response.screenshot_width = ss_w
+            response.screenshot_height = ss_h
+
+        return response
     except Exception as e:
         return ActionResponse(success=False, error=str(e))
 
 @app.post("/scroll", response_model=ActionResponse)
 async def do_scroll(req: ScrollRequest):
     try:
+        session = None
         if req.scope == "browser":
             session = session_manager.get_session(req.session_id) if req.session_id else session_manager.get_active_session()
             if not session or not session.is_alive():
@@ -848,17 +922,28 @@ async def do_scroll(req: ScrollRequest):
             dx, dy = (0, -req.amount) if req.direction == "up" else (0, req.amount) if req.direction == "down" else (-req.amount, 0) if req.direction == "left" else (req.amount, 0)
             await session.page.mouse.wheel(dx, dy)
             logger.info(f"📜 Scroll: {req.direction}")
-            return ActionResponse(success=True, executed_with="playwright")
+            response = ActionResponse(success=True, executed_with="playwright")
         elif req.scope == "desktop" and PYAUTOGUI_AVAILABLE:
             clicks = req.amount // 100
             pyautogui.scroll(clicks if req.direction == "up" else -clicks)
-            return ActionResponse(success=True, executed_with="pyautogui")
+            response = ActionResponse(success=True, executed_with="pyautogui")
+        else:
+            return ActionResponse(success=False, error="Invalid scope")
+
+        if req.include_screenshot:
+            ss_b64, ss_w, ss_h = await take_auto_screenshot(session, req.scope)
+            response.screenshot_base64 = ss_b64
+            response.screenshot_width = ss_w
+            response.screenshot_height = ss_h
+
+        return response
     except Exception as e:
         return ActionResponse(success=False, error=str(e))
 
 @app.post("/keypress", response_model=ActionResponse)
 async def do_keypress(req: KeypressRequest):
     try:
+        session = None
         if req.scope == "browser":
             session = session_manager.get_session(req.session_id) if req.session_id else session_manager.get_active_session()
             if not session or not session.is_alive():
@@ -873,10 +958,85 @@ async def do_keypress(req: KeypressRequest):
             else:
                 await session.page.keyboard.press(req.key)
             logger.info(f"⌨️ Key: {req.key}")
-            return ActionResponse(success=True, executed_with="playwright")
+            response = ActionResponse(success=True, executed_with="playwright")
         elif req.scope == "desktop" and PYAUTOGUI_AVAILABLE:
             pyautogui.hotkey(*req.key.lower().split("+")) if "+" in req.key else pyautogui.press(req.key.lower())
-            return ActionResponse(success=True, executed_with="pyautogui")
+            response = ActionResponse(success=True, executed_with="pyautogui")
+        else:
+            return ActionResponse(success=False, error="Invalid scope")
+
+        if req.include_screenshot:
+            ss_b64, ss_w, ss_h = await take_auto_screenshot(session, req.scope)
+            response.screenshot_base64 = ss_b64
+            response.screenshot_width = ss_w
+            response.screenshot_height = ss_h
+
+        return response
+    except Exception as e:
+        return ActionResponse(success=False, error=str(e))
+
+# v9.0.0: New endpoints for Claude Computer Use compatibility
+@app.post("/hold_key", response_model=ActionResponse)
+async def do_hold_key(req: HoldKeyRequest):
+    """Hold a key down for a specified duration"""
+    try:
+        session = None
+        if req.duration > 100:
+            return ActionResponse(success=False, error="Duration too long (max 100s)")
+
+        if req.scope == "browser":
+            session = session_manager.get_session(req.session_id) if req.session_id else session_manager.get_active_session()
+            if not session or not session.is_alive():
+                return ActionResponse(success=False, error="No active browser session")
+            await session.page.keyboard.down(req.key)
+            await asyncio.sleep(req.duration)
+            await session.page.keyboard.up(req.key)
+            logger.info(f"⌨️ Hold key: {req.key} for {req.duration}s")
+            response = ActionResponse(success=True, executed_with="playwright", details={"key": req.key, "duration": req.duration})
+        elif req.scope == "desktop" and PYAUTOGUI_AVAILABLE:
+            pyautogui.keyDown(req.key.lower())
+            await asyncio.sleep(req.duration)
+            pyautogui.keyUp(req.key.lower())
+            response = ActionResponse(success=True, executed_with="pyautogui", details={"key": req.key, "duration": req.duration})
+        else:
+            return ActionResponse(success=False, error="Invalid scope")
+
+        if req.include_screenshot:
+            ss_b64, ss_w, ss_h = await take_auto_screenshot(session, req.scope)
+            response.screenshot_base64 = ss_b64
+            response.screenshot_width = ss_w
+            response.screenshot_height = ss_h
+
+        return response
+    except Exception as e:
+        return ActionResponse(success=False, error=str(e))
+
+@app.post("/wait", response_model=ActionResponse)
+async def do_wait(req: WaitRequest):
+    """Wait for a specified duration (useful for letting UI settle)"""
+    try:
+        if req.duration > 100:
+            return ActionResponse(success=False, error="Duration too long (max 100s)")
+
+        logger.info(f"⏳ Wait: {req.duration}s")
+        await asyncio.sleep(req.duration)
+
+        response = ActionResponse(success=True, executed_with="asyncio", details={"duration": req.duration})
+
+        if req.include_screenshot:
+            session = None
+            if req.session_id:
+                session = session_manager.get_session(req.session_id)
+            elif session_manager.get_active_session():
+                session = session_manager.get_active_session()
+
+            scope = "browser" if session and session.is_alive() else "desktop"
+            ss_b64, ss_w, ss_h = await take_auto_screenshot(session, scope)
+            response.screenshot_base64 = ss_b64
+            response.screenshot_width = ss_w
+            response.screenshot_height = ss_h
+
+        return response
     except Exception as e:
         return ActionResponse(success=False, error=str(e))
 
