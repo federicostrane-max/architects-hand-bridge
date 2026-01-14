@@ -20,9 +20,53 @@ import signal
 import threading
 from pathlib import Path
 
-# Configurazione
-SCRIPT_DIR = Path(__file__).parent.resolve()
-PYTHON_SERVICE_DIR = SCRIPT_DIR / "python-service"
+
+# ============================================================================
+# AUTO-RILEVAMENTO ROOT DEL PROGETTO
+# ============================================================================
+
+def find_project_root():
+    """
+    Trova la root del progetto risalendo la gerarchia delle cartelle.
+    Cerca package.json e src/main.js come marker del progetto Electron.
+
+    Funziona sia quando:
+    - Eseguito come script Python (launcher.py)
+    - Eseguito come exe PyInstaller (da qualsiasi posizione)
+    """
+    # Determina la directory di partenza
+    if getattr(sys, 'frozen', False):
+        # PyInstaller exe - usa la posizione dell'eseguibile
+        start_dir = Path(sys.executable).parent
+    else:
+        # Script Python normale
+        start_dir = Path(__file__).parent
+
+    # Risali fino a 5 livelli cercando i marker del progetto
+    current = start_dir
+    for _ in range(5):
+        # Cerca package.json E src/main.js (marker progetto Electron)
+        if (current / "package.json").exists() and (current / "src" / "main.js").exists():
+            return current
+        current = current.parent
+
+    # Fallback: prova percorsi noti (hardcoded per sicurezza)
+    known_paths = [
+        Path("D:/downloads/Lux/app lux 1/architects-hand-bridge"),
+        Path("C:/architects-hand-bridge"),
+        Path.home() / "architects-hand-bridge",
+    ]
+    for path in known_paths:
+        if path.exists() and (path / "package.json").exists():
+            return path
+
+    # Ultimo fallback: directory di partenza
+    return start_dir
+
+
+# Configurazione con auto-rilevamento
+PROJECT_ROOT = find_project_root()
+PYTHON_SERVICE_DIR = PROJECT_ROOT / "python-service"
 TASKER_SERVICE_SCRIPT = PYTHON_SERVICE_DIR / "tasker_service.py"
 
 # Processi globali
@@ -50,7 +94,33 @@ def find_python():
 
 
 def find_npm():
-    """Trova npm"""
+    """Trova npm e restituisce il percorso completo"""
+    # Su Windows, cerca npm.cmd nel PATH
+    if sys.platform == "win32":
+        # Prova percorsi comuni
+        common_paths = [
+            Path("C:/Program Files/nodejs/npm.cmd"),
+            Path(os.environ.get("APPDATA", "")) / "npm/npm.cmd",
+            Path(os.environ.get("ProgramFiles", "")) / "nodejs/npm.cmd",
+        ]
+        for npm_path in common_paths:
+            if npm_path.exists():
+                return str(npm_path)
+
+        # Prova con where
+        try:
+            result = subprocess.run(
+                ["where", "npm.cmd"],
+                capture_output=True,
+                text=True,
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            if result.returncode == 0:
+                return result.stdout.strip().split('\n')[0]
+        except:
+            pass
+
+    # Fallback: prova npm direttamente
     try:
         result = subprocess.run(
             ["npm", "--version"],
@@ -71,6 +141,8 @@ def start_tasker_service():
 
     python_cmd = find_python()
     print(f"[LAUNCHER] Avvio Tasker Service con {python_cmd}...")
+    print(f"[LAUNCHER] Script: {TASKER_SERVICE_SCRIPT}")
+    print(f"[LAUNCHER] CWD: {PYTHON_SERVICE_DIR}")
 
     # Avvia in una nuova finestra console
     if sys.platform == "win32":
@@ -98,20 +170,24 @@ def start_electron_bridge():
         print("[LAUNCHER] ERRORE: npm non trovato!")
         return None
 
-    print(f"[LAUNCHER] Avvio Electron Bridge...")
+    print(f"[LAUNCHER] Avvio Electron Bridge da: {PROJECT_ROOT}")
+    print(f"[LAUNCHER] npm path: {npm_cmd}")
 
     # Avvia in una nuova finestra console
     if sys.platform == "win32":
+        # Usa cmd.exe /k per aprire una nuova console che rimane aperta
+        # e esegue npm start dalla directory corretta
+        cmd_line = f'cmd.exe /k "cd /d {PROJECT_ROOT} && "{npm_cmd}" start"'
+        print(f"[LAUNCHER] Comando: {cmd_line}")
+
         electron_process = subprocess.Popen(
-            ["npm", "start"],
-            cwd=str(SCRIPT_DIR),
-            creationflags=subprocess.CREATE_NEW_CONSOLE,
-            shell=True
+            cmd_line,
+            creationflags=subprocess.CREATE_NEW_CONSOLE
         )
     else:
         electron_process = subprocess.Popen(
-            ["npm", "start"],
-            cwd=str(SCRIPT_DIR)
+            [npm_cmd, "start"],
+            cwd=str(PROJECT_ROOT)
         )
 
     print(f"[LAUNCHER] Electron Bridge avviato (PID: {electron_process.pid})")
@@ -279,6 +355,17 @@ def run_gui_mode():
 
         def start_all(self):
             self.start_btn.config(state=tk.DISABLED)
+
+            # Log percorsi per debug
+            self.log(f"Root: {PROJECT_ROOT}")
+            self.log(f"Tasker: {TASKER_SERVICE_SCRIPT.exists()}")
+
+            if not TASKER_SERVICE_SCRIPT.exists():
+                self.log(f"ERRORE: File non trovato!")
+                self.log(f"Path: {TASKER_SERVICE_SCRIPT}")
+                self.start_btn.config(state=tk.NORMAL)
+                return
+
             self.log("Avvio Tasker Service...")
 
             # Avvia in thread separato
@@ -330,9 +417,24 @@ def run_gui_mode():
     gui.run()
 
 
+def log_paths():
+    """Stampa i percorsi rilevati per debug"""
+    print("=" * 50)
+    print("[LAUNCHER] Percorsi rilevati:")
+    print(f"  PROJECT_ROOT: {PROJECT_ROOT}")
+    print(f"  PYTHON_SERVICE_DIR: {PYTHON_SERVICE_DIR}")
+    print(f"  TASKER_SERVICE_SCRIPT: {TASKER_SERVICE_SCRIPT}")
+    print(f"  TASKER exists: {TASKER_SERVICE_SCRIPT.exists()}")
+    print(f"  package.json exists: {(PROJECT_ROOT / 'package.json').exists()}")
+    print("=" * 50)
+
+
 def main():
+    # Log percorsi per debug
+    log_paths()
+
     # Cambia directory di lavoro
-    os.chdir(SCRIPT_DIR)
+    os.chdir(PROJECT_ROOT)
 
     # Controlla argomenti
     if "--no-gui" in sys.argv or "-c" in sys.argv:

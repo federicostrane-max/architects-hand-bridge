@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-tasker_service.py v7.3.0 - Unified Multi-Provider Computer Use
+tasker_service.py v7.4.0 - Unified Multi-Provider Computer Use
 =============================================================
 
 SUPPORTED PROVIDERS:
@@ -26,6 +26,8 @@ Versioni:
 - v7.3.0: ALLINEAMENTO SDK - Fix parametri default (temperature=0.5, max_steps=20/60),
           aggiunto reset_handler(), reflection_interval=20, step_delay=0.3,
           rimossa intercettazione type_via_clipboard (usa handler SDK nativo)
+- v7.4.0: FILE LOGGING - Ogni esecuzione crea un file .log in execution_logs/
+          con tutti i dettagli per debug facile
 """
 
 import asyncio
@@ -51,7 +53,7 @@ from pydantic import BaseModel, Field
 # CONFIGURATION
 # ============================================================================
 
-SERVICE_VERSION = "7.3.0"
+SERVICE_VERSION = "7.4.0"
 SERVICE_PORT = 8765
 
 # ==========================================================================
@@ -89,27 +91,89 @@ GEMINI_CUA_MODEL = "gemini-2.5-computer-use-preview-10-2025"      # Per CUA (sol
 ANALYSIS_DIR = Path.home() / ".architect-hand" / "analysis"
 ANALYSIS_DIR.mkdir(parents=True, exist_ok=True)
 
+# Execution logs directory (per debug facile)
+EXECUTION_LOGS_DIR = Path(__file__).parent / "execution_logs"
+EXECUTION_LOGS_DIR.mkdir(parents=True, exist_ok=True)
+
 # ============================================================================
 # LOGGING
 # ============================================================================
 
 class TaskLogger:
-    """Logger personalizzato con timestamp e colori"""
-    
+    """Logger personalizzato con timestamp, colori e salvataggio su file"""
+
     def __init__(self):
         self.logs: List[str] = []
-        
+        self.current_log_file: Optional[Path] = None
+        self.execution_id: Optional[str] = None
+
+    def start_execution(self, mode: str, task_description: str):
+        """Inizia una nuova esecuzione e crea il file di log"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.execution_id = f"{mode}_{timestamp}"
+        self.current_log_file = EXECUTION_LOGS_DIR / f"{self.execution_id}.log"
+        self.logs = []
+
+        # Header del log
+        header = [
+            "=" * 80,
+            f"EXECUTION LOG - {self.execution_id}",
+            "=" * 80,
+            f"Timestamp: {datetime.now().isoformat()}",
+            f"Mode: {mode}",
+            f"Task: {task_description}",
+            "=" * 80,
+            ""
+        ]
+
+        # Scrivi header su file
+        with open(self.current_log_file, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(header))
+
+        self.log(f"📝 Log file: {self.current_log_file}")
+
     def log(self, message: str, level: str = "INFO"):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         formatted = f"[{timestamp}] [{level}] {message}"
         self.logs.append(formatted)
         print(formatted)
-        
+
+        # Scrivi anche su file se disponibile
+        if self.current_log_file:
+            try:
+                with open(self.current_log_file, 'a', encoding='utf-8') as f:
+                    f.write(formatted + '\n')
+            except Exception as e:
+                print(f"[WARN] Failed to write to log file: {e}")
+
     def get_logs(self) -> List[str]:
         return self.logs.copy()
-    
+
     def clear(self):
         self.logs = []
+
+    def end_execution(self, success: bool, error: Optional[str] = None):
+        """Chiude l'esecuzione e finalizza il log"""
+        footer = [
+            "",
+            "=" * 80,
+            f"EXECUTION {'COMPLETED' if success else 'FAILED'}",
+            f"End Time: {datetime.now().isoformat()}",
+        ]
+        if error:
+            footer.append(f"Error: {error}")
+        footer.append("=" * 80)
+
+        for line in footer:
+            self.log(line)
+
+        # Log file path per riferimento
+        if self.current_log_file:
+            print(f"\n📄 Full log saved to: {self.current_log_file}\n")
+
+    def get_current_log_path(self) -> Optional[str]:
+        """Ritorna il path del log corrente"""
+        return str(self.current_log_file) if self.current_log_file else None
 
 logger = TaskLogger()
 
@@ -242,6 +306,7 @@ class TaskResponse(BaseModel):
     mode_used: str = ""
     actions_log: List[dict] = []
     logs: List[str] = []
+    log_file: Optional[str] = None  # Path del file di log completo
 
 
 class StatusResponse(BaseModel):
@@ -1594,34 +1659,42 @@ async def get_status():
 async def execute_task(request: TaskRequest):
     """Esegue un task"""
     global is_running
-    
+
+    # Inizia logging su file
+    logger.start_execution(request.mode, request.task_description)
+
     # Debug: log full request
     logger.log("=" * 60)
     logger.log(f"[REQUEST] mode: {request.mode}")
-    logger.log(f"[REQUEST] task: {request.task_description[:50]}...")
+    logger.log(f"[REQUEST] task: {request.task_description}")
     logger.log(f"[REQUEST] api_key: {'***' + request.api_key[-4:] if request.api_key else 'None'}")
     logger.log(f"[REQUEST] gemini_api_key: {'***' + request.gemini_api_key[-4:] if request.gemini_api_key else 'None'}")
     logger.log(f"[REQUEST] max_steps: {request.max_steps}")
     logger.log(f"[REQUEST] max_steps_per_todo: {request.max_steps_per_todo}")
+    logger.log(f"[REQUEST] temperature: {request.temperature}")
+    logger.log(f"[REQUEST] todos: {request.todos}")
     logger.log("=" * 60)
-    
+
     if is_running:
+        logger.end_execution(False, "Un task è già in esecuzione")
         raise HTTPException(status_code=409, detail="Un task è già in esecuzione")
     
     is_running = True
     
     try:
+        result = None
+
         # Lux modes
         if request.mode in ["actor", "thinker"]:
-            return await execute_with_actor(request)
-        
+            result = await execute_with_actor(request)
+
         elif request.mode == "tasker":
-            return await execute_with_tasker(request)
-        
+            result = await execute_with_tasker(request)
+
         # Gemini modes
         elif request.mode == "gemini_cua":
-            return await execute_with_gemini_cua(request)
-        
+            result = await execute_with_gemini_cua(request)
+
         elif request.mode in ["gemini", "gemini_hybrid"]:
             global global_hybrid_executor
             
@@ -1672,16 +1745,30 @@ async def execute_task(request: TaskRequest):
                 executor = HybridModeExecutor(headless=request.headless, api_key=gemini_key)
                 global_hybrid_executor = executor
             
-            return await executor.run(
-                request.task_description, 
-                request.start_url, 
+            result = await executor.run(
+                request.task_description,
+                request.start_url,
                 max_steps,
                 new_tab=new_tab
             )
-        
+
         else:
+            logger.end_execution(False, f"Mode sconosciuto: {request.mode}")
             raise HTTPException(status_code=400, detail=f"Mode sconosciuto: {request.mode}")
-    
+
+        # Finalizza log con risultato
+        if result:
+            logger.end_execution(result.success, result.error)
+            # Aggiungi path del log alla risposta
+            result.log_file = logger.get_current_log_path()
+
+        return result
+
+    except Exception as e:
+        logger.log(f"❌ EXCEPTION: {str(e)}", "ERROR")
+        logger.end_execution(False, str(e))
+        raise
+
     finally:
         is_running = False
 
