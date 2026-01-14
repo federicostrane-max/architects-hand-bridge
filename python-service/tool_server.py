@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """
-tool_server.py v9.0.0 - Desktop App "Hands Only" Server + Claude Computer Use
-=============================================================================
+tool_server.py v10.0.0 - Desktop App "Hands Only" Server + Playwright MCP Style
+================================================================================
 
-NOVITÀ v9.0.0: CLAUDE COMPUTER USE COMPATIBILITY
-================================================
-Nuovi endpoint e funzionalità per compatibilità con Claude Computer Use:
-- /hold_key: Tieni premuto un tasto per una durata
-- /wait: Attendi per una durata specificata
-- Triple click support
-- Auto-screenshot dopo ogni azione (opzionale)
-- Dynamic scaling basato su risoluzione schermo
+NOVITÀ v10.0.0: PLAYWRIGHT MCP COMPATIBILITY
+============================================
+Nuove funzionalità ispirate a Playwright MCP per automazione avanzata:
+- Accessibility Ref System: ogni elemento ha un ref ID univoco (es. "e3")
+- Click by Ref: clicca elementi direttamente per ref invece di coordinate
+- Smart Waiting: waitForSelector, waitForLoadState invece di sleep fissi
+- File Upload: upload file su input type=file
+- Drag and Drop: trascina elementi
+- Select Option: selezione dropdown
+- Hover: hover su elementi
+- Error Recovery: auto-retry con exponential backoff
 
 CHANGELOG:
 - v8.4.2: Aggiunto /browser/dom/tree endpoint
@@ -18,6 +21,7 @@ CHANGELOG:
 - v8.4.4: Fix accessibility API deprecata → estrazione DOM via JavaScript
 - v8.5.0: Sistema di pairing automatico con Web App
 - v9.0.0: Claude Computer Use compatibility (hold_key, wait, triple_click, auto-screenshot)
+- v10.0.0: Playwright MCP compatibility (ref system, smart waiting, file upload, drag, hover)
 """
 
 import argparse
@@ -58,7 +62,7 @@ except ImportError:
 # CONFIGURATION
 # ============================================================================
 
-SERVICE_VERSION = "9.0.0"
+SERVICE_VERSION = "10.0.0"
 SERVICE_PORT = 8766
 
 # ============================================================================
@@ -381,6 +385,68 @@ class WaitRequest(BaseModel):
     include_screenshot: bool = False
     session_id: Optional[str] = None  # For browser screenshot after wait
 
+# v10.0.0: New Playwright MCP-style models
+class ClickByRefRequest(BaseModel):
+    """Click element by ref ID from accessibility snapshot"""
+    session_id: str
+    ref: str  # e.g., "e3", "e15"
+    click_type: Literal["single", "double", "right", "triple"] = "single"
+    include_screenshot: bool = False
+
+class HoverRequest(BaseModel):
+    """Hover over element"""
+    scope: Literal["browser", "desktop"] = "browser"
+    session_id: Optional[str] = None
+    x: Optional[int] = None
+    y: Optional[int] = None
+    ref: Optional[str] = None  # Alternative: hover by ref
+    selector: Optional[str] = None  # Alternative: hover by selector
+    include_screenshot: bool = False
+
+class DragRequest(BaseModel):
+    """Drag from one position to another"""
+    scope: Literal["browser", "desktop"] = "browser"
+    session_id: Optional[str] = None
+    start_x: int
+    start_y: int
+    end_x: int
+    end_y: int
+    coordinate_origin: Literal["viewport", "screen", "lux_sdk", "normalized"] = "viewport"
+    include_screenshot: bool = False
+
+class SelectOptionRequest(BaseModel):
+    """Select option from dropdown"""
+    session_id: str
+    selector: Optional[str] = None
+    ref: Optional[str] = None
+    value: Optional[str] = None  # Select by value
+    label: Optional[str] = None  # Select by visible text
+    index: Optional[int] = None  # Select by index
+    include_screenshot: bool = False
+
+class FileUploadRequest(BaseModel):
+    """Upload file to input element"""
+    session_id: str
+    selector: Optional[str] = None
+    ref: Optional[str] = None
+    file_path: str  # Local path to file
+    include_screenshot: bool = False
+
+class WaitForSelectorRequest(BaseModel):
+    """Wait for element to appear/disappear"""
+    session_id: str
+    selector: str
+    state: Literal["attached", "detached", "visible", "hidden"] = "visible"
+    timeout: int = 30000  # ms
+    include_screenshot: bool = False
+
+class WaitForLoadStateRequest(BaseModel):
+    """Wait for page load state"""
+    session_id: str
+    state: Literal["load", "domcontentloaded", "networkidle"] = "load"
+    timeout: int = 30000  # ms
+    include_screenshot: bool = False
+
 class BrowserStartRequest(BaseModel):
     start_url: Optional[str] = None
     headless: bool = False
@@ -527,12 +593,29 @@ class BrowserSession:
         self.context: Optional[BrowserContext] = None
         self.pages: List[Page] = []
         self.current_page_index = 0
-    
+        # v10.0.0: Ref system for element tracking
+        self._element_refs: Dict[str, Dict[str, Any]] = {}  # ref -> element info with coordinates
+        self._ref_counter = 0
+
     @property
     def page(self):
         if self.pages and 0 <= self.current_page_index < len(self.pages):
             return self.pages[self.current_page_index]
         return None
+
+    def _generate_ref(self) -> str:
+        """Generate unique ref ID like 'e1', 'e2', etc."""
+        self._ref_counter += 1
+        return f"e{self._ref_counter}"
+
+    def get_element_by_ref(self, ref: str) -> Optional[Dict[str, Any]]:
+        """Get element info by ref ID"""
+        return self._element_refs.get(ref)
+
+    def clear_refs(self):
+        """Clear all refs (call before new snapshot)"""
+        self._element_refs = {}
+        self._ref_counter = 0
     
     async def start(self, start_url: Optional[str] = None, headless: bool = False):
         self.playwright = await async_playwright().start()
@@ -568,11 +651,18 @@ class BrowserSession:
         except:
             return False
     
-    async def get_accessibility_tree(self):
-        """Get DOM tree using JavaScript (accessibility API is deprecated)"""
+    async def get_accessibility_tree(self, include_refs: bool = True):
+        """
+        Get DOM tree with ref IDs (Playwright MCP style).
+        Each interactive element gets a unique ref like 'e1', 'e2', etc.
+        """
         if not self.page:
             return None
-        
+
+        # Clear refs before new snapshot
+        if include_refs:
+            self.clear_refs()
+
         try:
             # Try new aria_snapshot first (Playwright 1.40+)
             try:
@@ -580,104 +670,141 @@ class BrowserSession:
                 return {"type": "aria_snapshot", "tree": snapshot}
             except (AttributeError, Exception):
                 pass
-            
+
             # Fallback: Extract interactive elements via JavaScript
-            tree = await self.page.evaluate('''() => {
-                function extractNode(el, depth = 0) {
-                    if (depth > 10) return null;  // Limit depth
-                    
-                    const rect = el.getBoundingClientRect();
-                    const style = window.getComputedStyle(el);
-                    const isVisible = style.display !== 'none' && 
-                                     style.visibility !== 'hidden' && 
-                                     rect.width > 0 && rect.height > 0;
-                    
-                    if (!isVisible) return null;
-                    
-                    const node = {
-                        tag: el.tagName.toLowerCase(),
-                        role: el.getAttribute('role') || el.tagName.toLowerCase(),
-                        name: el.getAttribute('aria-label') || 
-                              el.getAttribute('title') || 
-                              el.getAttribute('placeholder') ||
-                              (el.tagName === 'INPUT' ? el.getAttribute('name') : null) ||
-                              (el.tagName === 'BUTTON' || el.tagName === 'A' ? el.textContent?.trim().slice(0, 50) : null),
-                        text: el.textContent?.trim().slice(0, 100) || null,
-                        x: Math.round(rect.x + rect.width / 2),
-                        y: Math.round(rect.y + rect.height / 2),
-                        width: Math.round(rect.width),
-                        height: Math.round(rect.height),
-                    };
-                    
-                    // Add specific attributes
-                    if (el.id) node.id = el.id;
-                    if (el.href) node.href = el.href;
-                    if (el.type) node.type = el.type;
-                    if (el.disabled) node.disabled = true;
-                    if (el.getAttribute('data-testid')) node.testId = el.getAttribute('data-testid');
-                    
-                    // Get interactive children
-                    const interactiveSelectors = 'a, button, input, select, textarea, [role="button"], [role="link"], [onclick]';
-                    const children = [];
-                    
-                    for (const child of el.querySelectorAll(':scope > *')) {
-                        const isInteractive = child.matches(interactiveSelectors);
-                        const hasInteractiveChildren = child.querySelector(interactiveSelectors);
-                        
-                        if (isInteractive || hasInteractiveChildren) {
-                            const childNode = extractNode(child, depth + 1);
-                            if (childNode) children.push(childNode);
-                        }
-                    }
-                    
-                    if (children.length > 0) node.children = children;
-                    
-                    return node;
-                }
-                
-                // Get all interactive elements at top level
-                const interactive = document.querySelectorAll('a, button, input, select, textarea, [role="button"], [role="link"], [role="textbox"], [role="menuitem"], nav, header, main, form');
+            raw_elements = await self.page.evaluate('''() => {
+                // Get all interactive elements
+                const interactive = document.querySelectorAll(
+                    'a, button, input, select, textarea, ' +
+                    '[role="button"], [role="link"], [role="textbox"], [role="menuitem"], ' +
+                    '[role="tab"], [role="checkbox"], [role="radio"], [role="switch"], ' +
+                    '[role="option"], [role="combobox"], [role="listbox"], ' +
+                    '[onclick], [tabindex]:not([tabindex="-1"]), ' +
+                    'label, img[alt], [aria-label]'
+                );
                 const elements = [];
-                
-                interactive.forEach(el => {
+
+                interactive.forEach((el, index) => {
                     const rect = el.getBoundingClientRect();
                     const style = window.getComputedStyle(el);
-                    const isVisible = style.display !== 'none' && 
-                                     style.visibility !== 'hidden' && 
+                    const isVisible = style.display !== 'none' &&
+                                     style.visibility !== 'hidden' &&
                                      rect.width > 0 && rect.height > 0;
-                    
+
                     if (isVisible && rect.top < window.innerHeight && rect.bottom > 0) {
+                        const tag = el.tagName.toLowerCase();
+                        const role = el.getAttribute('role') ||
+                                    (tag === 'a' ? 'link' :
+                                     tag === 'button' ? 'button' :
+                                     tag === 'input' ? (el.type === 'checkbox' ? 'checkbox' :
+                                                        el.type === 'radio' ? 'radio' : 'textbox') :
+                                     tag === 'select' ? 'combobox' :
+                                     tag === 'textarea' ? 'textbox' : tag);
+
+                        const name = el.getAttribute('aria-label') ||
+                                    el.getAttribute('title') ||
+                                    el.getAttribute('placeholder') ||
+                                    el.getAttribute('alt') ||
+                                    (tag === 'input' && el.type === 'submit' ? el.value : null) ||
+                                    (tag === 'label' ? el.textContent?.trim().slice(0, 50) : null) ||
+                                    (tag === 'button' || tag === 'a' ? el.textContent?.trim().slice(0, 50) : null);
+
                         elements.push({
-                            tag: el.tagName.toLowerCase(),
-                            role: el.getAttribute('role') || el.tagName.toLowerCase(),
-                            name: el.getAttribute('aria-label') || 
-                                  el.getAttribute('title') || 
-                                  el.getAttribute('placeholder') ||
-                                  el.textContent?.trim().slice(0, 50) || null,
+                            _index: index,
+                            tag: tag,
+                            role: role,
+                            name: name || null,
+                            text: el.textContent?.trim().slice(0, 100) || null,
                             x: Math.round(rect.x + rect.width / 2),
                             y: Math.round(rect.y + rect.height / 2),
                             width: Math.round(rect.width),
                             height: Math.round(rect.height),
+                            top: Math.round(rect.top),
+                            left: Math.round(rect.left),
                             id: el.id || null,
+                            className: el.className || null,
                             testId: el.getAttribute('data-testid') || null,
+                            value: el.value || null,
+                            disabled: el.disabled || false,
+                            checked: el.checked || null,
+                            type: el.type || null,
+                            href: el.href || null,
                         });
                     }
                 });
-                
+
                 return {
-                    type: 'interactive_elements',
                     url: window.location.href,
                     title: document.title,
                     viewport: { width: window.innerWidth, height: window.innerHeight },
                     elements: elements
                 };
             }''')
-            
-            return tree
-            
+
+            # Assign refs to each element and store mapping
+            elements_with_refs = []
+            for el in raw_elements.get('elements', []):
+                ref = self._generate_ref()
+                el['ref'] = ref
+                # Store in ref map for later lookup
+                self._element_refs[ref] = {
+                    'x': el['x'],
+                    'y': el['y'],
+                    'width': el['width'],
+                    'height': el['height'],
+                    'tag': el['tag'],
+                    'role': el['role'],
+                    'name': el['name'],
+                    'selector': self._build_selector(el),
+                }
+                elements_with_refs.append(el)
+
+            # Build text representation (like Playwright MCP)
+            text_snapshot = self._build_text_snapshot(elements_with_refs)
+
+            return {
+                'type': 'interactive_elements_with_refs',
+                'url': raw_elements.get('url'),
+                'title': raw_elements.get('title'),
+                'viewport': raw_elements.get('viewport'),
+                'elements': elements_with_refs,
+                'text_snapshot': text_snapshot,
+                'ref_count': len(elements_with_refs)
+            }
+
         except Exception as e:
             logger.error(f"❌ DOM tree extraction failed: {e}")
             return {"error": str(e)}
+
+    def _build_selector(self, el: Dict) -> str:
+        """Build a CSS selector for the element"""
+        if el.get('id'):
+            return f"#{el['id']}"
+        if el.get('testId'):
+            return f"[data-testid=\"{el['testId']}\"]"
+        if el.get('tag') and el.get('name'):
+            # Escape quotes in name
+            name = el['name'].replace('"', '\\"')[:30]
+            return f"{el['tag']}:has-text(\"{name}\")"
+        return f"{el.get('tag', 'div')}"
+
+    def _build_text_snapshot(self, elements: List[Dict]) -> str:
+        """Build text representation of the page (like Playwright MCP)"""
+        lines = []
+        for el in elements:
+            ref = el.get('ref', '?')
+            role = el.get('role', el.get('tag', '?'))
+            name = el.get('name') or el.get('text', '')
+            if name:
+                name = name[:40]
+
+            # Format: - role "name" [ref=e1]
+            if name:
+                lines.append(f"- {role} \"{name}\" [ref={ref}]")
+            else:
+                lines.append(f"- {role} [ref={ref}]")
+
+        return "\n".join(lines)
     
     async def get_element_rect(self, req: ElementRectRequest) -> ElementRectResponse:
         if not self.page:
@@ -1039,6 +1166,330 @@ async def do_wait(req: WaitRequest):
         return response
     except Exception as e:
         return ActionResponse(success=False, error=str(e))
+
+# ============================================================================
+# v10.0.0: Playwright MCP-style endpoints
+# ============================================================================
+
+async def _retry_with_backoff(func, max_retries: int = 3, base_delay: float = 0.5):
+    """Execute function with exponential backoff retry"""
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            return await func()
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)
+                logger.warning(f"⚠️ Retry {attempt + 1}/{max_retries} after {delay}s: {e}")
+                await asyncio.sleep(delay)
+    raise last_error
+
+@app.post("/click_by_ref", response_model=ActionResponse)
+async def do_click_by_ref(req: ClickByRefRequest):
+    """Click element by ref ID from accessibility snapshot"""
+    try:
+        session = session_manager.get_session(req.session_id)
+        if not session or not session.is_alive():
+            return ActionResponse(success=False, error="Session not found")
+
+        element = session.get_element_by_ref(req.ref)
+        if not element:
+            return ActionResponse(success=False, error=f"Ref '{req.ref}' not found. Call /browser/dom/tree first to get fresh refs.")
+
+        x, y = element['x'], element['y']
+
+        async def click_action():
+            if req.click_type == "double":
+                await session.page.mouse.dblclick(x, y)
+            elif req.click_type == "triple":
+                await session.page.mouse.click(x, y, click_count=3)
+            elif req.click_type == "right":
+                await session.page.mouse.click(x, y, button="right")
+            else:
+                await session.page.mouse.click(x, y)
+
+        await _retry_with_backoff(click_action)
+
+        logger.info(f"🖱️ Click by ref: {req.ref} → ({x}, {y}) [{req.click_type}]")
+        response = ActionResponse(
+            success=True,
+            executed_with="playwright",
+            details={"ref": req.ref, "x": x, "y": y, "click_type": req.click_type, "element": element}
+        )
+
+        if req.include_screenshot:
+            ss_b64, ss_w, ss_h = await take_auto_screenshot(session, "browser")
+            response.screenshot_base64 = ss_b64
+            response.screenshot_width = ss_w
+            response.screenshot_height = ss_h
+
+        return response
+    except Exception as e:
+        return ActionResponse(success=False, error=str(e))
+
+@app.post("/hover", response_model=ActionResponse)
+async def do_hover(req: HoverRequest):
+    """Hover over element by coordinates, ref, or selector"""
+    try:
+        session = None
+        x, y = req.x, req.y
+
+        if req.scope == "browser":
+            session = session_manager.get_session(req.session_id) if req.session_id else session_manager.get_active_session()
+            if not session or not session.is_alive():
+                return ActionResponse(success=False, error="No active browser session")
+
+            # Resolve coordinates from ref or selector
+            if req.ref:
+                element = session.get_element_by_ref(req.ref)
+                if not element:
+                    return ActionResponse(success=False, error=f"Ref '{req.ref}' not found")
+                x, y = element['x'], element['y']
+            elif req.selector:
+                locator = session.page.locator(req.selector)
+                bbox = await locator.bounding_box()
+                if not bbox:
+                    return ActionResponse(success=False, error=f"Selector '{req.selector}' not found")
+                x, y = int(bbox['x'] + bbox['width']/2), int(bbox['y'] + bbox['height']/2)
+            elif x is None or y is None:
+                return ActionResponse(success=False, error="Provide x/y coordinates, ref, or selector")
+
+            await session.page.mouse.move(x, y)
+            logger.info(f"🎯 Hover: ({x}, {y})")
+            response = ActionResponse(success=True, executed_with="playwright", details={"x": x, "y": y})
+
+        elif req.scope == "desktop" and PYAUTOGUI_AVAILABLE:
+            if x is None or y is None:
+                return ActionResponse(success=False, error="Provide x/y coordinates for desktop")
+            pyautogui.moveTo(x, y)
+            response = ActionResponse(success=True, executed_with="pyautogui", details={"x": x, "y": y})
+        else:
+            return ActionResponse(success=False, error="Invalid scope")
+
+        if req.include_screenshot:
+            ss_b64, ss_w, ss_h = await take_auto_screenshot(session, req.scope)
+            response.screenshot_base64 = ss_b64
+            response.screenshot_width = ss_w
+            response.screenshot_height = ss_h
+
+        return response
+    except Exception as e:
+        return ActionResponse(success=False, error=str(e))
+
+@app.post("/drag", response_model=ActionResponse)
+async def do_drag(req: DragRequest):
+    """Drag from one position to another"""
+    try:
+        session = None
+        start_x, start_y = req.start_x, req.start_y
+        end_x, end_y = req.end_x, req.end_y
+
+        if req.scope == "browser":
+            session = session_manager.get_session(req.session_id) if req.session_id else session_manager.get_active_session()
+            if not session or not session.is_alive():
+                return ActionResponse(success=False, error="No active browser session")
+
+            if req.coordinate_origin == "normalized":
+                start_x, start_y = CoordinateConverter.normalized_to_viewport(start_x, start_y)
+                end_x, end_y = CoordinateConverter.normalized_to_viewport(end_x, end_y)
+
+            # Perform drag
+            await session.page.mouse.move(start_x, start_y)
+            await session.page.mouse.down()
+            await session.page.mouse.move(end_x, end_y, steps=10)  # Smooth drag
+            await session.page.mouse.up()
+
+            logger.info(f"🎯 Drag: ({start_x},{start_y}) → ({end_x},{end_y})")
+            response = ActionResponse(success=True, executed_with="playwright",
+                                      details={"start": {"x": start_x, "y": start_y}, "end": {"x": end_x, "y": end_y}})
+
+        elif req.scope == "desktop" and PYAUTOGUI_AVAILABLE:
+            sw, sh = pyautogui.size()
+            if req.coordinate_origin == "normalized":
+                start_x, start_y = CoordinateConverter.normalized_to_screen(start_x, start_y, sw, sh)
+                end_x, end_y = CoordinateConverter.normalized_to_screen(end_x, end_y, sw, sh)
+            elif req.coordinate_origin == "lux_sdk":
+                start_x, start_y = CoordinateConverter.lux_sdk_to_screen(start_x, start_y, sw, sh)
+                end_x, end_y = CoordinateConverter.lux_sdk_to_screen(end_x, end_y, sw, sh)
+
+            pyautogui.moveTo(start_x, start_y)
+            pyautogui.drag(end_x - start_x, end_y - start_y, duration=0.5)
+            response = ActionResponse(success=True, executed_with="pyautogui",
+                                      details={"start": {"x": start_x, "y": start_y}, "end": {"x": end_x, "y": end_y}})
+        else:
+            return ActionResponse(success=False, error="Invalid scope")
+
+        if req.include_screenshot:
+            ss_b64, ss_w, ss_h = await take_auto_screenshot(session, req.scope)
+            response.screenshot_base64 = ss_b64
+            response.screenshot_width = ss_w
+            response.screenshot_height = ss_h
+
+        return response
+    except Exception as e:
+        return ActionResponse(success=False, error=str(e))
+
+@app.post("/select_option", response_model=ActionResponse)
+async def do_select_option(req: SelectOptionRequest):
+    """Select option from dropdown"""
+    try:
+        session = session_manager.get_session(req.session_id)
+        if not session or not session.is_alive():
+            return ActionResponse(success=False, error="Session not found")
+
+        # Resolve locator
+        locator = None
+        if req.ref:
+            element = session.get_element_by_ref(req.ref)
+            if not element:
+                return ActionResponse(success=False, error=f"Ref '{req.ref}' not found")
+            locator = session.page.locator(element['selector'])
+        elif req.selector:
+            locator = session.page.locator(req.selector)
+        else:
+            return ActionResponse(success=False, error="Provide ref or selector")
+
+        # Select option
+        if req.value is not None:
+            await locator.select_option(value=req.value)
+        elif req.label is not None:
+            await locator.select_option(label=req.label)
+        elif req.index is not None:
+            await locator.select_option(index=req.index)
+        else:
+            return ActionResponse(success=False, error="Provide value, label, or index")
+
+        logger.info(f"📋 Select option: {req.value or req.label or f'index {req.index}'}")
+        response = ActionResponse(success=True, executed_with="playwright",
+                                  details={"value": req.value, "label": req.label, "index": req.index})
+
+        if req.include_screenshot:
+            ss_b64, ss_w, ss_h = await take_auto_screenshot(session, "browser")
+            response.screenshot_base64 = ss_b64
+            response.screenshot_width = ss_w
+            response.screenshot_height = ss_h
+
+        return response
+    except Exception as e:
+        return ActionResponse(success=False, error=str(e))
+
+@app.post("/file_upload", response_model=ActionResponse)
+async def do_file_upload(req: FileUploadRequest):
+    """Upload file to input element"""
+    try:
+        session = session_manager.get_session(req.session_id)
+        if not session or not session.is_alive():
+            return ActionResponse(success=False, error="Session not found")
+
+        # Check file exists
+        file_path = Path(req.file_path)
+        if not file_path.exists():
+            return ActionResponse(success=False, error=f"File not found: {req.file_path}")
+
+        # Resolve locator
+        locator = None
+        if req.ref:
+            element = session.get_element_by_ref(req.ref)
+            if not element:
+                return ActionResponse(success=False, error=f"Ref '{req.ref}' not found")
+            locator = session.page.locator(element['selector'])
+        elif req.selector:
+            locator = session.page.locator(req.selector)
+        else:
+            # Try to find file input
+            locator = session.page.locator('input[type="file"]').first
+
+        await locator.set_input_files(str(file_path))
+
+        logger.info(f"📁 File upload: {file_path.name}")
+        response = ActionResponse(success=True, executed_with="playwright",
+                                  details={"file": str(file_path), "name": file_path.name})
+
+        if req.include_screenshot:
+            ss_b64, ss_w, ss_h = await take_auto_screenshot(session, "browser")
+            response.screenshot_base64 = ss_b64
+            response.screenshot_width = ss_w
+            response.screenshot_height = ss_h
+
+        return response
+    except Exception as e:
+        return ActionResponse(success=False, error=str(e))
+
+@app.post("/wait_for_selector", response_model=ActionResponse)
+async def do_wait_for_selector(req: WaitForSelectorRequest):
+    """Wait for element to appear/disappear (smart waiting)"""
+    try:
+        session = session_manager.get_session(req.session_id)
+        if not session or not session.is_alive():
+            return ActionResponse(success=False, error="Session not found")
+
+        logger.info(f"⏳ Wait for selector: {req.selector} [{req.state}]")
+        await session.page.wait_for_selector(req.selector, state=req.state, timeout=req.timeout)
+
+        response = ActionResponse(success=True, executed_with="playwright",
+                                  details={"selector": req.selector, "state": req.state})
+
+        if req.include_screenshot:
+            ss_b64, ss_w, ss_h = await take_auto_screenshot(session, "browser")
+            response.screenshot_base64 = ss_b64
+            response.screenshot_width = ss_w
+            response.screenshot_height = ss_h
+
+        return response
+    except Exception as e:
+        # Timeout is expected in some cases
+        if "Timeout" in str(e):
+            return ActionResponse(success=False, error=f"Timeout waiting for selector: {req.selector}",
+                                  details={"selector": req.selector, "state": req.state, "timeout_ms": req.timeout})
+        return ActionResponse(success=False, error=str(e))
+
+@app.post("/wait_for_load_state", response_model=ActionResponse)
+async def do_wait_for_load_state(req: WaitForLoadStateRequest):
+    """Wait for page load state (smart waiting)"""
+    try:
+        session = session_manager.get_session(req.session_id)
+        if not session or not session.is_alive():
+            return ActionResponse(success=False, error="Session not found")
+
+        logger.info(f"⏳ Wait for load state: {req.state}")
+        await session.page.wait_for_load_state(req.state, timeout=req.timeout)
+
+        response = ActionResponse(success=True, executed_with="playwright",
+                                  details={"state": req.state})
+
+        if req.include_screenshot:
+            ss_b64, ss_w, ss_h = await take_auto_screenshot(session, "browser")
+            response.screenshot_base64 = ss_b64
+            response.screenshot_width = ss_w
+            response.screenshot_height = ss_h
+
+        return response
+    except Exception as e:
+        return ActionResponse(success=False, error=str(e))
+
+@app.get("/browser/snapshot")
+async def browser_snapshot(session_id: str = Query(...), format: str = Query("text")):
+    """
+    Get page snapshot in text format (Playwright MCP style).
+    Returns a text representation of interactive elements with ref IDs.
+    """
+    session = session_manager.get_session(session_id)
+    if not session or not session.is_alive():
+        return {"success": False, "error": "Session not found"}
+
+    tree = await session.get_accessibility_tree(include_refs=True)
+
+    if format == "text":
+        return {
+            "success": True,
+            "url": tree.get('url'),
+            "title": tree.get('title'),
+            "snapshot": tree.get('text_snapshot', ''),
+            "ref_count": tree.get('ref_count', 0)
+        }
+    else:
+        return {"success": True, **tree}
 
 # Browser endpoints
 @app.post("/browser/start")
