@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
 """
-tool_server.py v8.4.4 - Desktop App "Hands Only" Server + ngrok
-===============================================================
+tool_server.py v8.5.0 - Desktop App "Hands Only" Server + ngrok + Pairing
+=========================================================================
 
-NOVITÀ v8.4.4: FIX DOM TREE
-============================
-Risolto errore "Page object has no attribute 'accessibility'" usando
-JavaScript per estrarre elementi interattivi invece dell'API deprecata.
+NOVITÀ v8.5.0: PAIRING AUTOMATICO
+=================================
+Nuovo sistema di pairing one-time con la Web App:
+- python tool_server.py --pair ABC123
+- Salva config in ~/.tool_server_config.json
+- Aggiorna automaticamente l'URL ngrok ad ogni avvio
 
 CHANGELOG:
 - v8.4.2: Aggiunto /browser/dom/tree endpoint
 - v8.4.3: Integrato ngrok tunnel automatico
 - v8.4.4: Fix accessibility API deprecata → estrazione DOM via JavaScript
+- v8.5.0: Sistema di pairing automatico con Web App
 """
 
+import argparse
 import asyncio
 import base64
 import io
@@ -23,6 +27,7 @@ import os
 import sys
 import time
 import atexit
+import requests
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional, Literal, List, Dict, Tuple
@@ -50,8 +55,15 @@ except ImportError:
 # CONFIGURATION
 # ============================================================================
 
-SERVICE_VERSION = "8.4.4"
+SERVICE_VERSION = "8.5.0"
 SERVICE_PORT = 8766
+
+# ============================================================================
+# PAIRING CONFIGURATION
+# ============================================================================
+
+PAIRING_CONFIG_FILE = Path.home() / ".tool_server_config.json"
+PAIRING_CONFIG = None  # Will be loaded from file
 
 LUX_SDK_WIDTH = 1260
 LUX_SDK_HEIGHT = 700
@@ -142,6 +154,176 @@ def stop_ngrok_tunnel():
             pass
 
 atexit.register(stop_ngrok_tunnel)
+
+# ============================================================================
+# PAIRING FUNCTIONS
+# ============================================================================
+
+def load_pairing_config() -> Optional[Dict]:
+    """Load pairing config from file"""
+    global PAIRING_CONFIG
+    if PAIRING_CONFIG_FILE.exists():
+        try:
+            with open(PAIRING_CONFIG_FILE, 'r') as f:
+                PAIRING_CONFIG = json.load(f)
+                logger.info(f"✅ Loaded pairing config for user: {PAIRING_CONFIG.get('user_id', 'unknown')[:8]}...")
+                return PAIRING_CONFIG
+        except Exception as e:
+            logger.error(f"❌ Failed to load pairing config: {e}")
+    return None
+
+def save_pairing_config(config: Dict):
+    """Save pairing config to file"""
+    global PAIRING_CONFIG
+    try:
+        with open(PAIRING_CONFIG_FILE, 'w') as f:
+            json.dump(config, f, indent=2)
+        PAIRING_CONFIG = config
+        logger.info(f"✅ Saved pairing config to {PAIRING_CONFIG_FILE}")
+    except Exception as e:
+        logger.error(f"❌ Failed to save pairing config: {e}")
+
+def delete_pairing_config():
+    """Delete pairing config file"""
+    global PAIRING_CONFIG
+    if PAIRING_CONFIG_FILE.exists():
+        try:
+            PAIRING_CONFIG_FILE.unlink()
+            PAIRING_CONFIG = None
+            logger.info("✅ Deleted pairing config")
+        except Exception as e:
+            logger.error(f"❌ Failed to delete pairing config: {e}")
+
+def do_pairing(token: str) -> bool:
+    """Perform pairing with the web app using a token"""
+    logger.info(f"🔗 Attempting pairing with token: {token}")
+
+    # Default Supabase URL (hardcoded for this project)
+    # This will be overwritten by the response
+    SUPABASE_URL = "https://vjeafbnkycxfzpxwkifw.supabase.co"
+
+    try:
+        response = requests.post(
+            f"{SUPABASE_URL}/functions/v1/tool-server-pair",
+            json={
+                "action": "validate",
+                "token": token.upper(),
+                "device_name": os.environ.get("COMPUTERNAME", "Desktop"),
+                "ngrok_url": NGROK_PUBLIC_URL
+            },
+            headers={"Content-Type": "application/json"},
+            timeout=30
+        )
+
+        if response.status_code != 200:
+            logger.error(f"❌ Pairing failed: HTTP {response.status_code}")
+            try:
+                error_data = response.json()
+                logger.error(f"   Error: {error_data.get('error', 'Unknown error')}")
+            except:
+                pass
+            return False
+
+        data = response.json()
+
+        if not data.get("success"):
+            logger.error(f"❌ Pairing failed: {data.get('error', 'Unknown error')}")
+            return False
+
+        # Save config
+        config = {
+            "user_id": data["user_id"],
+            "device_secret": data["device_secret"],
+            "supabase_url": data.get("supabase_url", SUPABASE_URL),
+            "function_url": data.get("function_url", f"{SUPABASE_URL}/functions/v1/tool-server-pair"),
+            "paired_at": datetime.now().isoformat()
+        }
+        save_pairing_config(config)
+
+        logger.info("✅ Pairing successful!")
+        logger.info(f"   User ID: {config['user_id'][:8]}...")
+        logger.info(f"   Config saved to: {PAIRING_CONFIG_FILE}")
+
+        return True
+
+    except requests.exceptions.RequestException as e:
+        logger.error(f"❌ Pairing request failed: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"❌ Pairing error: {e}")
+        return False
+
+def update_ngrok_url(ngrok_url: str) -> bool:
+    """Update ngrok URL on the server"""
+    global PAIRING_CONFIG
+
+    if not PAIRING_CONFIG:
+        PAIRING_CONFIG = load_pairing_config()
+
+    if not PAIRING_CONFIG:
+        logger.warning("⚠️ No pairing config found - skipping URL update")
+        return False
+
+    try:
+        response = requests.post(
+            PAIRING_CONFIG["function_url"],
+            json={
+                "action": "update_url",
+                "user_id": PAIRING_CONFIG["user_id"],
+                "device_secret": PAIRING_CONFIG["device_secret"],
+                "ngrok_url": ngrok_url
+            },
+            headers={"Content-Type": "application/json"},
+            timeout=30
+        )
+
+        if response.status_code == 401:
+            logger.error("❌ Pairing revoked or expired. Run with --pair to re-pair.")
+            return False
+
+        if response.status_code != 200:
+            logger.error(f"❌ Failed to update URL: HTTP {response.status_code}")
+            return False
+
+        data = response.json()
+        if data.get("success"):
+            logger.info(f"✅ ngrok URL synced to web app: {ngrok_url}")
+            return True
+        else:
+            logger.error(f"❌ Failed to update URL: {data.get('error', 'Unknown error')}")
+            return False
+
+    except Exception as e:
+        logger.error(f"❌ Failed to update URL: {e}")
+        return False
+
+def parse_args():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(
+        description="Tool Server - Desktop automation server with web app pairing"
+    )
+    parser.add_argument(
+        "--pair",
+        metavar="CODE",
+        help="Pair with web app using a 6-character code"
+    )
+    parser.add_argument(
+        "--unpair",
+        action="store_true",
+        help="Remove pairing configuration"
+    )
+    parser.add_argument(
+        "--no-ngrok",
+        action="store_true",
+        help="Disable ngrok tunnel"
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=SERVICE_PORT,
+        help=f"Port to run on (default: {SERVICE_PORT})"
+    )
+    return parser.parse_args()
 
 # ============================================================================
 # PYDANTIC MODELS
@@ -838,8 +1020,43 @@ async def coordinates_convert(x: int, y: int, from_space: str, to_space: str):
 # ============================================================================
 
 if __name__ == "__main__":
-    ngrok_url = start_ngrok_tunnel(SERVICE_PORT)
-    
+    args = parse_args()
+
+    # Handle --unpair
+    if args.unpair:
+        delete_pairing_config()
+        print("✅ Pairing configuration removed")
+        sys.exit(0)
+
+    # Start ngrok tunnel (unless disabled)
+    ngrok_url = None
+    if not args.no_ngrok:
+        ngrok_url = start_ngrok_tunnel(args.port)
+
+    # Handle --pair
+    if args.pair:
+        if not ngrok_url:
+            print("❌ Cannot pair without ngrok. Remove --no-ngrok flag.")
+            sys.exit(1)
+
+        success = do_pairing(args.pair)
+        if not success:
+            print("\n❌ Pairing failed. Check the token and try again.")
+            sys.exit(1)
+
+        print("\n✅ Pairing successful! Starting server...\n")
+
+    # Load existing pairing config
+    load_pairing_config()
+
+    # Update ngrok URL if paired
+    if ngrok_url and PAIRING_CONFIG:
+        update_ngrok_url(ngrok_url)
+
+    # Determine pairing status for display
+    pairing_status = "PAIRED" if PAIRING_CONFIG else "NOT PAIRED"
+    pairing_user = PAIRING_CONFIG.get("user_id", "")[:8] + "..." if PAIRING_CONFIG else "N/A"
+
     print(f"""
 ╔══════════════════════════════════════════════════════════════╗
 ║      ARCHITECT'S HAND - TOOL SERVER v{SERVICE_VERSION}                ║
@@ -848,8 +1065,10 @@ if __name__ == "__main__":
 ║  🖐️  MODE: HANDS ONLY                                        ║
 ║                                                              ║
 ║  ENDPOINTS:                                                  ║
-║  ├── 🏠 LOCAL:  http://127.0.0.1:{SERVICE_PORT}                       ║
+║  ├── 🏠 LOCAL:  http://127.0.0.1:{args.port}                       ║
 ║  └── 🔒 PUBLIC: {(ngrok_url or 'NOT AVAILABLE'):<42} ║
+║                                                              ║
+║  PAIRING: {pairing_status:<10} User: {pairing_user:<24} ║
 ║                                                              ║
 ║  VIEWPORT: {VIEWPORT_WIDTH}×{VIEWPORT_HEIGHT} (Lux SDK native)                    ║
 ║                                                              ║
@@ -859,8 +1078,14 @@ if __name__ == "__main__":
 ║                                                              ║
 ╚══════════════════════════════════════════════════════════════╝
 """)
-    
-    if ngrok_url:
+
+    if ngrok_url and not PAIRING_CONFIG:
+        print(f"💡 To enable auto-sync, run: python tool_server.py --pair <CODE>")
+        print(f"   Get the code from the web app settings.\n")
+
+    if ngrok_url and PAIRING_CONFIG:
+        print(f"✅ Auto-sync enabled - ngrok URL will be sent to web app automatically\n")
+    elif ngrok_url:
         print(f"📋 Copy this URL for Lovable: {ngrok_url}\n")
-    
-    uvicorn.run(app, host="127.0.0.1", port=SERVICE_PORT, log_level="info")
+
+    uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="info")

@@ -28,6 +28,17 @@ Versioni:
           rimossa intercettazione type_via_clipboard (usa handler SDK nativo)
 - v7.4.0: FILE LOGGING - Ogni esecuzione crea un file .log in execution_logs/
           con tutti i dettagli per debug facile
+- v7.5.0: ENHANCED LOGGING - Sistema isolato per esecuzione (fix race condition),
+          log reasoning di Lux, screenshot per step, report HTML automatico
+- v7.5.1: EDGE PERSISTENT - Tutti i modi usano Edge con profilo persistente unificato
+          (~/.architect-hand-browser) per mantenere i login tra sessioni
+- v7.5.2: FIX SCREENSHOT - Gestisce correttamente PILImage dall'SDK oagi
+- v7.5.3: FOREGROUND - Porta Edge in primo piano dopo apertura (necessario per Lux vision)
+- v7.5.4: FIX FOREGROUND - Usa AttachThreadInput + keybd_event per bypassare
+          restrizioni Windows su SetForegroundWindow, fallback Alt+Tab
+- v7.5.5: FIX WINDOW DETECT - Cerca Edge per processo (msedge.exe) via psutil,
+          non per titolo (che non contiene "edge")
+- v7.5.6: MAXIMIZE - Massimizza Edge a schermo intero dopo averlo portato in primo piano
 """
 
 import asyncio
@@ -53,7 +64,7 @@ from pydantic import BaseModel, Field
 # CONFIGURATION
 # ============================================================================
 
-SERVICE_VERSION = "7.4.0"
+SERVICE_VERSION = "7.5.6"
 SERVICE_PORT = 8765
 
 # ==========================================================================
@@ -79,9 +90,11 @@ LUX_REF_HEIGHT = 700
 VIEWPORT_WIDTH = 1288
 VIEWPORT_HEIGHT = 711
 
-# Profile directories
-GEMINI_PROFILE_DIR = Path.home() / ".gemini-browser-profile"
-HYBRID_PROFILE_DIR = Path.home() / ".hybrid-browser-profile"
+# Profile directories - UNIFIED per sessioni persistenti
+# Tutti i modi usano lo stesso profilo per mantenere i login
+BROWSER_PROFILE_DIR = Path.home() / ".architect-hand-browser"
+GEMINI_PROFILE_DIR = BROWSER_PROFILE_DIR  # Alias per retrocompatibilità
+HYBRID_PROFILE_DIR = BROWSER_PROFILE_DIR  # Alias per retrocompatibilità
 
 # Models (aggiornati da Stagehand repo ufficiale)
 GEMINI_HYBRID_MODEL = "gemini-3-flash-preview"                    # Per Hybrid (DOM + Vision)
@@ -96,41 +109,339 @@ EXECUTION_LOGS_DIR = Path(__file__).parent / "execution_logs"
 EXECUTION_LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
 # ============================================================================
-# LOGGING
+# LOGGING - Sistema Isolato per Esecuzione (v7.5.0)
 # ============================================================================
 
-class TaskLogger:
-    """Logger personalizzato con timestamp, colori e salvataggio su file"""
+class ExecutionContext:
+    """
+    Contesto di esecuzione isolato per ogni task.
+    Risolve race condition: ogni task ha il suo logger/directory.
+    """
 
-    def __init__(self):
+    def __init__(self, mode: str, task_description: str):
+        self.mode = mode
+        self.task_description = task_description
+        self.start_time = datetime.now()
+        self.execution_id = f"{mode}_{self.start_time.strftime('%Y%m%d_%H%M%S%f')}"
+
+        # Directory dedicata per questa esecuzione
+        self.execution_dir = EXECUTION_LOGS_DIR / self.execution_id
+        self.execution_dir.mkdir(parents=True, exist_ok=True)
+
+        # Files
+        self.log_file = self.execution_dir / "execution.log"
+        self.report_file = self.execution_dir / "report.html"
+        self.screenshots_dir = self.execution_dir / "screenshots"
+        self.screenshots_dir.mkdir(exist_ok=True)
+
+        # Data
         self.logs: List[str] = []
-        self.current_log_file: Optional[Path] = None
-        self.execution_id: Optional[str] = None
+        self.steps: List[dict] = []
+        self.current_step = 0
+        self.success = False
+        self.error: Optional[str] = None
 
-    def start_execution(self, mode: str, task_description: str):
-        """Inizia una nuova esecuzione e crea il file di log"""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.execution_id = f"{mode}_{timestamp}"
-        self.current_log_file = EXECUTION_LOGS_DIR / f"{self.execution_id}.log"
-        self.logs = []
+        # Scrivi header
+        self._write_header()
 
-        # Header del log
+    def _write_header(self):
         header = [
             "=" * 80,
             f"EXECUTION LOG - {self.execution_id}",
             "=" * 80,
-            f"Timestamp: {datetime.now().isoformat()}",
-            f"Mode: {mode}",
-            f"Task: {task_description}",
+            f"Start Time: {self.start_time.isoformat()}",
+            f"Mode: {self.mode}",
+            f"Task: {self.task_description}",
+            f"Directory: {self.execution_dir}",
             "=" * 80,
             ""
         ]
-
-        # Scrivi header su file
-        with open(self.current_log_file, 'w', encoding='utf-8') as f:
+        with open(self.log_file, 'w', encoding='utf-8') as f:
             f.write('\n'.join(header))
+        self.log(f"📁 Execution directory: {self.execution_dir}")
 
-        self.log(f"📝 Log file: {self.current_log_file}")
+    def log(self, message: str, level: str = "INFO"):
+        """Log con timestamp - scrive su file E console"""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        formatted = f"[{timestamp}] [{level}] {message}"
+        self.logs.append(formatted)
+        print(formatted)
+
+        try:
+            with open(self.log_file, 'a', encoding='utf-8') as f:
+                f.write(formatted + '\n')
+        except Exception as e:
+            print(f"[WARN] Failed to write log: {e}")
+
+    def start_step(self, step_num: int, max_steps: int):
+        """Inizia un nuovo step"""
+        self.current_step = step_num
+        self.log(f"\n{'='*60}")
+        self.log(f"STEP {step_num}/{max_steps}")
+        self.log(f"{'='*60}")
+
+    def log_reasoning(self, reasoning: str):
+        """Log del reasoning di Lux"""
+        if reasoning:
+            self.log(f"🧠 REASONING: {reasoning}")
+            if self.steps and self.current_step > 0:
+                # Aggiungi reasoning all'ultimo step
+                for step in reversed(self.steps):
+                    if step.get("step") == self.current_step:
+                        step["reasoning"] = reasoning
+                        break
+
+    def log_action(self, action_type: str, argument: str = "", coordinates: tuple = None):
+        """Log di un'azione"""
+        self.log(f"🎯 ACTION: {action_type}")
+        if argument:
+            self.log(f"   Argument: {argument}")
+        if coordinates:
+            self.log(f"   Coordinates: ({coordinates[0]}, {coordinates[1]})")
+
+        # Salva nei steps
+        step_data = {
+            "step": self.current_step,
+            "action_type": action_type,
+            "argument": argument,
+            "coordinates": coordinates,
+            "timestamp": datetime.now().isoformat()
+        }
+        self.steps.append(step_data)
+
+    def save_screenshot(self, screenshot_data, label: str = "") -> Optional[str]:
+        """
+        Salva screenshot per questo step.
+
+        Args:
+            screenshot_data: può essere:
+                - str: base64 encoded PNG
+                - bytes: raw PNG data
+                - PILImage: oggetto PIL Image (dall'SDK oagi)
+            label: etichetta opzionale (es. "before", "after")
+        """
+        try:
+            filename = f"step_{self.current_step:03d}"
+            if label:
+                filename += f"_{label}"
+            filename += ".png"
+
+            filepath = self.screenshots_dir / filename
+
+            # Gestisci diversi tipi di input
+            if isinstance(screenshot_data, str):
+                # Base64 string
+                img_data = base64.b64decode(screenshot_data)
+                with open(filepath, 'wb') as f:
+                    f.write(img_data)
+            elif isinstance(screenshot_data, bytes):
+                # Raw bytes
+                with open(filepath, 'wb') as f:
+                    f.write(screenshot_data)
+            elif hasattr(screenshot_data, 'save'):
+                # PIL Image object (ha metodo save)
+                screenshot_data.save(str(filepath), format='PNG')
+            elif hasattr(screenshot_data, 'image') and hasattr(screenshot_data.image, 'save'):
+                # PILImage wrapper dall'SDK oagi (ha attributo .image che è PIL Image)
+                screenshot_data.image.save(str(filepath), format='PNG')
+            else:
+                # Prova a convertire a bytes
+                self.log(f"⚠️ Tipo screenshot sconosciuto: {type(screenshot_data)}", "WARNING")
+                return None
+
+            self.log(f"📸 Screenshot: {filename}")
+
+            # Aggiungi path allo step corrente
+            for step in reversed(self.steps):
+                if step.get("step") == self.current_step:
+                    step["screenshot"] = str(filepath)
+                    break
+
+            return str(filepath)
+        except Exception as e:
+            self.log(f"⚠️ Screenshot save failed: {e}", "WARNING")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    def finish(self, success: bool, error: Optional[str] = None):
+        """Finalizza esecuzione e genera report"""
+        self.success = success
+        self.error = error
+        end_time = datetime.now()
+        duration = (end_time - self.start_time).total_seconds()
+
+        # Log footer
+        self.log("")
+        self.log("=" * 80)
+        self.log(f"EXECUTION {'COMPLETED' if success else 'FAILED'}")
+        self.log(f"End Time: {end_time.isoformat()}")
+        self.log(f"Duration: {duration:.1f}s")
+        self.log(f"Steps: {len(self.steps)}")
+        if error:
+            self.log(f"Error: {error}")
+        self.log("=" * 80)
+
+        # Genera report HTML
+        self._generate_html_report(duration)
+
+        print(f"\n📄 Log: {self.log_file}")
+        print(f"📊 Report: {self.report_file}\n")
+
+    def _generate_html_report(self, duration: float):
+        """Genera report HTML dettagliato"""
+        html = f"""<!DOCTYPE html>
+<html>
+<head>
+    <title>LUX Report - {self.execution_id}</title>
+    <style>
+        body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif; margin: 20px; background: #f5f5f5; }}
+        .header {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; border-radius: 10px; margin-bottom: 20px; }}
+        .header h1 {{ margin: 0 0 10px 0; }}
+        .header .task {{ font-size: 14px; opacity: 0.9; white-space: pre-wrap; }}
+        .stats {{ display: flex; gap: 20px; margin-top: 15px; }}
+        .stat {{ background: rgba(255,255,255,0.2); padding: 10px 20px; border-radius: 8px; }}
+        .stat-value {{ font-size: 24px; font-weight: bold; }}
+        .stat-label {{ font-size: 12px; opacity: 0.8; }}
+        .step {{ background: white; border-radius: 10px; padding: 20px; margin-bottom: 15px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
+        .step-header {{ display: flex; align-items: center; gap: 10px; margin-bottom: 15px; }}
+        .step-num {{ background: #667eea; color: white; padding: 5px 15px; border-radius: 20px; font-weight: bold; }}
+        .reasoning {{ background: #e8f4f8; padding: 15px; border-radius: 8px; margin: 15px 0; border-left: 4px solid #667eea; }}
+        .reasoning-label {{ font-weight: bold; color: #667eea; margin-bottom: 5px; }}
+        .action {{ background: #f8f9fa; padding: 12px; border-radius: 6px; margin-bottom: 8px; }}
+        .action-type {{ display: inline-block; background: #007bff; color: white; padding: 2px 10px; border-radius: 4px; font-size: 12px; margin-right: 10px; }}
+        .action-type.click {{ background: #007bff; }}
+        .action-type.type {{ background: #28a745; }}
+        .action-type.scroll {{ background: #ffc107; color: black; }}
+        .action-type.wait {{ background: #6c757d; }}
+        .action-type.hotkey {{ background: #17a2b8; }}
+        .action-type.drag {{ background: #fd7e14; }}
+        .action-type.left_double {{ background: #dc3545; }}
+        .screenshot {{ max-width: 100%; border-radius: 8px; margin-top: 10px; box-shadow: 0 2px 8px rgba(0,0,0,0.15); }}
+        .success {{ border-left: 4px solid #28a745; }}
+        .failed {{ border-left: 4px solid #dc3545; }}
+        .status-badge {{ display: inline-block; padding: 5px 15px; border-radius: 20px; font-weight: bold; }}
+        .status-success {{ background: #28a745; color: white; }}
+        .status-failed {{ background: #dc3545; color: white; }}
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🤖 LUX Execution Report</h1>
+        <div class="task">{self.task_description}</div>
+        <div class="stats">
+            <div class="stat">
+                <div class="stat-value">{len(self.steps)}</div>
+                <div class="stat-label">Steps</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value">{duration:.1f}s</div>
+                <div class="stat-label">Duration</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value">
+                    <span class="status-badge {'status-success' if self.success else 'status-failed'}">
+                        {'✓ Success' if self.success else '✗ Failed'}
+                    </span>
+                </div>
+                <div class="stat-label">Status</div>
+            </div>
+        </div>
+    </div>
+"""
+
+        # Raggruppa steps per numero
+        steps_by_num = {}
+        for step in self.steps:
+            num = step.get("step", 0)
+            if num not in steps_by_num:
+                steps_by_num[num] = {"actions": [], "reasoning": None, "screenshot": None}
+            steps_by_num[num]["actions"].append(step)
+            if step.get("reasoning"):
+                steps_by_num[num]["reasoning"] = step["reasoning"]
+            if step.get("screenshot"):
+                steps_by_num[num]["screenshot"] = step["screenshot"]
+
+        # Genera HTML per ogni step
+        for step_num in sorted(steps_by_num.keys()):
+            step_data = steps_by_num[step_num]
+            html += f"""
+    <div class="step {'success' if self.success else ''}">
+        <div class="step-header">
+            <span class="step-num">Step {step_num}</span>
+        </div>
+"""
+            if step_data["reasoning"]:
+                html += f"""
+        <div class="reasoning">
+            <div class="reasoning-label">🧠 LUX Reasoning:</div>
+            {step_data["reasoning"]}
+        </div>
+"""
+
+            html += "        <div><strong>Actions:</strong></div>\n"
+
+            for action in step_data["actions"]:
+                action_type = action.get("action_type", "unknown")
+                argument = action.get("argument", "")
+                coords = action.get("coordinates")
+
+                html += f"""
+        <div class="action">
+            <span class="action-type {action_type.lower()}">{action_type.upper()}</span>
+"""
+                if coords:
+                    html += f"            <span>({coords[0]}, {coords[1]})</span>\n"
+                if argument:
+                    html += f"            <span>{argument[:100]}</span>\n"
+                html += "        </div>\n"
+
+            # Screenshot (usa path relativo)
+            if step_data["screenshot"]:
+                screenshot_path = Path(step_data["screenshot"])
+                relative_path = f"screenshots/{screenshot_path.name}"
+                html += f"""
+        <img class="screenshot" src="{relative_path}" alt="Step {step_num} screenshot">
+"""
+
+            html += "    </div>\n"
+
+        # Footer
+        html += f"""
+    <div class="step">
+        <h3>📋 Execution Summary</h3>
+        <p><strong>Execution ID:</strong> {self.execution_id}</p>
+        <p><strong>Mode:</strong> {self.mode}</p>
+        <p><strong>Duration:</strong> {duration:.1f} seconds</p>
+        <p><strong>Total Steps:</strong> {len(steps_by_num)}</p>
+        <p><strong>Total Actions:</strong> {len(self.steps)}</p>
+        {"<p><strong>Error:</strong> " + self.error + "</p>" if self.error else ""}
+    </div>
+</body>
+</html>
+"""
+
+        with open(self.report_file, 'w', encoding='utf-8') as f:
+            f.write(html)
+
+    def get_logs(self) -> List[str]:
+        return self.logs.copy()
+
+    def get_log_path(self) -> str:
+        return str(self.log_file)
+
+    def get_report_path(self) -> str:
+        return str(self.report_file)
+
+
+class TaskLogger:
+    """
+    Logger globale per messaggi di sistema (startup, dependency checks).
+    Per le esecuzioni task, usa ExecutionContext.
+    """
+
+    def __init__(self):
+        self.logs: List[str] = []
 
     def log(self, message: str, level: str = "INFO"):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
@@ -138,43 +449,14 @@ class TaskLogger:
         self.logs.append(formatted)
         print(formatted)
 
-        # Scrivi anche su file se disponibile
-        if self.current_log_file:
-            try:
-                with open(self.current_log_file, 'a', encoding='utf-8') as f:
-                    f.write(formatted + '\n')
-            except Exception as e:
-                print(f"[WARN] Failed to write to log file: {e}")
-
     def get_logs(self) -> List[str]:
         return self.logs.copy()
 
     def clear(self):
         self.logs = []
 
-    def end_execution(self, success: bool, error: Optional[str] = None):
-        """Chiude l'esecuzione e finalizza il log"""
-        footer = [
-            "",
-            "=" * 80,
-            f"EXECUTION {'COMPLETED' if success else 'FAILED'}",
-            f"End Time: {datetime.now().isoformat()}",
-        ]
-        if error:
-            footer.append(f"Error: {error}")
-        footer.append("=" * 80)
 
-        for line in footer:
-            self.log(line)
-
-        # Log file path per riferimento
-        if self.current_log_file:
-            print(f"\n📄 Full log saved to: {self.current_log_file}\n")
-
-    def get_current_log_path(self) -> Optional[str]:
-        """Ritorna il path del log corrente"""
-        return str(self.current_log_file) if self.current_log_file else None
-
+# Logger globale solo per startup/system messages
 logger = TaskLogger()
 
 # Standard logging per uvicorn
@@ -306,7 +588,8 @@ class TaskResponse(BaseModel):
     mode_used: str = ""
     actions_log: List[dict] = []
     logs: List[str] = []
-    log_file: Optional[str] = None  # Path del file di log completo
+    log_file: Optional[str] = None      # Path del file di log completo
+    report_file: Optional[str] = None   # Path del report HTML (v7.5.0)
 
 
 class StatusResponse(BaseModel):
@@ -355,6 +638,257 @@ class ExecutionHistory:
             "end_time": self.end_time.isoformat() if self.end_time else None,
             "success": getattr(self, 'success', None)
         }
+
+
+# ============================================================================
+# BROWSER: Open Edge with Persistent Profile (for Lux modes)
+# ============================================================================
+
+def bring_edge_to_foreground() -> bool:
+    """
+    Porta la finestra di Edge in primo piano.
+
+    Windows ha restrizioni su SetForegroundWindow - non funziona se il processo
+    chiamante non è in primo piano. Usiamo diversi workaround:
+    1. AttachThreadInput per "rubare" il focus
+    2. Simula Alt key per bypassare le restrizioni
+    3. Fallback con click sulla taskbar
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+
+        # Trova la finestra di Edge cercando per CLASSE della finestra
+        # Edge usa la classe "Chrome_WidgetWin_1" (come Chrome, è basato su Chromium)
+        # Ma possiamo anche cercare per processo
+        edge_hwnd = None
+        edge_windows = []
+
+        def enum_windows_callback(hwnd, lparam):
+            if user32.IsWindowVisible(hwnd):
+                # Ottieni nome della classe
+                class_name = ctypes.create_unicode_buffer(256)
+                user32.GetClassNameW(hwnd, class_name, 256)
+
+                # Ottieni titolo
+                length = user32.GetWindowTextLengthW(hwnd)
+                title = ""
+                if length > 0:
+                    buff = ctypes.create_unicode_buffer(length + 1)
+                    user32.GetWindowTextW(hwnd, buff, length + 1)
+                    title = buff.value
+
+                # Edge usa classe "Chrome_WidgetWin_1" e il processo è msedge.exe
+                # Controlliamo il processo
+                if class_name.value == "Chrome_WidgetWin_1" and title:
+                    # Ottieni PID del processo
+                    pid = wintypes.DWORD()
+                    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+
+                    # Controlla se è Edge verificando il nome del processo
+                    try:
+                        import psutil
+                        proc = psutil.Process(pid.value)
+                        if "msedge" in proc.name().lower():
+                            edge_windows.append((hwnd, title))
+                            logger.log(f"🔍 Trovata finestra Edge: '{title[:50]}...' (hwnd: {hwnd})")
+                    except:
+                        # psutil non disponibile, usa euristica sul titolo
+                        # Edge aggiunge "- Microsoft Edge" o "- Microsoft​ Edge" al titolo
+                        # Ma a volte no! Quindi controlliamo altri pattern
+                        title_lower = title.lower()
+                        # Escludi finestre Chrome esplicite
+                        if "chrome" not in title_lower and "google" not in title_lower:
+                            # Potrebbe essere Edge
+                            edge_windows.append((hwnd, title))
+                            logger.log(f"🔍 Possibile finestra Edge: '{title[:50]}...' (hwnd: {hwnd})")
+            return True
+
+        WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+        user32.EnumWindows(WNDENUMPROC(enum_windows_callback), 0)
+
+        if not edge_windows:
+            logger.log("⚠️ Nessuna finestra Edge trovata", "WARNING")
+            return _click_edge_taskbar()
+
+        # Prendi la prima (più recente)
+        edge_hwnd, edge_title = edge_windows[0]
+        logger.log(f"✅ Selezionata finestra Edge: '{edge_title[:50]}...' (hwnd: {edge_hwnd})")
+
+        # Metodo 1: AttachThreadInput + SetForegroundWindow
+        # Questo "attacca" il nostro thread al thread della finestra foreground
+        foreground_hwnd = user32.GetForegroundWindow()
+        foreground_thread = user32.GetWindowThreadProcessId(foreground_hwnd, None)
+        current_thread = kernel32.GetCurrentThreadId()
+
+        # Attach al thread foreground
+        user32.AttachThreadInput(current_thread, foreground_thread, True)
+
+        try:
+            # Costanti ShowWindow
+            SW_RESTORE = 9
+            SW_MAXIMIZE = 3
+            SW_SHOWMAXIMIZED = 3
+
+            # Prima ripristina se minimizzata
+            user32.ShowWindow(edge_hwnd, SW_RESTORE)
+
+            # Simula pressione Alt per bypassare restrizioni Windows
+            # (Windows permette SetForegroundWindow dopo un input event)
+            VK_MENU = 0x12  # Alt key
+            KEYEVENTF_EXTENDEDKEY = 0x0001
+            KEYEVENTF_KEYUP = 0x0002
+            user32.keybd_event(VK_MENU, 0, KEYEVENTF_EXTENDEDKEY, 0)
+            user32.keybd_event(VK_MENU, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0)
+
+            # Ora SetForegroundWindow dovrebbe funzionare
+            user32.SetForegroundWindow(edge_hwnd)
+            user32.BringWindowToTop(edge_hwnd)
+
+            # MASSIMIZZA la finestra a schermo intero
+            user32.ShowWindow(edge_hwnd, SW_MAXIMIZE)
+            logger.log("📐 Finestra Edge massimizzata")
+
+            # Imposta focus
+            user32.SetFocus(edge_hwnd)
+
+        finally:
+            # Detach dal thread
+            user32.AttachThreadInput(current_thread, foreground_thread, False)
+
+        # Verifica se ha funzionato
+        time.sleep(0.3)
+        new_foreground = user32.GetForegroundWindow()
+
+        if new_foreground == edge_hwnd:
+            logger.log(f"✅ Edge in primo piano e massimizzato")
+            return True
+        else:
+            logger.log("⚠️ SetForegroundWindow non ha funzionato, provo click taskbar", "WARNING")
+            # Fallback: click sulla taskbar
+            return _click_edge_taskbar()
+
+    except Exception as e:
+        logger.log(f"⚠️ Errore bring_edge_to_foreground: {e}", "WARNING")
+        import traceback
+        traceback.print_exc()
+        return _click_edge_taskbar()
+
+
+def _click_edge_taskbar() -> bool:
+    """
+    Fallback: trova e clicca sull'icona Edge nella taskbar.
+    """
+    try:
+        if not PYAUTOGUI_AVAILABLE:
+            return False
+
+        logger.log("🖱️ Tentativo click su taskbar Edge...")
+
+        # La taskbar è tipicamente in basso, cerca l'icona Edge
+        # Ottieni dimensioni schermo
+        screen_width, screen_height = pyautogui.size()
+
+        # La taskbar è alta circa 40-48 pixel in basso
+        taskbar_y = screen_height - 24  # Centro della taskbar
+
+        # Cerca l'icona Edge nella taskbar usando pyautogui.locateOnScreen
+        # Ma questo richiede un'immagine di riferimento, quindi usiamo un approccio diverso:
+        # Prova Win+1, Win+2, etc. per attivare le app nella taskbar
+
+        # Metodo più semplice: usa Alt+Tab ripetutamente per trovare Edge
+        # O meglio: usa Win+Tab e poi click
+
+        # Prova con pyautogui.hotkey per simulare Win+numero
+        # Prima proviamo Alt+Tab
+        pyautogui.keyDown('alt')
+        time.sleep(0.1)
+        pyautogui.press('tab')
+        time.sleep(0.3)
+
+        # Cerca "Edge" nel task switcher (potrebbe non funzionare sempre)
+        # Rilascia Alt per selezionare
+        pyautogui.keyUp('alt')
+
+        logger.log("🔄 Usato Alt+Tab")
+        return True
+
+    except Exception as e:
+        logger.log(f"⚠️ Click taskbar fallito: {e}", "WARNING")
+        return False
+
+
+async def open_edge_persistent(url: Optional[str] = None, wait_seconds: float = 3.0) -> bool:
+    """
+    Apre Microsoft Edge con profilo persistente per Lux modes.
+
+    - Usa lo stesso profilo di Gemini modes per mantenere i login
+    - Se url è fornito, naviga a quell'URL
+    - Porta Edge in primo piano per Lux
+    - Aspetta che il browser sia pronto prima di ritornare
+
+    Returns: True se browser aperto con successo
+    """
+    BROWSER_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Trova il path di Edge
+    edge_paths = [
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    ]
+
+    edge_exe = None
+    for path in edge_paths:
+        if Path(path).exists():
+            edge_exe = path
+            break
+
+    if not edge_exe:
+        logger.log("⚠️ Microsoft Edge non trovato", "WARNING")
+        return False
+
+    # Costruisci comando
+    cmd = [
+        edge_exe,
+        f"--user-data-dir={BROWSER_PROFILE_DIR}",
+        "--no-first-run",
+        "--disable-features=msEdgeEnhancedSecurityMode",
+        "--start-maximized",
+    ]
+
+    if url:
+        cmd.append(url)
+
+    try:
+        logger.log(f"🌐 Apertura Edge con profilo persistente: {BROWSER_PROFILE_DIR}")
+        if url:
+            logger.log(f"📍 URL: {url}")
+
+        # Avvia Edge
+        subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+        # Aspetta che il browser si apra
+        await asyncio.sleep(wait_seconds)
+
+        # Porta Edge in primo piano
+        bring_edge_to_foreground()
+
+        # Aspetta un attimo per il focus
+        await asyncio.sleep(0.5)
+
+        logger.log("✅ Edge aperto e in primo piano")
+        return True
+
+    except Exception as e:
+        logger.log(f"❌ Errore apertura Edge: {e}", "ERROR")
+        return False
 
 
 # ============================================================================
@@ -433,47 +967,59 @@ def type_via_clipboard(text: str):
 async def execute_with_actor(request: TaskRequest) -> TaskResponse:
     """
     Esegue task usando AsyncActor (per mode actor/thinker).
-    
+
     - actor: usa lux-actor-1 (veloce, meno ragionamento)
     - thinker: usa lux-thinker-1 (più lento, più ragionamento)
+
+    v7.5.0: Usa ExecutionContext per logging isolato con:
+    - Screenshot salvati per ogni step
+    - Reasoning di Lux catturato
+    - Report HTML automatico
+
+    v7.5.1: Apre automaticamente Edge con profilo persistente se start_url è fornito
     """
-    logger.clear()
-    logger.log("=" * 60)
-    logger.log(f"LUX {request.mode.upper()} MODE - v{SERVICE_VERSION}")
-    logger.log("=" * 60)
-    logger.log(f"Task: {request.task_description[:80]}...")
-    
+    # Crea contesto isolato per questa esecuzione
+    ctx = ExecutionContext(request.mode, request.task_description)
+
     if not ASYNC_ACTOR_AVAILABLE:
+        ctx.finish(False, "AsyncActor non disponibile. Installa: pip install openagi")
         return TaskResponse(
             success=False,
             error="AsyncActor non disponibile. Installa: pip install openagi",
-            mode_used=request.mode
+            mode_used=request.mode,
+            log_file=ctx.get_log_path()
         )
-    
+
+    # Se c'è un start_url, apri Edge con profilo persistente
+    if request.start_url:
+        ctx.log(f"🌐 Apertura Edge per URL: {request.start_url}")
+        browser_opened = await open_edge_persistent(request.start_url, wait_seconds=3.0)
+        if not browser_opened:
+            ctx.log("⚠️ Impossibile aprire Edge, Lux procederà comunque", "WARNING")
+
     # Seleziona modello
-    if request.mode == "thinker":
-        model = "lux-thinker-1"
-    else:
-        model = "lux-actor-1"
-    
-    logger.log(f"Model: {model}")
-    logger.log(f"Max steps: {request.max_steps}")
-    
+    model = "lux-thinker-1" if request.mode == "thinker" else "lux-actor-1"
+
+    ctx.log(f"LUX {request.mode.upper()} MODE - v{SERVICE_VERSION}")
+    ctx.log(f"Model: {model}")
+    ctx.log(f"Max steps: {request.max_steps}")
+
     # Screen info
     if PYAUTOGUI_AVAILABLE:
         screen_width, screen_height = pyautogui.size()
-        logger.log(f"Screen reale: {screen_width}x{screen_height}")
-        logger.log(f"Lux reference: {LUX_REF_WIDTH}x{LUX_REF_HEIGHT} (ufficiale)")
-        logger.log(f"Scale factor: {screen_width/LUX_REF_WIDTH:.2f}x, {screen_height/LUX_REF_HEIGHT:.2f}y")
-    
-    history = ExecutionHistory(request.task_description)
-    
+        ctx.log(f"Screen reale: {screen_width}x{screen_height}")
+        ctx.log(f"Lux reference: {LUX_REF_WIDTH}x{LUX_REF_HEIGHT} (ufficiale)")
+        ctx.log(f"Scale factor: {screen_width/LUX_REF_WIDTH:.2f}x, {screen_height/LUX_REF_HEIGHT:.2f}y")
+
+    step_count = 0
+    done = False
+
     try:
         # API key
         api_key = request.api_key or os.getenv("OAGI_API_KEY")
         if not api_key:
             raise ValueError("OAGI_API_KEY non configurata")
-        
+
         # Crea handlers
         pyautogui_config = PyautoguiConfig(
             drag_duration=request.drag_duration,
@@ -481,98 +1027,119 @@ async def execute_with_actor(request: TaskRequest) -> TaskResponse:
             wait_duration=request.wait_duration,
             action_pause=request.action_pause
         )
-        
+
         if request.enable_screenshot_resize:
-            # Usa ImageConfig ufficiale dell'SDK per resize a 1260x700
             image_config = ImageConfig(
                 format="JPEG",
                 quality=85,
-                width=LUX_REF_WIDTH,   # 1260
-                height=LUX_REF_HEIGHT  # 700
+                width=LUX_REF_WIDTH,
+                height=LUX_REF_HEIGHT
             )
             image_provider = AsyncScreenshotMaker(config=image_config)
-            logger.log(f"📸 Screenshot resize: {LUX_REF_WIDTH}x{LUX_REF_HEIGHT} (SDK ufficiale)")
+            ctx.log(f"📸 Screenshot resize: {LUX_REF_WIDTH}x{LUX_REF_HEIGHT} (SDK ufficiale)")
         else:
             image_provider = AsyncScreenshotMaker()
-            logger.log("📸 Screenshot: risoluzione nativa (⚠️ potrebbe causare imprecisione)")
-        
-        action_handler = AsyncPyautoguiActionHandler(config=pyautogui_config)
-        logger.log("🎮 Action handler: PyAutoGUI")
+            ctx.log("📸 Screenshot: risoluzione nativa (⚠️ potrebbe causare imprecisione)")
 
-        # Reset handler state a inizio automazione (best practice SDK)
+        action_handler = AsyncPyautoguiActionHandler(config=pyautogui_config)
+        ctx.log("🎮 Action handler: PyAutoGUI")
+
+        # Reset handler state
         if RESET_HANDLER_AVAILABLE:
             reset_handler(action_handler)
-            logger.log("🔄 Handler state reset")
+            ctx.log("🔄 Handler state reset")
 
-        # Execution loop con AsyncActor come context manager (API ufficiale)
-        step_count = 0
-        done = False
-
+        # Execution loop
         async with AsyncActor(api_key=api_key, model=model) as actor:
-            # Inizializza task (deve essere awaited)
             await actor.init_task(
                 task_desc=request.task_description,
                 max_steps=request.max_steps
             )
-            
+
             while not done and step_count < request.max_steps:
                 step_count += 1
-                logger.log(f"\n--- Step {step_count}/{request.max_steps} ---")
-                
+                ctx.start_step(step_count, request.max_steps)
+
                 # Cattura screenshot
                 screenshot_b64 = await image_provider()
-                
-                # Chiedi azione a Lux (metodo step(), non act())
+
+                # Salva screenshot PRIMA dell'azione
+                ctx.save_screenshot(screenshot_b64, "before")
+
+                # Chiedi azione a Lux
                 step_result = await actor.step(screenshot_b64)
-                
+
+                # Log reasoning (se disponibile)
+                if hasattr(step_result, 'reasoning') and step_result.reasoning:
+                    ctx.log_reasoning(step_result.reasoning)
+                elif hasattr(step_result, 'thought') and step_result.thought:
+                    ctx.log_reasoning(step_result.thought)
+
                 # Controlla se task completato
                 if step_result.stop:
-                    logger.log("✅ Task completato!")
+                    ctx.log("✅ Task completato!")
                     done = True
                     break
-                
-                # Esegui azioni tramite SDK (usa handler ufficiale con _windows.typewrite_exact)
+
+                # Esegui azioni
                 for action in step_result.actions:
                     action_type = str(action.type.value) if hasattr(action.type, "value") else str(action.type)
                     argument = str(action.argument) if hasattr(action, "argument") else ""
 
-                    logger.log(f"🎯 Action: {action_type}")
-                    if argument:
-                        logger.log(f"   Argument: {argument[:50]}...")
+                    # Estrai coordinate se presenti
+                    coordinates = None
+                    if hasattr(action, 'x') and hasattr(action, 'y'):
+                        coordinates = (action.x, action.y)
+                    elif hasattr(action, 'coordinate') and action.coordinate:
+                        coordinates = (action.coordinate.x, action.coordinate.y)
 
-                    # Esegui via SDK handler (gestisce TYPE internamente con typewrite_exact)
+                    ctx.log_action(action_type, argument, coordinates)
+
+                    # Esegui via SDK handler
                     await action_handler([action])
-                    history.add_step(step_count, action_type, {"argument": argument[:100] if argument else ""})
 
-                    # Delay tra azioni (da SDK: DEFAULT_STEP_DELAY = 0.3)
+                    # Delay tra azioni
                     await asyncio.sleep(request.step_delay)
-        
-        history.finish(done)
 
-        # Reset handler state a fine automazione (best practice SDK)
+                # Salva screenshot DOPO le azioni
+                screenshot_after = await image_provider()
+                ctx.save_screenshot(screenshot_after, "after")
+
+        # Reset handler state a fine
         if RESET_HANDLER_AVAILABLE:
             reset_handler(action_handler)
-            logger.log("🔄 Handler state reset (fine)")
+            ctx.log("🔄 Handler state reset (fine)")
+
+        # Finalizza e genera report
+        ctx.finish(done)
 
         return TaskResponse(
             success=done,
             message="Task completato" if done else f"Max steps ({request.max_steps}) raggiunto",
             steps_executed=step_count,
             mode_used=request.mode,
-            actions_log=history.steps,
-            logs=logger.get_logs()
+            actions_log=ctx.steps,
+            logs=ctx.get_logs(),
+            log_file=ctx.get_log_path(),
+            report_file=ctx.get_report_path()
         )
 
     except Exception as e:
-        logger.log(f"❌ Errore: {e}", "ERROR")
+        ctx.log(f"❌ Errore: {e}", "ERROR")
         import traceback
         traceback.print_exc()
+
+        # Finalizza anche in caso di errore
+        ctx.finish(False, str(e))
 
         return TaskResponse(
             success=False,
             error=str(e),
+            steps_executed=step_count,
             mode_used=request.mode,
-            logs=logger.get_logs()
+            logs=ctx.get_logs(),
+            log_file=ctx.get_log_path(),
+            report_file=ctx.get_report_path()
         )
 
 
@@ -583,49 +1150,62 @@ async def execute_with_actor(request: TaskRequest) -> TaskResponse:
 async def execute_with_tasker(request: TaskRequest) -> TaskResponse:
     """
     Esegue task usando TaskerAgent con lista di todos.
-    
+
     Ogni todo viene eseguito in sequenza con max_steps_per_todo step.
     Il TaskerAgent traccia quali todos sono completati.
+
+    v7.5.0: Usa ExecutionContext per logging isolato.
+    v7.5.1: Apre automaticamente Edge con profilo persistente se start_url è fornito.
     """
-    logger.clear()
-    logger.log("=" * 60)
-    logger.log(f"LUX TASKER MODE - v{SERVICE_VERSION}")
-    logger.log("=" * 60)
-    
+    todos = request.todos or []
+
+    # Crea contesto isolato per questa esecuzione
+    ctx = ExecutionContext("tasker", request.task_description)
+
+    # Se c'è un start_url, apri Edge con profilo persistente
+    if request.start_url:
+        ctx.log(f"🌐 Apertura Edge per URL: {request.start_url}")
+        browser_opened = await open_edge_persistent(request.start_url, wait_seconds=3.0)
+        if not browser_opened:
+            ctx.log("⚠️ Impossibile aprire Edge, Lux procederà comunque", "WARNING")
+
     if not TASKER_AGENT_AVAILABLE:
+        ctx.finish(False, "TaskerAgent non disponibile. Installa: pip install openagi")
         return TaskResponse(
             success=False,
             error="TaskerAgent non disponibile. Installa: pip install openagi",
-            mode_used="tasker"
+            mode_used="tasker",
+            log_file=ctx.get_log_path(),
+            report_file=ctx.get_report_path()
         )
-    
-    todos = request.todos or []
+
     if not todos:
+        ctx.finish(False, "Tasker mode richiede una lista di todos")
         return TaskResponse(
             success=False,
             error="Tasker mode richiede una lista di todos",
-            mode_used="tasker"
+            mode_used="tasker",
+            log_file=ctx.get_log_path(),
+            report_file=ctx.get_report_path()
         )
-    
-    logger.log(f"Task: {request.task_description[:80]}...")
-    logger.log(f"Todos: {len(todos)}")
+
+    ctx.log(f"LUX TASKER MODE - v{SERVICE_VERSION}")
+    ctx.log(f"Todos: {len(todos)}")
     for i, todo in enumerate(todos):
-        logger.log(f"  [{i+1}] {todo[:60]}...")
-    
+        ctx.log(f"  [{i+1}] {todo[:60]}...")
+
     # Screen info
     if PYAUTOGUI_AVAILABLE:
         screen_width, screen_height = pyautogui.size()
-        logger.log(f"Screen reale: {screen_width}x{screen_height}")
-        logger.log(f"Lux reference: {LUX_REF_WIDTH}x{LUX_REF_HEIGHT} (ufficiale)")
-    
-    history = ExecutionHistory(request.task_description, todos)
-    
+        ctx.log(f"Screen reale: {screen_width}x{screen_height}")
+        ctx.log(f"Lux reference: {LUX_REF_WIDTH}x{LUX_REF_HEIGHT} (ufficiale)")
+
     try:
         # API key
         api_key = request.api_key or os.getenv("OAGI_API_KEY")
         if not api_key:
             raise ValueError("OAGI_API_KEY non configurata")
-        
+
         # Crea PyAutoGUI config
         pyautogui_config = PyautoguiConfig(
             drag_duration=request.drag_duration,
@@ -633,13 +1213,13 @@ async def execute_with_tasker(request: TaskRequest) -> TaskResponse:
             wait_duration=request.wait_duration,
             action_pause=request.action_pause
         )
-        
+
         # Crea observer (opzionale)
         observer = None
         if ASYNC_AGENT_OBSERVER_AVAILABLE:
             observer = AsyncAgentObserver()
-            logger.log("📊 Observer abilitato")
-        
+            ctx.log("📊 Observer abilitato")
+
         # Crea image provider
         if request.enable_screenshot_resize:
             # Usa ImageConfig ufficiale dell'SDK per resize a 1260x700
@@ -650,19 +1230,19 @@ async def execute_with_tasker(request: TaskRequest) -> TaskResponse:
                 height=LUX_REF_HEIGHT  # 700
             )
             image_provider = AsyncScreenshotMaker(config=image_config)
-            logger.log(f"📸 Screenshot resize: {LUX_REF_WIDTH}x{LUX_REF_HEIGHT} (SDK ufficiale)")
+            ctx.log(f"📸 Screenshot resize: {LUX_REF_WIDTH}x{LUX_REF_HEIGHT} (SDK ufficiale)")
         else:
             image_provider = AsyncScreenshotMaker()
-            logger.log("📸 Screenshot: risoluzione nativa (⚠️ potrebbe causare imprecisione)")
-        
+            ctx.log("📸 Screenshot: risoluzione nativa (⚠️ potrebbe causare imprecisione)")
+
         # Crea action handler
         action_handler = AsyncPyautoguiActionHandler(config=pyautogui_config)
-        logger.log("🎮 Action handler: PyAutoGUI")
+        ctx.log("🎮 Action handler: PyAutoGUI")
 
         # Reset handler state a inizio automazione (best practice SDK)
         if RESET_HANDLER_AVAILABLE:
             reset_handler(action_handler)
-            logger.log("🔄 Handler state reset")
+            ctx.log("🔄 Handler state reset")
 
         # Crea TaskerAgent con parametri da SDK (constants.py)
         tasker_kwargs = {
@@ -677,38 +1257,38 @@ async def execute_with_tasker(request: TaskRequest) -> TaskResponse:
         if observer:
             tasker_kwargs["step_observer"] = observer
 
-        logger.log(f"Creating TaskerAgent:")
-        logger.log(f"  model: lux-actor-1")
-        logger.log(f"  max_steps_per_todo: {request.max_steps_per_todo}")
-        logger.log(f"  temperature: {request.temperature}")
-        logger.log(f"  reflection_interval: 20")
+        ctx.log(f"Creating TaskerAgent:")
+        ctx.log(f"  model: lux-actor-1")
+        ctx.log(f"  max_steps_per_todo: {request.max_steps_per_todo}")
+        ctx.log(f"  temperature: {request.temperature}")
+        ctx.log(f"  reflection_interval: 20")
 
         tasker = TaskerAgent(**tasker_kwargs)
-        
+
         # Set task e todos
         tasker.set_task(
             task=request.task_description,
             todos=todos
         )
-        
-        logger.log("🚀 Avvio esecuzione TaskerAgent...")
-        
+
+        ctx.log("🚀 Avvio esecuzione TaskerAgent...")
+
         # Esegui
         success = await tasker.execute(
             instruction="",  # Task già impostato via set_task
             action_handler=action_handler,
             image_provider=image_provider
         )
-        
+
         # Ottieni risultati da memory
         completed_todos = 0
         todo_statuses = []
-        
+
         try:
             memory = tasker.get_memory()
             if memory:
-                logger.log(f"📋 Summary: {memory.task_execution_summary}")
-                
+                ctx.log(f"📋 Summary: {memory.task_execution_summary}")
+
                 for i, todo_mem in enumerate(memory.todos):
                     status = todo_mem.status.value if hasattr(todo_mem.status, 'value') else str(todo_mem.status)
                     todo_statuses.append({
@@ -718,28 +1298,27 @@ async def execute_with_tasker(request: TaskRequest) -> TaskResponse:
                     })
                     if status == "completed":
                         completed_todos += 1
-                    logger.log(f"  [{i+1}] {status}: {todo_mem.description[:50]}...")
+                    ctx.log(f"  [{i+1}] {status}: {todo_mem.description[:50]}...")
         except Exception as mem_err:
-            logger.log(f"⚠️ Memory non disponibile: {mem_err}", "WARNING")
+            ctx.log(f"⚠️ Memory non disponibile: {mem_err}", "WARNING")
             completed_todos = len(todos) if success else 0
-        
-        # Esporta report observer
+
+        # Esporta report observer (oltre al nostro report HTML)
         if observer:
             try:
-                report_dir = ANALYSIS_DIR / f"tasker_{int(time.time())}"
-                report_dir.mkdir(parents=True, exist_ok=True)
-                observer_file = report_dir / "observer_history.html"
+                observer_file = ctx.execution_dir / "observer_history.html"
                 observer.export("html", str(observer_file))
-                logger.log(f"📊 Report: {observer_file}")
+                ctx.log(f"📊 Observer report: {observer_file}")
             except Exception as obs_err:
-                logger.log(f"⚠️ Export observer fallito: {obs_err}", "WARNING")
-        
-        history.finish(success)
+                ctx.log(f"⚠️ Export observer fallito: {obs_err}", "WARNING")
 
         # Reset handler state a fine automazione (best practice SDK)
         if RESET_HANDLER_AVAILABLE:
             reset_handler(action_handler)
-            logger.log("🔄 Handler state reset (fine)")
+            ctx.log("🔄 Handler state reset (fine)")
+
+        # Finalizza e genera report
+        ctx.finish(success)
 
         return TaskResponse(
             success=success,
@@ -749,20 +1328,27 @@ async def execute_with_tasker(request: TaskRequest) -> TaskResponse:
             total_todos=len(todos),
             mode_used="tasker",
             actions_log=todo_statuses,
-            logs=logger.get_logs()
+            logs=ctx.get_logs(),
+            log_file=ctx.get_log_path(),
+            report_file=ctx.get_report_path()
         )
 
     except Exception as e:
-        logger.log(f"❌ Errore: {e}", "ERROR")
+        ctx.log(f"❌ Errore: {e}", "ERROR")
         import traceback
         traceback.print_exc()
+
+        # Finalizza anche in caso di errore
+        ctx.finish(False, str(e))
 
         return TaskResponse(
             success=False,
             error=str(e),
             total_todos=len(todos),
             mode_used="tasker",
-            logs=logger.get_logs()
+            logs=ctx.get_logs(),
+            log_file=ctx.get_log_path(),
+            report_file=ctx.get_report_path()
         )
 
 
@@ -1657,34 +2243,28 @@ async def get_status():
 
 @app.post("/execute", response_model=TaskResponse)
 async def execute_task(request: TaskRequest):
-    """Esegue un task"""
+    """
+    Esegue un task.
+
+    v7.5.0: Ogni modo crea il proprio ExecutionContext isolato.
+    Non c'è più un logger globale per le esecuzioni - ogni modo
+    gestisce il proprio logging internamente.
+    """
     global is_running
 
-    # Inizia logging su file
-    logger.start_execution(request.mode, request.task_description)
-
-    # Debug: log full request
-    logger.log("=" * 60)
-    logger.log(f"[REQUEST] mode: {request.mode}")
-    logger.log(f"[REQUEST] task: {request.task_description}")
-    logger.log(f"[REQUEST] api_key: {'***' + request.api_key[-4:] if request.api_key else 'None'}")
-    logger.log(f"[REQUEST] gemini_api_key: {'***' + request.gemini_api_key[-4:] if request.gemini_api_key else 'None'}")
-    logger.log(f"[REQUEST] max_steps: {request.max_steps}")
-    logger.log(f"[REQUEST] max_steps_per_todo: {request.max_steps_per_todo}")
-    logger.log(f"[REQUEST] temperature: {request.temperature}")
-    logger.log(f"[REQUEST] todos: {request.todos}")
-    logger.log("=" * 60)
+    # Log request info (sistema, non esecuzione)
+    logger.log(f"[REQUEST] mode={request.mode} task={request.task_description[:50]}...")
 
     if is_running:
-        logger.end_execution(False, "Un task è già in esecuzione")
+        logger.log("[REJECTED] Un task è già in esecuzione", "WARNING")
         raise HTTPException(status_code=409, detail="Un task è già in esecuzione")
-    
+
     is_running = True
-    
+
     try:
         result = None
 
-        # Lux modes
+        # Lux modes (usano ExecutionContext per logging isolato)
         if request.mode in ["actor", "thinker"]:
             result = await execute_with_actor(request)
 
@@ -1697,18 +2277,18 @@ async def execute_task(request: TaskRequest):
 
         elif request.mode in ["gemini", "gemini_hybrid"]:
             global global_hybrid_executor
-            
+
             # 'gemini' è alias per 'gemini_hybrid' (retrocompatibilità)
             # Usa api_key come fallback per gemini_api_key (il client passa api_key)
             gemini_key = request.gemini_api_key or request.api_key
-            
+
             # Rileva comportamento browser dalla descrizione del task
             behavior = detect_browser_behavior(request.task_description)
-            
+
             # I parametri espliciti nella request hanno priorità
             new_tab = request.new_tab or behavior["new_tab"]
             close_current = behavior["close_current"]
-            
+
             # Debug: log what we received
             logger.log(f"[DEBUG] mode: {request.mode}")
             logger.log(f"[DEBUG] gemini_api_key presente: {bool(request.gemini_api_key)}")
@@ -1717,23 +2297,23 @@ async def execute_task(request: TaskRequest):
             logger.log(f"[DEBUG] reuse_browser: {request.reuse_browser}")
             logger.log(f"[DEBUG] new_tab (rilevato): {new_tab}")
             logger.log(f"[DEBUG] close_current (rilevato): {close_current}")
-            
+
             # Usa max_steps_per_todo come fallback per max_steps (il client passa max_steps_per_todo)
             max_steps = request.max_steps if request.max_steps != 30 else request.max_steps_per_todo
-            
+
             if not gemini_key:
                 return TaskResponse(
                     success=False,
                     error="Gemini API key non configurata. Verifica che sia salvata nelle impostazioni della app.",
                     mode_used="gemini_hybrid"
                 )
-            
+
             # Se richiesto di chiudere il browser corrente
             if close_current and global_hybrid_executor and global_hybrid_executor.is_browser_open():
                 logger.log("🚫 Chiusura browser esistente come richiesto")
                 await global_hybrid_executor.close_browser()
                 global_hybrid_executor = None
-            
+
             # Logica per riuso browser
             if request.reuse_browser and global_hybrid_executor and global_hybrid_executor.is_browser_open():
                 # Riusa l'executor esistente (browser già aperto)
@@ -1744,7 +2324,7 @@ async def execute_task(request: TaskRequest):
                 logger.log("🆕 Creazione nuovo executor")
                 executor = HybridModeExecutor(headless=request.headless, api_key=gemini_key)
                 global_hybrid_executor = executor
-            
+
             result = await executor.run(
                 request.task_description,
                 request.start_url,
@@ -1753,20 +2333,12 @@ async def execute_task(request: TaskRequest):
             )
 
         else:
-            logger.end_execution(False, f"Mode sconosciuto: {request.mode}")
             raise HTTPException(status_code=400, detail=f"Mode sconosciuto: {request.mode}")
-
-        # Finalizza log con risultato
-        if result:
-            logger.end_execution(result.success, result.error)
-            # Aggiungi path del log alla risposta
-            result.log_file = logger.get_current_log_path()
 
         return result
 
     except Exception as e:
         logger.log(f"❌ EXCEPTION: {str(e)}", "ERROR")
-        logger.end_execution(False, str(e))
         raise
 
     finally:
