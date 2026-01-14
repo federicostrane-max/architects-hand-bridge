@@ -505,6 +505,10 @@ class ElementRectResponse(BaseModel):
     text: Optional[str] = None
     element_count: Optional[int] = None
     selector_used: Optional[str] = None
+    # v10.0.0: Coordinate system info for consistency with vision tools
+    coordinate_system: str = "viewport"  # Always viewport (1260×700)
+    source: str = "dom_element_rect"
+    viewport: Dict[str, int] = {"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT}
 
 # ============================================================================
 # COORDINATE CONVERTER
