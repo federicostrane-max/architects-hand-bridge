@@ -23,6 +23,7 @@ CHANGELOG:
 - v9.0.0: Claude Computer Use compatibility (hold_key, wait, triple_click, auto-screenshot)
 - v10.0.0: Playwright MCP compatibility (ref system, smart waiting, file upload, drag, hover)
 - v10.1.0: Auto-snapshot DOM after actions (include_snapshot parameter for agent awareness)
+- v10.2.0: Playwright MCP alignment - snapshot ALWAYS included for browser actions, semantic attributes [active] [checked] [disabled] etc.
 """
 
 import argparse
@@ -63,7 +64,7 @@ except ImportError:
 # CONFIGURATION
 # ============================================================================
 
-SERVICE_VERSION = "10.1.0"  # Auto-snapshot DOM after actions
+SERVICE_VERSION = "10.2.0"  # Always snapshot for browser actions (Playwright MCP style)
 SERVICE_PORT = 8766
 
 # ============================================================================
@@ -708,8 +709,11 @@ class BrowserSession:
             except (AttributeError, Exception):
                 pass
 
-            # Fallback: Extract interactive elements via JavaScript
+            # Fallback: Extract interactive elements via JavaScript (Playwright MCP style)
             raw_elements = await self.page.evaluate('''() => {
+                // Get active element for [active] attribute
+                const activeElement = document.activeElement;
+
                 // Get all interactive elements
                 const interactive = document.querySelectorAll(
                     'a, button, input, select, textarea, ' +
@@ -717,7 +721,7 @@ class BrowserSession:
                     '[role="tab"], [role="checkbox"], [role="radio"], [role="switch"], ' +
                     '[role="option"], [role="combobox"], [role="listbox"], ' +
                     '[onclick], [tabindex]:not([tabindex="-1"]), ' +
-                    'label, img[alt], [aria-label]'
+                    'label, img[alt], [aria-label], h1, h2, h3, h4, h5, h6'
                 );
                 const elements = [];
 
@@ -736,7 +740,8 @@ class BrowserSession:
                                      tag === 'input' ? (el.type === 'checkbox' ? 'checkbox' :
                                                         el.type === 'radio' ? 'radio' : 'textbox') :
                                      tag === 'select' ? 'combobox' :
-                                     tag === 'textarea' ? 'textbox' : tag);
+                                     tag === 'textarea' ? 'textbox' :
+                                     tag.match(/^h[1-6]$/) ? 'heading' : tag);
 
                         const name = el.getAttribute('aria-label') ||
                                     el.getAttribute('title') ||
@@ -744,7 +749,17 @@ class BrowserSession:
                                     el.getAttribute('alt') ||
                                     (tag === 'input' && el.type === 'submit' ? el.value : null) ||
                                     (tag === 'label' ? el.textContent?.trim().slice(0, 50) : null) ||
-                                    (tag === 'button' || tag === 'a' ? el.textContent?.trim().slice(0, 50) : null);
+                                    (tag === 'button' || tag === 'a' ? el.textContent?.trim().slice(0, 50) : null) ||
+                                    (tag.match(/^h[1-6]$/) ? el.textContent?.trim().slice(0, 50) : null);
+
+                        // Semantic attributes (Playwright MCP style)
+                        const isActive = el === activeElement;
+                        const isDisabled = el.disabled || el.getAttribute('aria-disabled') === 'true';
+                        const isChecked = el.checked === true || el.getAttribute('aria-checked') === 'true';
+                        const isExpanded = el.getAttribute('aria-expanded') === 'true';
+                        const isSelected = el.getAttribute('aria-selected') === 'true';
+                        const isRequired = el.required || el.getAttribute('aria-required') === 'true';
+                        const isReadonly = el.readOnly || el.getAttribute('aria-readonly') === 'true';
 
                         elements.push({
                             _index: index,
@@ -762,10 +777,16 @@ class BrowserSession:
                             className: el.className || null,
                             testId: el.getAttribute('data-testid') || null,
                             value: el.value || null,
-                            disabled: el.disabled || false,
-                            checked: el.checked || null,
                             type: el.type || null,
                             href: el.href || null,
+                            // Semantic attributes
+                            active: isActive,
+                            disabled: isDisabled,
+                            checked: isChecked,
+                            expanded: isExpanded,
+                            selected: isSelected,
+                            required: isRequired,
+                            readonly: isReadonly,
                         });
                     }
                 });
@@ -826,20 +847,53 @@ class BrowserSession:
         return f"{el.get('tag', 'div')}"
 
     def _build_text_snapshot(self, elements: List[Dict]) -> str:
-        """Build text representation of the page (like Playwright MCP)"""
+        """
+        Build text representation of the page (Playwright MCP style).
+        Format: - role "name" [attr1] [attr2] [ref=eN]: value
+        """
         lines = []
         for el in elements:
             ref = el.get('ref', '?')
             role = el.get('role', el.get('tag', '?'))
-            name = el.get('name') or el.get('text', '')
+            name = el.get('name') or ''
             if name:
                 name = name[:40]
 
-            # Format: - role "name" [ref=e1]
-            if name:
-                lines.append(f"- {role} \"{name}\" [ref={ref}]")
+            # Build attributes list (Playwright MCP style)
+            attrs = []
+            if el.get('active'):
+                attrs.append('[active]')
+            if el.get('disabled'):
+                attrs.append('[disabled]')
+            if el.get('checked'):
+                attrs.append('[checked]')
+            if el.get('expanded'):
+                attrs.append('[expanded]')
+            if el.get('selected'):
+                attrs.append('[selected]')
+            if el.get('required'):
+                attrs.append('[required]')
+            if el.get('readonly'):
+                attrs.append('[readonly]')
+
+            # Add ref at the end of attributes
+            attrs.append(f'[ref={ref}]')
+            attrs_str = ' '.join(attrs)
+
+            # Get value for inputs (shown after colon)
+            value = el.get('value', '')
+            if value and role in ('textbox', 'combobox', 'checkbox', 'radio'):
+                value = str(value)[:30]
+
+            # Format: - role "name" [attr1] [ref=eN]: value
+            if name and value:
+                lines.append(f'- {role} "{name}" {attrs_str}: {value}')
+            elif name:
+                lines.append(f'- {role} "{name}" {attrs_str}')
+            elif value:
+                lines.append(f'- {role} {attrs_str}: {value}')
             else:
-                lines.append(f"- {role} [ref={ref}]")
+                lines.append(f'- {role} {attrs_str}')
 
         return "\n".join(lines)
     
@@ -1082,15 +1136,15 @@ async def do_click(req: ClickRequest):
         else:
             return ActionResponse(success=False, error="Invalid scope or PyAutoGUI not available")
 
-        # v9.0.0: Auto-screenshot after action
+        # v9.0.0: Auto-screenshot after action (optional)
         if req.include_screenshot:
             ss_b64, ss_w, ss_h = await take_auto_screenshot(session, req.scope)
             response.screenshot_base64 = ss_b64
             response.screenshot_width = ss_w
             response.screenshot_height = ss_h
 
-        # v10.1.0: Auto-snapshot DOM after action
-        if req.include_snapshot and session:
+        # v10.2.0: ALWAYS include snapshot for browser actions (Playwright MCP style)
+        if session and session.is_alive():
             snap, snap_url, snap_title, snap_count = await take_auto_snapshot(session)
             response.snapshot = snap
             response.snapshot_url = snap_url
@@ -1126,8 +1180,8 @@ async def do_type(req: TypeRequest):
             response.screenshot_width = ss_w
             response.screenshot_height = ss_h
 
-        # v10.1.0: Auto-snapshot DOM after action
-        if req.include_snapshot and session:
+        # v10.2.0: ALWAYS include snapshot for browser actions (Playwright MCP style)
+        if session and session.is_alive():
             snap, snap_url, snap_title, snap_count = await take_auto_snapshot(session)
             response.snapshot = snap
             response.snapshot_url = snap_url
@@ -1163,8 +1217,8 @@ async def do_scroll(req: ScrollRequest):
             response.screenshot_width = ss_w
             response.screenshot_height = ss_h
 
-        # v10.1.0: Auto-snapshot DOM after action
-        if req.include_snapshot and session:
+        # v10.2.0: ALWAYS include snapshot for browser actions (Playwright MCP style)
+        if session and session.is_alive():
             snap, snap_url, snap_title, snap_count = await take_auto_snapshot(session)
             response.snapshot = snap
             response.snapshot_url = snap_url
@@ -1206,8 +1260,8 @@ async def do_keypress(req: KeypressRequest):
             response.screenshot_width = ss_w
             response.screenshot_height = ss_h
 
-        # v10.1.0: Auto-snapshot DOM after action
-        if req.include_snapshot and session:
+        # v10.2.0: ALWAYS include snapshot for browser actions (Playwright MCP style)
+        if session and session.is_alive():
             snap, snap_url, snap_title, snap_count = await take_auto_snapshot(session)
             response.snapshot = snap
             response.snapshot_url = snap_url
@@ -1340,8 +1394,8 @@ async def do_click_by_ref(req: ClickByRefRequest):
             response.screenshot_width = ss_w
             response.screenshot_height = ss_h
 
-        # v10.1.0: Auto-snapshot DOM after action
-        if req.include_snapshot and session:
+        # v10.2.0: ALWAYS include snapshot for browser actions (Playwright MCP style)
+        if session and session.is_alive():
             snap, snap_url, snap_title, snap_count = await take_auto_snapshot(session)
             response.snapshot = snap
             response.snapshot_url = snap_url
