@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-tasker_service.py v7.2.2 - Unified Multi-Provider Computer Use
+tasker_service.py v7.3.0 - Unified Multi-Provider Computer Use
 =============================================================
 
 SUPPORTED PROVIDERS:
@@ -14,15 +14,18 @@ SUPPORTED PROVIDERS:
    - Usa Playwright con Edge + persistent context
    - Tool computer_use simulato
 
-3. GEMINI HYBRID (DOM + Vision - browser dedicato) [NUOVO]
+3. GEMINI HYBRID (DOM + Vision - browser dedicato)
    - Combina Accessibility Tree + Screenshot
    - Self-healing automatico
 
 Versioni:
 - v6.0.7: Switch a Edge per evitare conflitti
 - v7.0.0: Unified con Hybrid Mode + Lux completo
-- v7.2.3: FIX - Usa ImageConfig ufficiale SDK invece di custom ResizedScreenshotMaker
 - v7.2.2: FIX CRITICO - Risoluzione Lux corretta a 1260x700 (da repo ufficiale oagi)
+- v7.2.3: FIX - Usa ImageConfig ufficiale SDK invece di custom ResizedScreenshotMaker
+- v7.3.0: ALLINEAMENTO SDK - Fix parametri default (temperature=0.5, max_steps=20/60),
+          aggiunto reset_handler(), reflection_interval=20, step_delay=0.3,
+          rimossa intercettazione type_via_clipboard (usa handler SDK nativo)
 """
 
 import asyncio
@@ -48,7 +51,7 @@ from pydantic import BaseModel, Field
 # CONFIGURATION
 # ============================================================================
 
-SERVICE_VERSION = "7.2.3"
+SERVICE_VERSION = "7.3.0"
 SERVICE_PORT = 8765
 
 # ==========================================================================
@@ -145,6 +148,7 @@ OAGI_AVAILABLE = False
 ASYNC_ACTOR_AVAILABLE = False
 TASKER_AGENT_AVAILABLE = False
 ASYNC_AGENT_OBSERVER_AVAILABLE = False
+RESET_HANDLER_AVAILABLE = False
 
 try:
     from oagi import (
@@ -156,11 +160,13 @@ try:
         PyautoguiConfig,
         ImageConfig  # Per configurare resize screenshot a 1260x700
     )
+    from oagi.handler.utils import reset_handler  # Per reset stato handler a inizio/fine task
     ASYNC_ACTOR_AVAILABLE = True
     TASKER_AGENT_AVAILABLE = True
     ASYNC_AGENT_OBSERVER_AVAILABLE = True
     OAGI_AVAILABLE = True
-    logger.log("✅ OAGI SDK completo (AsyncActor, TaskerAgent, handlers)")
+    RESET_HANDLER_AVAILABLE = True
+    logger.log("✅ OAGI SDK completo (AsyncActor, TaskerAgent, handlers, reset_handler)")
 except ImportError as e:
     logger.log(f"⚠️ OAGI SDK non disponibile: {e}", "WARNING")
 
@@ -198,11 +204,12 @@ class TaskRequest(BaseModel):
     api_key: Optional[str] = None  # OAGI API key per Lux, oppure Gemini API key se mode=gemini
     gemini_api_key: Optional[str] = None  # Gemini API key (alternativa)
     
-    # Lux settings
+    # Lux settings (default da SDK ufficiale oagi/constants.py)
     model: str = "lux-actor-1"
-    max_steps: int = 30
-    max_steps_per_todo: int = 24
-    temperature: float = 0.0
+    max_steps: int = 20              # DEFAULT_MAX_STEPS = 20 (Actor)
+    max_steps_per_todo: int = 60     # DEFAULT_MAX_STEPS_TASKER = 60
+    temperature: float = 0.5         # DEFAULT_TEMPERATURE = 0.5
+    step_delay: float = 0.3          # DEFAULT_STEP_DELAY = 0.3
     todos: Optional[List[str]] = None
     
     # PyAutoGUI settings
@@ -286,57 +293,10 @@ class ExecutionHistory:
 
 
 # ============================================================================
-# LUX: RESIZED SCREENSHOT MAKER
-# ============================================================================
-
-class ResizedScreenshotMaker:
-    """
-    Screenshot maker che ridimensiona alla risoluzione di riferimento Lux.
-    
-    RISOLUZIONE UFFICIALE: 1260x700 (da documentazione SDK oagi)
-    Fonte: https://github.com/agiopen-org/oagi-python
-    
-    Il modello Lux è stato trainato su questa risoluzione, quindi le coordinate
-    restituite sono relative a 1260x700. Usare risoluzioni diverse causa
-    imprecisione nei click.
-    """
-    
-    def __init__(self, target_width: int = LUX_REF_WIDTH, target_height: int = LUX_REF_HEIGHT):
-        self.target_width = target_width
-        self.target_height = target_height
-        
-    async def __call__(self) -> str:
-        """Cattura screenshot, ridimensiona a 1260x700 e restituisce base64"""
-        try:
-            from PIL import Image
-            import io
-            
-            # Cattura screenshot
-            screenshot = pyautogui.screenshot()
-            original_size = screenshot.size
-            
-            # Ridimensiona alla risoluzione target (1260x700)
-            resized = screenshot.resize(
-                (self.target_width, self.target_height),
-                Image.Resampling.LANCZOS
-            )
-            
-            # Converti in base64
-            buffer = io.BytesIO()
-            resized.save(buffer, format='PNG')
-            buffer.seek(0)
-            
-            logger.log(f"📸 Screenshot: {original_size[0]}x{original_size[1]} → {self.target_width}x{self.target_height}")
-            
-            return base64.b64encode(buffer.read()).decode('utf-8')
-            
-        except Exception as e:
-            logger.log(f"❌ Errore screenshot: {e}", "ERROR")
-            raise
-
-
-# ============================================================================
 # LUX: COORDINATE SCALING
+# ============================================================================
+# NOTA: ResizedScreenshotMaker rimossa - ora usiamo AsyncScreenshotMaker con
+# ImageConfig ufficiale dell'SDK (width=1260, height=700)
 # ============================================================================
 
 def scale_coordinates(x: int, y: int) -> tuple:
@@ -473,11 +433,16 @@ async def execute_with_actor(request: TaskRequest) -> TaskResponse:
         
         action_handler = AsyncPyautoguiActionHandler(config=pyautogui_config)
         logger.log("🎮 Action handler: PyAutoGUI")
-        
+
+        # Reset handler state a inizio automazione (best practice SDK)
+        if RESET_HANDLER_AVAILABLE:
+            reset_handler(action_handler)
+            logger.log("🔄 Handler state reset")
+
         # Execution loop con AsyncActor come context manager (API ufficiale)
         step_count = 0
         done = False
-        
+
         async with AsyncActor(api_key=api_key, model=model) as actor:
             # Inizializza task (deve essere awaited)
             await actor.init_task(
@@ -501,27 +466,29 @@ async def execute_with_actor(request: TaskRequest) -> TaskResponse:
                     done = True
                     break
                 
-                # Esegui azioni
+                # Esegui azioni tramite SDK (usa handler ufficiale con _windows.typewrite_exact)
                 for action in step_result.actions:
                     action_type = str(action.type.value) if hasattr(action.type, "value") else str(action.type)
                     argument = str(action.argument) if hasattr(action, "argument") else ""
-                    
+
                     logger.log(f"🎯 Action: {action_type}")
-                    
-                    # Intercetta type per clipboard
-                    if action_type.lower() == "type" and argument:
-                        logger.log(f"⌨️ Typing via clipboard: '{argument[:50]}...'")
-                        type_via_clipboard(argument)
-                        history.add_step(step_count, "type", {"text": argument[:100]})
-                    else:
-                        # Esegui via SDK (action_handler chiamato direttamente con lista)
-                        await action_handler([action])
-                        history.add_step(step_count, action_type, {"argument": argument[:100] if argument else ""})
-                    
-                    time.sleep(0.1)
+                    if argument:
+                        logger.log(f"   Argument: {argument[:50]}...")
+
+                    # Esegui via SDK handler (gestisce TYPE internamente con typewrite_exact)
+                    await action_handler([action])
+                    history.add_step(step_count, action_type, {"argument": argument[:100] if argument else ""})
+
+                    # Delay tra azioni (da SDK: DEFAULT_STEP_DELAY = 0.3)
+                    await asyncio.sleep(request.step_delay)
         
         history.finish(done)
-        
+
+        # Reset handler state a fine automazione (best practice SDK)
+        if RESET_HANDLER_AVAILABLE:
+            reset_handler(action_handler)
+            logger.log("🔄 Handler state reset (fine)")
+
         return TaskResponse(
             success=done,
             message="Task completato" if done else f"Max steps ({request.max_steps}) raggiunto",
@@ -530,12 +497,12 @@ async def execute_with_actor(request: TaskRequest) -> TaskResponse:
             actions_log=history.steps,
             logs=logger.get_logs()
         )
-        
+
     except Exception as e:
         logger.log(f"❌ Errore: {e}", "ERROR")
         import traceback
         traceback.print_exc()
-        
+
         return TaskResponse(
             success=False,
             error=str(e),
@@ -626,24 +593,31 @@ async def execute_with_tasker(request: TaskRequest) -> TaskResponse:
         # Crea action handler
         action_handler = AsyncPyautoguiActionHandler(config=pyautogui_config)
         logger.log("🎮 Action handler: PyAutoGUI")
-        
-        # Crea TaskerAgent
+
+        # Reset handler state a inizio automazione (best practice SDK)
+        if RESET_HANDLER_AVAILABLE:
+            reset_handler(action_handler)
+            logger.log("🔄 Handler state reset")
+
+        # Crea TaskerAgent con parametri da SDK (constants.py)
         tasker_kwargs = {
             "api_key": api_key,
             "base_url": "https://api.agiopen.org",
             "model": "lux-actor-1",  # Tasker usa sempre actor
-            "max_steps": request.max_steps_per_todo,
-            "temperature": 0.0,  # Forzato a 0 per evitare loop
+            "max_steps": request.max_steps_per_todo,         # DEFAULT_MAX_STEPS_TASKER = 60
+            "temperature": request.temperature,              # DEFAULT_TEMPERATURE = 0.5
+            "reflection_interval": 20,                       # DEFAULT_REFLECTION_INTERVAL_TASKER = 20
         }
-        
+
         if observer:
             tasker_kwargs["step_observer"] = observer
-        
+
         logger.log(f"Creating TaskerAgent:")
         logger.log(f"  model: lux-actor-1")
         logger.log(f"  max_steps_per_todo: {request.max_steps_per_todo}")
-        logger.log(f"  temperature: 0.0")
-        
+        logger.log(f"  temperature: {request.temperature}")
+        logger.log(f"  reflection_interval: 20")
+
         tasker = TaskerAgent(**tasker_kwargs)
         
         # Set task e todos
@@ -696,7 +670,12 @@ async def execute_with_tasker(request: TaskRequest) -> TaskResponse:
                 logger.log(f"⚠️ Export observer fallito: {obs_err}", "WARNING")
         
         history.finish(success)
-        
+
+        # Reset handler state a fine automazione (best practice SDK)
+        if RESET_HANDLER_AVAILABLE:
+            reset_handler(action_handler)
+            logger.log("🔄 Handler state reset (fine)")
+
         return TaskResponse(
             success=success,
             message=f"Completati {completed_todos}/{len(todos)} todos",
@@ -707,12 +686,12 @@ async def execute_with_tasker(request: TaskRequest) -> TaskResponse:
             actions_log=todo_statuses,
             logs=logger.get_logs()
         )
-        
+
     except Exception as e:
         logger.log(f"❌ Errore: {e}", "ERROR")
         import traceback
         traceback.print_exc()
-        
+
         return TaskResponse(
             success=False,
             error=str(e),
