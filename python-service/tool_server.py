@@ -702,14 +702,11 @@ class BrowserSession:
             self.clear_refs()
 
         try:
-            # Try new aria_snapshot first (Playwright 1.40+)
-            try:
-                snapshot = await self.page.locator('body').aria_snapshot()
-                return {"type": "aria_snapshot", "tree": snapshot}
-            except (AttributeError, Exception):
-                pass
+            # NOTE: We skip aria_snapshot() because it doesn't generate ref IDs.
+            # Our JavaScript fallback generates refs (e1, e2, etc.) needed for click_by_ref.
+            # The aria_snapshot is good for accessibility but lacks the ref system we need.
 
-            # Fallback: Extract interactive elements via JavaScript (Playwright MCP style)
+            # Extract interactive elements via JavaScript with ref IDs (Playwright MCP style)
             raw_elements = await self.page.evaluate('''() => {
                 // Get active element for [active] attribute
                 const activeElement = document.activeElement;
@@ -1658,7 +1655,11 @@ async def browser_snapshot(session_id: str = Query(...), format: str = Query("te
 
     tree = await session.get_accessibility_tree(include_refs=True)
 
+    if not tree:
+        return {"success": False, "error": "Failed to get accessibility tree"}
+
     if format == "text":
+        # Return text snapshot with ref IDs for LLM consumption
         return {
             "success": True,
             "url": tree.get('url'),
