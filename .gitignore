@@ -1,7 +1,27 @@
 node_modules/
 dist/
+build/
 *.log
 .env
 config.json
 .DS_Store
 Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# PyInstaller
+python-service/build/
+python-service/dist/
+python-service/__pycache__/
+
+# Debug e temp
+python-service/debug_logs/
+python-service/lux_analysis/
+
+# Cloned repos (reference only)
+python-service/kernel-oagi/
+python-service/oagi-lux-samples/
+python-service/oagi-python/
