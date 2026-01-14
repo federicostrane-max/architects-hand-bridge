@@ -22,6 +22,7 @@ CHANGELOG:
 - v8.5.0: Sistema di pairing automatico con Web App
 - v9.0.0: Claude Computer Use compatibility (hold_key, wait, triple_click, auto-screenshot)
 - v10.0.0: Playwright MCP compatibility (ref system, smart waiting, file upload, drag, hover)
+- v10.1.0: Auto-snapshot DOM after actions (include_snapshot parameter for agent awareness)
 """
 
 import argparse
@@ -62,7 +63,7 @@ except ImportError:
 # CONFIGURATION
 # ============================================================================
 
-SERVICE_VERSION = "10.0.0"
+SERVICE_VERSION = "10.1.0"  # Auto-snapshot DOM after actions
 SERVICE_PORT = 8766
 
 # ============================================================================
@@ -350,6 +351,7 @@ class ClickRequest(BaseModel):
     click_type: Literal["single", "double", "right", "triple"] = "single"
     session_id: Optional[str] = None
     include_screenshot: bool = False  # v9.0.0: Auto-screenshot after action
+    include_snapshot: bool = False  # v10.1.0: Auto-snapshot DOM after action
 
 class TypeRequest(BaseModel):
     scope: Literal["browser", "desktop"] = "browser"
@@ -358,6 +360,7 @@ class TypeRequest(BaseModel):
     session_id: Optional[str] = None
     selector: Optional[str] = None
     include_screenshot: bool = False
+    include_snapshot: bool = False  # v10.1.0: Auto-snapshot DOM after action
 
 class ScrollRequest(BaseModel):
     scope: Literal["browser", "desktop"] = "browser"
@@ -365,12 +368,14 @@ class ScrollRequest(BaseModel):
     amount: int = 300
     session_id: Optional[str] = None
     include_screenshot: bool = False
+    include_snapshot: bool = False  # v10.1.0: Auto-snapshot DOM after action
 
 class KeypressRequest(BaseModel):
     scope: Literal["browser", "desktop"] = "browser"
     key: str
     session_id: Optional[str] = None
     include_screenshot: bool = False
+    include_snapshot: bool = False  # v10.1.0: Auto-snapshot DOM after action
 
 # v9.0.0: New actions for Claude Computer Use compatibility
 class HoldKeyRequest(BaseModel):
@@ -392,6 +397,7 @@ class ClickByRefRequest(BaseModel):
     ref: str  # e.g., "e3", "e15"
     click_type: Literal["single", "double", "right", "triple"] = "single"
     include_screenshot: bool = False
+    include_snapshot: bool = False  # v10.1.0: Auto-snapshot DOM after action
 
 class HoverRequest(BaseModel):
     """Hover over element"""
@@ -482,6 +488,11 @@ class ActionResponse(BaseModel):
     screenshot_base64: Optional[str] = None
     screenshot_width: Optional[int] = None
     screenshot_height: Optional[int] = None
+    # v10.1.0: Auto-snapshot DOM after action (for agent awareness)
+    snapshot: Optional[str] = None  # Text snapshot like "- button 'Submit' [ref=e3]"
+    snapshot_url: Optional[str] = None
+    snapshot_title: Optional[str] = None
+    snapshot_ref_count: Optional[int] = None
 
 class ScreenshotResponse(BaseModel):
     success: bool
@@ -585,6 +596,28 @@ async def take_auto_screenshot(session: Optional['BrowserSession'] = None, scope
     except Exception as e:
         logger.warning(f"⚠️ Auto-screenshot failed: {e}")
     return None, None, None
+
+# v10.1.0: Auto-snapshot helper for DOM structure after actions
+async def take_auto_snapshot(session: Optional['BrowserSession'] = None) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[int]]:
+    """
+    Take a DOM snapshot and return (text_snapshot, url, title, ref_count).
+    Returns the text representation of interactive elements for agent consumption.
+    """
+    try:
+        if session and session.is_alive():
+            # Small delay to let UI update after action
+            await asyncio.sleep(0.3)
+            tree = await session.get_accessibility_tree(include_refs=True)
+            if tree and 'text_snapshot' in tree:
+                return (
+                    tree.get('text_snapshot', ''),
+                    tree.get('url', ''),
+                    tree.get('title', ''),
+                    tree.get('ref_count', 0)
+                )
+    except Exception as e:
+        logger.warning(f"⚠️ Auto-snapshot failed: {e}")
+    return None, None, None, None
 
 # ============================================================================
 # BROWSER SESSION
@@ -912,6 +945,53 @@ session_manager = SessionManager()
 # ============================================================================
 
 app = FastAPI(title="Tool Server", version=SERVICE_VERSION)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CORS Middleware Custom - FIX per ngrok free tier
+# Il problema: ngrok free mostra warning page che intercetta OPTIONS preflight
+# Soluzione: gestire CORS headers manualmente per TUTTE le risposte
+# ──────────────────────────────────────────────────────────────────────────────
+
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import Response
+
+class CustomCORSMiddleware(BaseHTTPMiddleware):
+    """
+    Custom CORS middleware che:
+    1. Gestisce OPTIONS preflight esplicitamente
+    2. Aggiunge CORS headers a TUTTE le risposte
+    """
+
+    async def dispatch(self, request, call_next):
+        # CORS headers comuni
+        cors_headers = {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Allow-Credentials": "true",
+            "Access-Control-Max-Age": "86400",  # Cache preflight per 24h
+        }
+
+        # Se è OPTIONS (preflight), rispondi subito con 200
+        if request.method == "OPTIONS":
+            return Response(
+                status_code=200,
+                headers=cors_headers
+            )
+
+        # Per altre richieste, procedi e aggiungi headers alla risposta
+        response = await call_next(request)
+
+        # Aggiungi CORS headers alla risposta
+        for key, value in cors_headers.items():
+            response.headers[key] = value
+
+        return response
+
+# Aggiungi il nostro middleware custom PRIMA del CORS standard
+app.add_middleware(CustomCORSMiddleware)
+
+# CORS standard come fallback (in caso il nostro middleware abbia problemi)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 @app.get("/")
@@ -1009,6 +1089,14 @@ async def do_click(req: ClickRequest):
             response.screenshot_width = ss_w
             response.screenshot_height = ss_h
 
+        # v10.1.0: Auto-snapshot DOM after action
+        if req.include_snapshot and session:
+            snap, snap_url, snap_title, snap_count = await take_auto_snapshot(session)
+            response.snapshot = snap
+            response.snapshot_url = snap_url
+            response.snapshot_title = snap_title
+            response.snapshot_ref_count = snap_count
+
         return response
     except Exception as e:
         return ActionResponse(success=False, error=str(e))
@@ -1038,6 +1126,14 @@ async def do_type(req: TypeRequest):
             response.screenshot_width = ss_w
             response.screenshot_height = ss_h
 
+        # v10.1.0: Auto-snapshot DOM after action
+        if req.include_snapshot and session:
+            snap, snap_url, snap_title, snap_count = await take_auto_snapshot(session)
+            response.snapshot = snap
+            response.snapshot_url = snap_url
+            response.snapshot_title = snap_title
+            response.snapshot_ref_count = snap_count
+
         return response
     except Exception as e:
         return ActionResponse(success=False, error=str(e))
@@ -1066,6 +1162,14 @@ async def do_scroll(req: ScrollRequest):
             response.screenshot_base64 = ss_b64
             response.screenshot_width = ss_w
             response.screenshot_height = ss_h
+
+        # v10.1.0: Auto-snapshot DOM after action
+        if req.include_snapshot and session:
+            snap, snap_url, snap_title, snap_count = await take_auto_snapshot(session)
+            response.snapshot = snap
+            response.snapshot_url = snap_url
+            response.snapshot_title = snap_title
+            response.snapshot_ref_count = snap_count
 
         return response
     except Exception as e:
@@ -1101,6 +1205,14 @@ async def do_keypress(req: KeypressRequest):
             response.screenshot_base64 = ss_b64
             response.screenshot_width = ss_w
             response.screenshot_height = ss_h
+
+        # v10.1.0: Auto-snapshot DOM after action
+        if req.include_snapshot and session:
+            snap, snap_url, snap_title, snap_count = await take_auto_snapshot(session)
+            response.snapshot = snap
+            response.snapshot_url = snap_url
+            response.snapshot_title = snap_title
+            response.snapshot_ref_count = snap_count
 
         return response
     except Exception as e:
@@ -1227,6 +1339,14 @@ async def do_click_by_ref(req: ClickByRefRequest):
             response.screenshot_base64 = ss_b64
             response.screenshot_width = ss_w
             response.screenshot_height = ss_h
+
+        # v10.1.0: Auto-snapshot DOM after action
+        if req.include_snapshot and session:
+            snap, snap_url, snap_title, snap_count = await take_auto_snapshot(session)
+            response.snapshot = snap
+            response.snapshot_url = snap_url
+            response.snapshot_title = snap_title
+            response.snapshot_ref_count = snap_count
 
         return response
     except Exception as e:
