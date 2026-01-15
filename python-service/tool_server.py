@@ -62,15 +62,15 @@ except ImportError:
 # CONFIGURATION
 # ============================================================================
 
-SERVICE_VERSION = "10.3.1"  # Fix: include snapshot in browser_start/navigate
+SERVICE_VERSION = "10.3.2"  # Fix: WEB_APP_URL to deployed app (PNA blocking fix)
 SERVICE_PORT = 8766
 
 # ============================================================================
 # AUTO-PAIRING CONFIGURATION
 # ============================================================================
 
-# URL della Web App (Lovable editor con preview)
-WEB_APP_URL = "https://lovable.dev/projects/3f9b0513-364f-439c-98b3-ce2ac79b2e99"
+# URL della Web App deployata (NON Lovable editor - PNA blocking issue)
+WEB_APP_URL = "https://spark-new-beginnings-80.lovable.app/"
 
 # Flag per tracciare se il pairing è in attesa
 WAITING_FOR_PAIRING = False
