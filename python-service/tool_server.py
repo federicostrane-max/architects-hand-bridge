@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-tool_server.py v10.3.0 - Desktop App "Hands Only" Server + Playwright MCP Style
+tool_server.py v10.4.0 - Desktop App "Hands Only" Server + Playwright MCP Style
 ================================================================================
 
-NOVITÀ v10.3.0: ZERO-CLICK AUTO PAIRING
-=======================================
-Il Tool Server ora supporta pairing automatico senza copia-incolla:
-- All'avvio, se non paired, apre automaticamente la Web App nel browser
-- La Web App rileva il Tool Server su localhost e invia le credenziali
-- Pairing completato in automatico, zero interazione richiesta!
+NOVITÀ v10.4.0: TRACING & ASSERTIONS
+====================================
+Nuovi endpoint ispirati a Playwright per testing e debugging:
+- /browser/tracing/start, /browser/tracing/stop - Recording completo della sessione
+- /browser/console - Cattura console.log, warnings, errors
+- /browser/network - Cattura richieste di rete con status
+- /browser/verify/* - Assertions per element visibility, text, URL, title
 
 CHANGELOG:
 - v8.4.2: Aggiunto /browser/dom/tree endpoint
@@ -20,6 +21,7 @@ CHANGELOG:
 - v10.1.0: Auto-snapshot DOM after actions (include_snapshot parameter for agent awareness)
 - v10.2.0: Playwright MCP alignment - snapshot ALWAYS included for browser actions
 - v10.3.0: Zero-click auto pairing - Web App invia credenziali automaticamente
+- v10.4.0: Tracing, console/network capture, assertions (Playwright-inspired testing features)
 """
 
 import argparse
@@ -29,6 +31,7 @@ import io
 import json
 import logging
 import os
+import re
 import sys
 import time
 import atexit
@@ -62,7 +65,7 @@ except ImportError:
 # CONFIGURATION
 # ============================================================================
 
-SERVICE_VERSION = "10.3.3"  # Fix: Unified browser profile with LuxVision/Cloud Computer Use
+SERVICE_VERSION = "10.4.0"  # Tracing, console/network capture, assertions (Playwright-inspired)
 SERVICE_PORT = 8766
 
 # ============================================================================
@@ -505,6 +508,72 @@ class ElementRectRequest(BaseModel):
     index: Optional[int] = 0
     must_be_visible: Optional[bool] = True
 
+# ============================================================================
+# v10.4.0: Tracing and Assertions Models (Playwright-inspired)
+# ============================================================================
+
+class TracingStartRequest(BaseModel):
+    """Start tracing browser session"""
+    session_id: str
+    screenshots: bool = True  # Capture screenshots during trace
+    snapshots: bool = True    # Capture DOM snapshots
+    sources: bool = False     # Include source files (larger trace)
+
+class TracingStopRequest(BaseModel):
+    """Stop tracing and save trace file"""
+    session_id: str
+    output_path: Optional[str] = None  # Where to save trace, defaults to temp
+
+class ConsoleRequest(BaseModel):
+    """Get console messages from session"""
+    session_id: str
+    types: Optional[List[str]] = None  # Filter by type: log, warning, error, info
+    limit: int = 100  # Max messages to return
+    clear: bool = False  # Clear messages after returning
+
+class NetworkRequest(BaseModel):
+    """Get network requests from session"""
+    session_id: str
+    types: Optional[List[str]] = None  # Filter: xhr, fetch, document, stylesheet, image, script
+    status_filter: Optional[str] = None  # success, error, or status code range (e.g., "4xx", "5xx")
+    limit: int = 100
+    clear: bool = False
+
+class VerifyElementRequest(BaseModel):
+    """Verify element visibility/presence"""
+    session_id: str
+    selector: Optional[str] = None
+    ref: Optional[str] = None
+    text: Optional[str] = None
+    timeout: int = 5000  # ms to wait before failing
+
+class VerifyTextRequest(BaseModel):
+    """Verify text is present on page"""
+    session_id: str
+    text: str
+    exact: bool = False
+    timeout: int = 5000
+
+class VerifyUrlRequest(BaseModel):
+    """Verify current URL matches pattern"""
+    session_id: str
+    url: Optional[str] = None  # Exact match
+    url_contains: Optional[str] = None  # Partial match
+    url_regex: Optional[str] = None  # Regex match
+
+class VerifyTitleRequest(BaseModel):
+    """Verify page title"""
+    session_id: str
+    title: Optional[str] = None  # Exact match
+    title_contains: Optional[str] = None  # Partial match
+
+class VerifyResponse(BaseModel):
+    """Response for verify/assertion endpoints"""
+    success: bool
+    passed: bool  # Whether assertion passed
+    error: Optional[str] = None
+    details: Optional[Dict[str, Any]] = None
+
 class ActionResponse(BaseModel):
     success: bool
     error: Optional[str] = None
@@ -659,6 +728,13 @@ class BrowserSession:
         # v10.0.0: Ref system for element tracking
         self._element_refs: Dict[str, Dict[str, Any]] = {}  # ref -> element info with coordinates
         self._ref_counter = 0
+        # v10.4.0: Tracing and debugging support
+        self._tracing_active = False
+        self._console_messages: List[Dict[str, Any]] = []
+        self._network_requests: List[Dict[str, Any]] = []
+        self._console_handler = None
+        self._request_handler = None
+        self._response_handler = None
 
     @property
     def page(self):
@@ -683,7 +759,7 @@ class BrowserSession:
     async def start(self, start_url: Optional[str] = None, headless: bool = False):
         self.playwright = await async_playwright().start()
         BROWSER_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-        
+
         self.context = await self.playwright.chromium.launch_persistent_context(
             user_data_dir=str(BROWSER_PROFILE_DIR),
             channel="msedge",
@@ -691,15 +767,78 @@ class BrowserSession:
             viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
             args=["--disable-blink-features=AutomationControlled", "--disable-infobars", "--no-first-run"]
         )
-        
+
         self.pages = list(self.context.pages) if self.context.pages else [await self.context.new_page()]
-        
+
+        # v10.4.0: Setup console and network capture handlers
+        if self.page:
+            self._setup_event_handlers(self.page)
+
         if start_url and self.page:
             await self.page.goto(start_url, wait_until="domcontentloaded", timeout=30000)
-        
+
         logger.info(f"✅ Browser started: {self.session_id}")
+
+    def _setup_event_handlers(self, page: Page):
+        """Setup console and network event handlers for a page"""
+        # Console message handler
+        def on_console(msg):
+            self._console_messages.append({
+                "type": msg.type,
+                "text": msg.text,
+                "location": {
+                    "url": msg.location.get("url", ""),
+                    "line": msg.location.get("lineNumber", 0),
+                    "column": msg.location.get("columnNumber", 0)
+                } if msg.location else None,
+                "timestamp": datetime.now().isoformat()
+            })
+            # Keep only last 1000 messages to prevent memory issues
+            if len(self._console_messages) > 1000:
+                self._console_messages = self._console_messages[-1000:]
+
+        # Network request handler
+        def on_request(request):
+            self._network_requests.append({
+                "id": id(request),
+                "method": request.method,
+                "url": request.url,
+                "resource_type": request.resource_type,
+                "headers": dict(request.headers) if request.headers else {},
+                "timestamp": datetime.now().isoformat(),
+                "status": None,  # Will be updated on response
+                "response_headers": None,
+                "duration_ms": None,
+                "error": None
+            })
+            # Keep only last 500 requests
+            if len(self._network_requests) > 500:
+                self._network_requests = self._network_requests[-500:]
+
+        # Network response handler
+        def on_response(response):
+            req_id = id(response.request)
+            for req in reversed(self._network_requests):
+                if req.get("id") == req_id:
+                    req["status"] = response.status
+                    req["response_headers"] = dict(response.headers) if response.headers else {}
+                    break
+
+        page.on("console", on_console)
+        page.on("request", on_request)
+        page.on("response", on_response)
+
+        self._console_handler = on_console
+        self._request_handler = on_request
+        self._response_handler = on_response
     
     async def stop(self):
+        # Stop tracing if active
+        if self._tracing_active:
+            try:
+                await self.context.tracing.stop()
+            except:
+                pass
         if self.context:
             await self.context.close()
         if self.playwright:
@@ -707,7 +846,74 @@ class BrowserSession:
         self.context = None
         self.playwright = None
         self.pages = []
-    
+        self._console_messages = []
+        self._network_requests = []
+
+    async def start_tracing(self, screenshots: bool = True, snapshots: bool = True, sources: bool = False):
+        """Start tracing browser session"""
+        if not self.context:
+            raise Exception("No browser context")
+        if self._tracing_active:
+            raise Exception("Tracing already active")
+
+        await self.context.tracing.start(
+            screenshots=screenshots,
+            snapshots=snapshots,
+            sources=sources
+        )
+        self._tracing_active = True
+        logger.info(f"🎬 Tracing started for session: {self.session_id}")
+
+    async def stop_tracing(self, output_path: Optional[str] = None) -> str:
+        """Stop tracing and save to file"""
+        if not self.context:
+            raise Exception("No browser context")
+        if not self._tracing_active:
+            raise Exception("Tracing not active")
+
+        # Default output path
+        if not output_path:
+            trace_dir = Path.home() / ".architect-hand-traces"
+            trace_dir.mkdir(parents=True, exist_ok=True)
+            output_path = str(trace_dir / f"trace-{self.session_id}-{datetime.now().strftime('%Y%m%d-%H%M%S')}.zip")
+
+        await self.context.tracing.stop(path=output_path)
+        self._tracing_active = False
+        logger.info(f"🎬 Tracing saved to: {output_path}")
+        return output_path
+
+    def get_console_messages(self, types: Optional[List[str]] = None, limit: int = 100, clear: bool = False) -> List[Dict]:
+        """Get captured console messages"""
+        messages = self._console_messages
+        if types:
+            messages = [m for m in messages if m["type"] in types]
+        result = messages[-limit:] if limit else messages
+        if clear:
+            if types:
+                self._console_messages = [m for m in self._console_messages if m["type"] not in types]
+            else:
+                self._console_messages = []
+        return list(result)
+
+    def get_network_requests(self, types: Optional[List[str]] = None, status_filter: Optional[str] = None,
+                            limit: int = 100, clear: bool = False) -> List[Dict]:
+        """Get captured network requests"""
+        requests = self._network_requests
+        if types:
+            requests = [r for r in requests if r["resource_type"] in types]
+        if status_filter:
+            if status_filter == "success":
+                requests = [r for r in requests if r.get("status") and 200 <= r["status"] < 300]
+            elif status_filter == "error":
+                requests = [r for r in requests if r.get("status") and r["status"] >= 400]
+            elif status_filter.endswith("xx"):
+                prefix = int(status_filter[0])
+                requests = [r for r in requests if r.get("status") and prefix * 100 <= r["status"] < (prefix + 1) * 100]
+        result = requests[-limit:] if limit else requests
+        if clear:
+            self._network_requests = []
+        return list(result)
+
     def is_alive(self) -> bool:
         try:
             return self.context is not None and self.page is not None and not self.page.is_closed()
@@ -1905,6 +2111,280 @@ async def browser_current_url(session_id: str = Query(...)):
     if session and session.is_alive():
         return {"success": True, "url": session.page.url}
     return {"success": False}
+
+# ============================================================================
+# v10.4.0: Tracing and Debugging Endpoints (Playwright-inspired)
+# ============================================================================
+
+@app.post("/browser/tracing/start")
+async def browser_tracing_start(req: TracingStartRequest):
+    """Start recording a trace of browser actions"""
+    try:
+        session = session_manager.get_session(req.session_id)
+        if not session or not session.is_alive():
+            return {"success": False, "error": "Session not found"}
+
+        await session.start_tracing(
+            screenshots=req.screenshots,
+            snapshots=req.snapshots,
+            sources=req.sources
+        )
+
+        return {
+            "success": True,
+            "message": "Tracing started",
+            "session_id": req.session_id,
+            "options": {
+                "screenshots": req.screenshots,
+                "snapshots": req.snapshots,
+                "sources": req.sources
+            }
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+@app.post("/browser/tracing/stop")
+async def browser_tracing_stop(req: TracingStopRequest):
+    """Stop tracing and save the trace file"""
+    try:
+        session = session_manager.get_session(req.session_id)
+        if not session or not session.is_alive():
+            return {"success": False, "error": "Session not found"}
+
+        output_path = await session.stop_tracing(req.output_path)
+
+        return {
+            "success": True,
+            "message": "Tracing stopped",
+            "trace_file": output_path,
+            "hint": "Open trace with: npx playwright show-trace <trace_file>"
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+@app.post("/browser/console")
+async def browser_console(req: ConsoleRequest):
+    """Get captured console messages from browser session"""
+    try:
+        session = session_manager.get_session(req.session_id)
+        if not session or not session.is_alive():
+            return {"success": False, "error": "Session not found"}
+
+        messages = session.get_console_messages(
+            types=req.types,
+            limit=req.limit,
+            clear=req.clear
+        )
+
+        # Count by type
+        type_counts = {}
+        for m in messages:
+            t = m.get("type", "unknown")
+            type_counts[t] = type_counts.get(t, 0) + 1
+
+        return {
+            "success": True,
+            "count": len(messages),
+            "type_counts": type_counts,
+            "messages": messages,
+            "cleared": req.clear
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+@app.post("/browser/network")
+async def browser_network(req: NetworkRequest):
+    """Get captured network requests from browser session"""
+    try:
+        session = session_manager.get_session(req.session_id)
+        if not session or not session.is_alive():
+            return {"success": False, "error": "Session not found"}
+
+        requests_list = session.get_network_requests(
+            types=req.types,
+            status_filter=req.status_filter,
+            limit=req.limit,
+            clear=req.clear
+        )
+
+        # Summary stats
+        status_counts = {}
+        type_counts = {}
+        for r in requests_list:
+            status = r.get("status")
+            if status:
+                status_key = f"{status // 100}xx"
+                status_counts[status_key] = status_counts.get(status_key, 0) + 1
+            rtype = r.get("resource_type", "unknown")
+            type_counts[rtype] = type_counts.get(rtype, 0) + 1
+
+        return {
+            "success": True,
+            "count": len(requests_list),
+            "status_counts": status_counts,
+            "type_counts": type_counts,
+            "requests": requests_list,
+            "cleared": req.clear
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+# ============================================================================
+# v10.4.0: Assertion/Verification Endpoints
+# ============================================================================
+
+@app.post("/browser/verify/element_visible", response_model=VerifyResponse)
+async def browser_verify_element_visible(req: VerifyElementRequest):
+    """Verify that an element is visible on the page"""
+    try:
+        session = session_manager.get_session(req.session_id)
+        if not session or not session.is_alive():
+            return VerifyResponse(success=False, passed=False, error="Session not found")
+
+        locator = None
+        selector_desc = ""
+
+        if req.ref:
+            element = session.get_element_by_ref(req.ref)
+            if not element:
+                return VerifyResponse(
+                    success=True,
+                    passed=False,
+                    details={"reason": f"Ref '{req.ref}' not found in current snapshot"}
+                )
+            locator = session.page.locator(element['selector'])
+            selector_desc = f"ref={req.ref}"
+        elif req.selector:
+            locator = session.page.locator(req.selector)
+            selector_desc = req.selector
+        elif req.text:
+            locator = session.page.get_by_text(req.text)
+            selector_desc = f"text='{req.text}'"
+        else:
+            return VerifyResponse(success=False, passed=False, error="Provide ref, selector, or text")
+
+        try:
+            await locator.wait_for(state="visible", timeout=req.timeout)
+            logger.info(f"✅ Verify element visible: {selector_desc} - PASSED")
+            return VerifyResponse(
+                success=True,
+                passed=True,
+                details={"selector": selector_desc, "visible": True}
+            )
+        except Exception as wait_error:
+            logger.info(f"❌ Verify element visible: {selector_desc} - FAILED")
+            return VerifyResponse(
+                success=True,
+                passed=False,
+                details={"selector": selector_desc, "visible": False, "reason": str(wait_error)}
+            )
+
+    except Exception as e:
+        return VerifyResponse(success=False, passed=False, error=str(e))
+
+@app.post("/browser/verify/text_visible", response_model=VerifyResponse)
+async def browser_verify_text_visible(req: VerifyTextRequest):
+    """Verify that specific text is visible on the page"""
+    try:
+        session = session_manager.get_session(req.session_id)
+        if not session or not session.is_alive():
+            return VerifyResponse(success=False, passed=False, error="Session not found")
+
+        locator = session.page.get_by_text(req.text, exact=req.exact)
+
+        try:
+            await locator.wait_for(state="visible", timeout=req.timeout)
+            logger.info(f"✅ Verify text visible: '{req.text}' - PASSED")
+            return VerifyResponse(
+                success=True,
+                passed=True,
+                details={"text": req.text, "exact": req.exact, "visible": True}
+            )
+        except Exception as wait_error:
+            logger.info(f"❌ Verify text visible: '{req.text}' - FAILED")
+            return VerifyResponse(
+                success=True,
+                passed=False,
+                details={"text": req.text, "exact": req.exact, "visible": False, "reason": str(wait_error)}
+            )
+
+    except Exception as e:
+        return VerifyResponse(success=False, passed=False, error=str(e))
+
+@app.post("/browser/verify/url", response_model=VerifyResponse)
+async def browser_verify_url(req: VerifyUrlRequest):
+    """Verify the current page URL"""
+    try:
+        session = session_manager.get_session(req.session_id)
+        if not session or not session.is_alive():
+            return VerifyResponse(success=False, passed=False, error="Session not found")
+
+        current_url = session.page.url
+        passed = False
+        match_type = None
+
+        if req.url:
+            passed = current_url == req.url
+            match_type = "exact"
+        elif req.url_contains:
+            passed = req.url_contains in current_url
+            match_type = "contains"
+        elif req.url_regex:
+            passed = bool(re.match(req.url_regex, current_url))
+            match_type = "regex"
+        else:
+            return VerifyResponse(success=False, passed=False, error="Provide url, url_contains, or url_regex")
+
+        logger.info(f"{'✅' if passed else '❌'} Verify URL ({match_type}): {current_url} - {'PASSED' if passed else 'FAILED'}")
+
+        return VerifyResponse(
+            success=True,
+            passed=passed,
+            details={
+                "current_url": current_url,
+                "match_type": match_type,
+                "expected": req.url or req.url_contains or req.url_regex
+            }
+        )
+
+    except Exception as e:
+        return VerifyResponse(success=False, passed=False, error=str(e))
+
+@app.post("/browser/verify/title", response_model=VerifyResponse)
+async def browser_verify_title(req: VerifyTitleRequest):
+    """Verify the page title"""
+    try:
+        session = session_manager.get_session(req.session_id)
+        if not session or not session.is_alive():
+            return VerifyResponse(success=False, passed=False, error="Session not found")
+
+        current_title = await session.page.title()
+        passed = False
+        match_type = None
+
+        if req.title:
+            passed = current_title == req.title
+            match_type = "exact"
+        elif req.title_contains:
+            passed = req.title_contains in current_title
+            match_type = "contains"
+        else:
+            return VerifyResponse(success=False, passed=False, error="Provide title or title_contains")
+
+        logger.info(f"{'✅' if passed else '❌'} Verify title ({match_type}): {current_title} - {'PASSED' if passed else 'FAILED'}")
+
+        return VerifyResponse(
+            success=True,
+            passed=passed,
+            details={
+                "current_title": current_title,
+                "match_type": match_type,
+                "expected": req.title or req.title_contains
+            }
+        )
+
+    except Exception as e:
+        return VerifyResponse(success=False, passed=False, error=str(e))
 
 @app.post("/coordinates/convert")
 async def coordinates_convert(x: int, y: int, from_space: str, to_space: str):
