@@ -1,19 +1,14 @@
 #!/usr/bin/env python3
 """
-tool_server.py v10.0.0 - Desktop App "Hands Only" Server + Playwright MCP Style
+tool_server.py v10.3.0 - Desktop App "Hands Only" Server + Playwright MCP Style
 ================================================================================
 
-NOVITÀ v10.0.0: PLAYWRIGHT MCP COMPATIBILITY
-============================================
-Nuove funzionalità ispirate a Playwright MCP per automazione avanzata:
-- Accessibility Ref System: ogni elemento ha un ref ID univoco (es. "e3")
-- Click by Ref: clicca elementi direttamente per ref invece di coordinate
-- Smart Waiting: waitForSelector, waitForLoadState invece di sleep fissi
-- File Upload: upload file su input type=file
-- Drag and Drop: trascina elementi
-- Select Option: selezione dropdown
-- Hover: hover su elementi
-- Error Recovery: auto-retry con exponential backoff
+NOVITÀ v10.3.0: ZERO-CLICK AUTO PAIRING
+=======================================
+Il Tool Server ora supporta pairing automatico senza copia-incolla:
+- All'avvio, se non paired, apre automaticamente la Web App nel browser
+- La Web App rileva il Tool Server su localhost e invia le credenziali
+- Pairing completato in automatico, zero interazione richiesta!
 
 CHANGELOG:
 - v8.4.2: Aggiunto /browser/dom/tree endpoint
@@ -23,7 +18,8 @@ CHANGELOG:
 - v9.0.0: Claude Computer Use compatibility (hold_key, wait, triple_click, auto-screenshot)
 - v10.0.0: Playwright MCP compatibility (ref system, smart waiting, file upload, drag, hover)
 - v10.1.0: Auto-snapshot DOM after actions (include_snapshot parameter for agent awareness)
-- v10.2.0: Playwright MCP alignment - snapshot ALWAYS included for browser actions, semantic attributes [active] [checked] [disabled] etc.
+- v10.2.0: Playwright MCP alignment - snapshot ALWAYS included for browser actions
+- v10.3.0: Zero-click auto pairing - Web App invia credenziali automaticamente
 """
 
 import argparse
@@ -36,6 +32,8 @@ import os
 import sys
 import time
 import atexit
+import webbrowser
+import threading
 import requests
 from datetime import datetime
 from pathlib import Path
@@ -64,8 +62,18 @@ except ImportError:
 # CONFIGURATION
 # ============================================================================
 
-SERVICE_VERSION = "10.2.0"  # Always snapshot for browser actions (Playwright MCP style)
+SERVICE_VERSION = "10.3.0"  # Zero-click auto pairing
 SERVICE_PORT = 8766
+
+# ============================================================================
+# AUTO-PAIRING CONFIGURATION
+# ============================================================================
+
+# URL della Web App (Lovable editor con preview)
+WEB_APP_URL = "https://lovable.dev/projects/3f9b0513-364f-439c-98b3-ce2ac79b2e99"
+
+# Flag per tracciare se il pairing è in attesa
+WAITING_FOR_PAIRING = False
 
 # ============================================================================
 # PAIRING CONFIGURATION
@@ -390,6 +398,21 @@ class WaitRequest(BaseModel):
     duration: float = 1.0  # seconds
     include_screenshot: bool = False
     session_id: Optional[str] = None  # For browser screenshot after wait
+
+# v10.3.0: Auto-pairing models
+class AutoPairRequest(BaseModel):
+    """Request from Web App to auto-pair the Tool Server"""
+    user_id: str
+    device_secret: str
+    supabase_url: str
+    function_url: str
+
+class PairingStatusResponse(BaseModel):
+    """Response for /pairing_status endpoint"""
+    paired: bool
+    waiting_for_pairing: bool
+    user_id: Optional[str] = None
+    ngrok_url: Optional[str] = None
 
 # v10.0.0: New Playwright MCP-style models
 class ClickByRefRequest(BaseModel):
@@ -1060,6 +1083,70 @@ async def get_status():
         "ngrok_url": NGROK_PUBLIC_URL,
         "references": {"lux_sdk": {"width": LUX_SDK_WIDTH, "height": LUX_SDK_HEIGHT}, "gemini_recommended": {"width": GEMINI_RECOMMENDED_WIDTH, "height": GEMINI_RECOMMENDED_HEIGHT}, "normalized_range": {"min": 0, "max": 999}}
     }
+
+# ============================================================================
+# v10.3.0: AUTO-PAIRING ENDPOINTS
+# ============================================================================
+
+@app.get("/pairing_status")
+async def get_pairing_status():
+    """
+    Endpoint chiamato dalla Web App per verificare lo stato del pairing.
+    La Web App fa polling su questo endpoint per rilevare il Tool Server.
+    """
+    global PAIRING_CONFIG, WAITING_FOR_PAIRING
+
+    is_paired = PAIRING_CONFIG is not None
+    user_id = PAIRING_CONFIG.get("user_id", "")[:8] + "..." if PAIRING_CONFIG else None
+
+    return {
+        "paired": is_paired,
+        "waiting_for_pairing": WAITING_FOR_PAIRING,
+        "user_id": user_id,
+        "ngrok_url": NGROK_PUBLIC_URL,
+        "version": SERVICE_VERSION
+    }
+
+@app.post("/auto_pair")
+async def auto_pair(req: AutoPairRequest):
+    """
+    Endpoint chiamato dalla Web App per completare il pairing automaticamente.
+    La Web App invia le credenziali dell'utente loggato.
+    """
+    global PAIRING_CONFIG, WAITING_FOR_PAIRING
+
+    try:
+        # Salva la configurazione
+        config = {
+            "user_id": req.user_id,
+            "device_secret": req.device_secret,
+            "supabase_url": req.supabase_url,
+            "function_url": req.function_url,
+            "paired_at": datetime.now().isoformat()
+        }
+        save_pairing_config(config)
+
+        WAITING_FOR_PAIRING = False
+
+        # Aggiorna ngrok URL sul server
+        if NGROK_PUBLIC_URL:
+            update_ngrok_url(NGROK_PUBLIC_URL)
+
+        logger.info(f"✅ Auto-pairing completato! User: {req.user_id[:8]}...")
+
+        return {
+            "success": True,
+            "message": "Pairing completato",
+            "user_id": req.user_id[:8] + "...",
+            "ngrok_url": NGROK_PUBLIC_URL
+        }
+
+    except Exception as e:
+        logger.error(f"❌ Auto-pairing fallito: {e}")
+        return {
+            "success": False,
+            "error": str(e)
+        }
 
 @app.post("/screenshot", response_model=ScreenshotResponse)
 async def take_screenshot(req: ScreenshotRequest):
@@ -1869,13 +1956,32 @@ if __name__ == "__main__":
 ╚══════════════════════════════════════════════════════════════╝
 """)
 
-    if ngrok_url and not PAIRING_CONFIG:
-        print(f"💡 To enable auto-sync, run: python tool_server.py --pair <CODE>")
-        print(f"   Get the code from the web app settings.\n")
+    # v10.3.0: Auto-pairing - se non paired, apri browser e aspetta
+    if not PAIRING_CONFIG:
+        WAITING_FOR_PAIRING = True
+        print("╔══════════════════════════════════════════════════════════════╗")
+        print("║  🔗 AUTO-PAIRING IN CORSO...                                 ║")
+        print("╠══════════════════════════════════════════════════════════════╣")
+        print("║                                                              ║")
+        print("║  1. Aprendo Web App nel browser...                           ║")
+        print("║  2. Effettua il login nella Web App (se necessario)          ║")
+        print("║  3. Il pairing avverrà automaticamente!                      ║")
+        print("║                                                              ║")
+        print(f"║  URL: {WEB_APP_URL[:52]:<52} ║")
+        print("║                                                              ║")
+        print("╚══════════════════════════════════════════════════════════════╝")
+        print("\n⏳ In attesa di pairing dalla Web App...\n")
 
-    if ngrok_url and PAIRING_CONFIG:
+        # Apri il browser in un thread separato per non bloccare
+        def open_browser():
+            time.sleep(1)  # Piccolo delay per permettere al server di avviarsi
+            webbrowser.open(WEB_APP_URL)
+            logger.info(f"🌐 Browser aperto su: {WEB_APP_URL}")
+
+        browser_thread = threading.Thread(target=open_browser, daemon=True)
+        browser_thread.start()
+
+    elif ngrok_url and PAIRING_CONFIG:
         print(f"✅ Auto-sync enabled - ngrok URL will be sent to web app automatically\n")
-    elif ngrok_url:
-        print(f"📋 Copy this URL for Lovable: {ngrok_url}\n")
 
     uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="info")
