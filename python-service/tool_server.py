@@ -69,8 +69,8 @@ SERVICE_PORT = 8766
 # AUTO-PAIRING CONFIGURATION
 # ============================================================================
 
-# URL della Web App (Lovable editor con preview)
-WEB_APP_URL = "https://lovable.dev/projects/3f9b0513-364f-439c-98b3-ce2ac79b2e99"
+# URL della Web App - usa localhost per auto-pairing (HTTPS blocca chiamate a localhost)
+WEB_APP_URL = "http://localhost:8080"
 
 # Flag per tracciare se il pairing è in attesa
 WAITING_FOR_PAIRING = False
