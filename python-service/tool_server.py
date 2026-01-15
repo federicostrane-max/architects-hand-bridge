@@ -62,7 +62,7 @@ except ImportError:
 # CONFIGURATION
 # ============================================================================
 
-SERVICE_VERSION = "10.3.0"  # Zero-click auto pairing
+SERVICE_VERSION = "10.3.1"  # Fix: include snapshot in browser_start/navigate
 SERVICE_PORT = 8766
 
 # ============================================================================
@@ -1764,7 +1764,23 @@ async def browser_start(req: BrowserStartRequest):
         raise HTTPException(500, "Playwright not available")
     sid = await session_manager.create_session(req.start_url, req.headless)
     session = session_manager.get_session(sid)
-    return {"success": True, "session_id": sid, "current_url": session.page.url if session and session.page else None, "viewport": {"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT}}
+
+    response = {
+        "success": True,
+        "session_id": sid,
+        "current_url": session.page.url if session and session.page else None,
+        "viewport": {"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT}
+    }
+
+    # v10.2.0: ALWAYS include snapshot for browser actions
+    if session and session.is_alive():
+        snap, snap_url, snap_title, snap_count = await take_auto_snapshot(session)
+        response["snapshot"] = snap
+        response["snapshot_url"] = snap_url
+        response["snapshot_title"] = snap_title
+        response["snapshot_ref_count"] = snap_count
+
+    return response
 
 @app.post("/browser/stop")
 async def browser_stop(session_id: str = Query(...)):
@@ -1784,7 +1800,17 @@ async def browser_navigate(req: NavigateRequest):
         return {"success": False, "error": "Session not found"}
     await session.page.goto(req.url, wait_until="domcontentloaded", timeout=30000)
     logger.info(f"🌐 Navigate: {req.url}")
-    return {"success": True, "url": session.page.url}
+
+    response = {"success": True, "url": session.page.url}
+
+    # v10.2.0: ALWAYS include snapshot for browser actions
+    snap, snap_url, snap_title, snap_count = await take_auto_snapshot(session)
+    response["snapshot"] = snap
+    response["snapshot_url"] = snap_url
+    response["snapshot_title"] = snap_title
+    response["snapshot_ref_count"] = snap_count
+
+    return response
 
 @app.post("/browser/reload")
 async def browser_reload(session_id: str = Query(...)):
