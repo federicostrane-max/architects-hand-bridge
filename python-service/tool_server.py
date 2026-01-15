@@ -62,7 +62,7 @@ except ImportError:
 # CONFIGURATION
 # ============================================================================
 
-SERVICE_VERSION = "10.3.2"  # Fix: WEB_APP_URL to deployed app (PNA blocking fix)
+SERVICE_VERSION = "10.3.3"  # Fix: Unified browser profile with LuxVision/Cloud Computer Use
 SERVICE_PORT = 8766
 
 # ============================================================================
@@ -90,7 +90,9 @@ GEMINI_RECOMMENDED_HEIGHT = 900
 VIEWPORT_WIDTH = LUX_SDK_WIDTH
 VIEWPORT_HEIGHT = LUX_SDK_HEIGHT
 NORMALIZED_COORD_MAX = 999
-BROWSER_PROFILE_DIR = Path.home() / ".edge-automation-profile"
+# UNIFIED PROFILE: Same as tasker_service.py for LuxVision/Cloud Computer Use
+# This ensures all tools share: logins, cookies, sessions, browser state
+BROWSER_PROFILE_DIR = Path.home() / ".architect-hand-browser"
 
 # ============================================================================
 # LOGGING
