@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-tool_server.py v10.4.0 - Desktop App "Hands Only" Server + Playwright MCP Style
+tool_server.py v10.5.0 - Desktop App "Hands Only" Server + Playwright MCP Style
 ================================================================================
 
-NOVITÀ v10.4.0: TRACING & ASSERTIONS
-====================================
-Nuovi endpoint ispirati a Playwright per testing e debugging:
-- /browser/tracing/start, /browser/tracing/stop - Recording completo della sessione
-- /browser/console - Cattura console.log, warnings, errors
-- /browser/network - Cattura richieste di rete con status
-- /browser/verify/* - Assertions per element visibility, text, URL, title
+NOVITÀ v10.5.0: CLAUDE LAUNCHER AUTO-START
+==========================================
+Il Tool Server avvia automaticamente Claude Launcher (desktop app Electron) all'avvio:
+- Trova automaticamente la versione più recente nella cartella release
+- Avvia in background senza bloccare il Tool Server
+- Health check su porta 3847 per verificare che sia pronto
+- Chiude automaticamente Claude Launcher alla chiusura del Tool Server
+- Skip se già in esecuzione
 
 CHANGELOG:
 - v8.4.2: Aggiunto /browser/dom/tree endpoint
@@ -22,6 +23,7 @@ CHANGELOG:
 - v10.2.0: Playwright MCP alignment - snapshot ALWAYS included for browser actions
 - v10.3.0: Zero-click auto pairing - Web App invia credenziali automaticamente
 - v10.4.0: Tracing, console/network capture, assertions (Playwright-inspired testing features)
+- v10.5.0: Claude Launcher auto-start - avvia automaticamente l'app desktop Electron
 """
 
 import argparse
@@ -38,6 +40,7 @@ import atexit
 import webbrowser
 import threading
 import requests
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional, Literal, List, Dict, Tuple
@@ -65,7 +68,7 @@ except ImportError:
 # CONFIGURATION
 # ============================================================================
 
-SERVICE_VERSION = "10.4.0"  # Tracing, console/network capture, assertions (Playwright-inspired)
+SERVICE_VERSION = "10.5.0"  # Claude Launcher auto-start
 SERVICE_PORT = 8766
 
 # ============================================================================
@@ -150,6 +153,152 @@ if PYNGROK_AVAILABLE:
     logger.info("✅ pyngrok available")
 else:
     logger.warning("⚠️ pyngrok not available - install with: pip install pyngrok")
+
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+    logger.info("✅ psutil available")
+except ImportError:
+    PSUTIL_AVAILABLE = False
+    logger.warning("⚠️ psutil not available - Claude Launcher auto-management disabled")
+
+# ============================================================================
+# CLAUDE LAUNCHER CONFIGURATION
+# ============================================================================
+
+CLAUDE_LAUNCHER_DIR = Path(r"D:\downloads\Lux\claude-launcher-electron\release")
+CLAUDE_LAUNCHER_PORT = 3847
+CLAUDE_LAUNCHER_PROCESS = None  # Global reference for cleanup
+
+# ============================================================================
+# CLAUDE LAUNCHER MANAGEMENT
+# ============================================================================
+
+def find_latest_claude_launcher() -> Optional[Path]:
+    """Find the most recent Claude Launcher exe in release folder (excluding Dev versions)"""
+    if not CLAUDE_LAUNCHER_DIR.exists():
+        logger.warning(f"⚠️ Claude Launcher directory not found: {CLAUDE_LAUNCHER_DIR}")
+        return None
+
+    exe_files = []
+    for f in CLAUDE_LAUNCHER_DIR.iterdir():
+        if f.suffix.lower() == '.exe' and 'claude launcher' in f.name.lower():
+            # Skip Dev versions, prefer versioned releases
+            if 'dev' in f.name.lower():
+                continue
+            exe_files.append((f, f.stat().st_mtime))
+
+    if not exe_files:
+        logger.warning(f"⚠️ No Claude Launcher exe found in {CLAUDE_LAUNCHER_DIR}")
+        return None
+
+    # Sort by modification time (most recent first)
+    exe_files.sort(key=lambda x: x[1], reverse=True)
+    return exe_files[0][0]
+
+def is_claude_launcher_running() -> bool:
+    """Check if Claude Launcher is already running"""
+    if not PSUTIL_AVAILABLE:
+        return False
+
+    for proc in psutil.process_iter(['name', 'exe']):
+        try:
+            name = proc.info['name'].lower() if proc.info['name'] else ''
+            if 'claude launcher' in name or 'claude-launcher' in name:
+                return True
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            pass
+    return False
+
+def wait_for_claude_launcher_ready(timeout: int = 30) -> bool:
+    """Wait for Claude Launcher API to be ready (health check on port 3847)"""
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            resp = requests.get(
+                f"http://localhost:{CLAUDE_LAUNCHER_PORT}/api/health",
+                timeout=2
+            )
+            if resp.status_code == 200:
+                return True
+        except requests.exceptions.RequestException:
+            pass
+        time.sleep(1)
+    return False
+
+def start_claude_launcher() -> bool:
+    """Start Claude Launcher if not already running"""
+    global CLAUDE_LAUNCHER_PROCESS
+
+    if not PSUTIL_AVAILABLE:
+        logger.warning("⚠️ psutil not available - skipping Claude Launcher auto-start")
+        return False
+
+    if is_claude_launcher_running():
+        logger.info("✅ Claude Launcher già in esecuzione")
+        return True
+
+    exe_path = find_latest_claude_launcher()
+    if not exe_path:
+        logger.error("❌ Claude Launcher exe non trovato")
+        return False
+
+    logger.info(f"🚀 Avvio Claude Launcher: {exe_path.name}")
+
+    try:
+        CLAUDE_LAUNCHER_PROCESS = subprocess.Popen(
+            [str(exe_path)],
+            creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+
+        # Wait for API to be ready
+        if wait_for_claude_launcher_ready():
+            logger.info(f"✅ Claude Launcher pronto su porta {CLAUDE_LAUNCHER_PORT}")
+            return True
+        else:
+            logger.warning(f"⚠️ Claude Launcher avviato ma health check timeout")
+            return False
+
+    except Exception as e:
+        logger.error(f"❌ Errore avvio Claude Launcher: {e}")
+        return False
+
+def stop_claude_launcher():
+    """Stop Claude Launcher on Tool Server shutdown"""
+    global CLAUDE_LAUNCHER_PROCESS
+
+    if not PSUTIL_AVAILABLE:
+        return
+
+    # If we started it, terminate it
+    if CLAUDE_LAUNCHER_PROCESS:
+        try:
+            CLAUDE_LAUNCHER_PROCESS.terminate()
+            CLAUDE_LAUNCHER_PROCESS.wait(timeout=5)
+            logger.info("✅ Claude Launcher terminato (processo avviato da noi)")
+        except Exception as e:
+            try:
+                CLAUDE_LAUNCHER_PROCESS.kill()
+            except:
+                pass
+            logger.warning(f"⚠️ Force kill Claude Launcher: {e}")
+        CLAUDE_LAUNCHER_PROCESS = None
+        return
+
+    # Otherwise find and terminate by name
+    for proc in psutil.process_iter(['name', 'pid']):
+        try:
+            name = proc.info['name'].lower() if proc.info['name'] else ''
+            if 'claude launcher' in name or 'claude-launcher' in name:
+                proc.terminate()
+                logger.info(f"✅ Claude Launcher terminato (PID: {proc.info['pid']})")
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            pass
+
+# Register Claude Launcher cleanup on exit
+atexit.register(stop_claude_launcher)
 
 # ============================================================================
 # NGROK TUNNEL
@@ -2442,6 +2591,13 @@ if __name__ == "__main__":
     pairing_status = "PAIRED" if PAIRING_CONFIG else "NOT PAIRED"
     pairing_user = PAIRING_CONFIG.get("user_id", "")[:8] + "..." if PAIRING_CONFIG else "N/A"
 
+    # v10.5.0: Start Claude Launcher automatically
+    claude_launcher_status = "NOT STARTED"
+    if start_claude_launcher():
+        claude_launcher_status = f"RUNNING (:{CLAUDE_LAUNCHER_PORT})"
+    else:
+        claude_launcher_status = "FAILED TO START"
+
     print(f"""
 ╔══════════════════════════════════════════════════════════════╗
 ║      ARCHITECT'S HAND - TOOL SERVER v{SERVICE_VERSION}                ║
@@ -2454,6 +2610,8 @@ if __name__ == "__main__":
 ║  └── 🔒 PUBLIC: {(ngrok_url or 'NOT AVAILABLE'):<42} ║
 ║                                                              ║
 ║  PAIRING: {pairing_status:<10} User: {pairing_user:<24} ║
+║                                                              ║
+║  CLAUDE LAUNCHER: {claude_launcher_status:<40} ║
 ║                                                              ║
 ║  VIEWPORT: {VIEWPORT_WIDTH}×{VIEWPORT_HEIGHT} (Lux SDK native)                    ║
 ║                                                              ║
