@@ -68,8 +68,56 @@ except ImportError:
 # CONFIGURATION
 # ============================================================================
 
-SERVICE_VERSION = "10.5.0"  # Claude Launcher auto-start
+SERVICE_VERSION = "10.6.0"  # Security hardening: CORS + Auth Token
 SERVICE_PORT = 8766
+
+# ============================================================================
+# SECURITY CONFIGURATION
+# ============================================================================
+
+import secrets
+import hashlib
+
+# Token di sicurezza per autenticare richieste sensibili
+# Generato all'avvio e salvato nel config file
+SECURITY_TOKEN_FILE = Path.home() / ".tool_server_security.json"
+SECURITY_TOKEN = None  # Loaded/generated at startup
+
+def load_or_generate_security_token() -> str:
+    """Carica token esistente o genera nuovo token sicuro"""
+    global SECURITY_TOKEN
+
+    if SECURITY_TOKEN_FILE.exists():
+        try:
+            with open(SECURITY_TOKEN_FILE, 'r') as f:
+                data = json.load(f)
+                SECURITY_TOKEN = data.get("token")
+                if SECURITY_TOKEN:
+                    return SECURITY_TOKEN
+        except Exception:
+            pass
+
+    # Genera nuovo token (32 bytes = 64 caratteri hex)
+    SECURITY_TOKEN = secrets.token_hex(32)
+
+    try:
+        with open(SECURITY_TOKEN_FILE, 'w') as f:
+            json.dump({"token": SECURITY_TOKEN, "created": datetime.now().isoformat()}, f)
+        # Imposta permessi restrittivi (solo owner può leggere)
+        import stat
+        SECURITY_TOKEN_FILE.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    except Exception as e:
+        print(f"Warning: Could not save security token: {e}")
+
+    return SECURITY_TOKEN
+
+# Endpoint che NON richiedono autenticazione (pubblici)
+PUBLIC_ENDPOINTS = [
+    "/",
+    "/status",
+    "/pairing_status",
+    "/auto_pair",  # Richiede già device_secret
+]
 
 # ============================================================================
 # AUTO-PAIRING CONFIGURATION
@@ -1378,39 +1426,63 @@ session_manager = SessionManager()
 app = FastAPI(title="Tool Server", version=SERVICE_VERSION)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# CORS Middleware Custom - FIX per ngrok free tier
-# Il problema: ngrok free mostra warning page che intercetta OPTIONS preflight
-# Soluzione: gestire CORS headers manualmente per TUTTE le risposte
+# CORS Middleware Custom - SICUREZZA: Solo origini autorizzate
 # ──────────────────────────────────────────────────────────────────────────────
 
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import Response
+from starlette.responses import Response, JSONResponse
 
-class CustomCORSMiddleware(BaseHTTPMiddleware):
+# Lista di origini autorizzate - SOLO queste possono fare richieste
+ALLOWED_ORIGINS = [
+    "https://spark-new-beginnings-80.lovable.app",  # Web App produzione
+    "http://localhost:8080",                         # Dev locale web app
+    "http://localhost:5173",                         # Vite dev server
+    "http://127.0.0.1:8080",
+    "http://127.0.0.1:5173",
+]
+
+class SecureCORSMiddleware(BaseHTTPMiddleware):
     """
-    Custom CORS middleware che:
-    1. Gestisce OPTIONS preflight esplicitamente
-    2. Aggiunge CORS headers a TUTTE le risposte
+    CORS middleware sicuro che:
+    1. Accetta SOLO origini nella whitelist
+    2. Blocca richieste da siti malevoli
+    3. Permette sempre richieste localhost dirette (no Origin header)
     """
 
     async def dispatch(self, request, call_next):
-        # CORS headers comuni
-        cors_headers = {
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
-            "Access-Control-Allow-Headers": "*",
-            "Access-Control-Allow-Credentials": "true",
-            "Access-Control-Max-Age": "86400",  # Cache preflight per 24h
-        }
+        origin = request.headers.get("origin", "")
 
-        # Se è OPTIONS (preflight), rispondi subito con 200
-        if request.method == "OPTIONS":
-            return Response(
-                status_code=200,
-                headers=cors_headers
+        # Richieste dirette (curl, Postman, localhost senza Origin) - permesse
+        # Richieste dalla stessa macchina senza browser
+        if not origin:
+            response = await call_next(request)
+            return response
+
+        # Verifica se l'origine è nella whitelist
+        origin_allowed = origin in ALLOWED_ORIGINS
+
+        # Se origine non autorizzata, blocca la richiesta
+        if not origin_allowed:
+            logger.warning(f"🚫 CORS BLOCKED: Origin '{origin}' not in whitelist")
+            return JSONResponse(
+                status_code=403,
+                content={"error": "CORS: Origin not allowed", "origin": origin}
             )
 
-        # Per altre richieste, procedi e aggiungi headers alla risposta
+        # CORS headers per origini autorizzate
+        cors_headers = {
+            "Access-Control-Allow-Origin": origin,  # Echo dell'origine specifica, non *
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Tool-Token",
+            "Access-Control-Allow-Credentials": "true",
+            "Access-Control-Max-Age": "86400",
+        }
+
+        # Se è OPTIONS (preflight), rispondi subito
+        if request.method == "OPTIONS":
+            return Response(status_code=200, headers=cors_headers)
+
+        # Procedi con la richiesta
         response = await call_next(request)
 
         # Aggiungi CORS headers alla risposta
@@ -1419,11 +1491,52 @@ class CustomCORSMiddleware(BaseHTTPMiddleware):
 
         return response
 
-# Aggiungi il nostro middleware custom PRIMA del CORS standard
-app.add_middleware(CustomCORSMiddleware)
+# Usa il middleware sicuro
+app.add_middleware(SecureCORSMiddleware)
 
-# CORS standard come fallback (in caso il nostro middleware abbia problemi)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+# ──────────────────────────────────────────────────────────────────────────────
+# AUTH Middleware - Autenticazione token per endpoint sensibili
+# ──────────────────────────────────────────────────────────────────────────────
+
+class AuthMiddleware(BaseHTTPMiddleware):
+    """
+    Middleware di autenticazione:
+    - Endpoint pubblici: accessibili senza token
+    - Endpoint sensibili: richiedono X-Tool-Token header
+    - Richieste locali senza Origin: bypass auth (uso diretto CLI)
+    """
+
+    async def dispatch(self, request, call_next):
+        path = request.url.path
+
+        # Endpoint pubblici - nessuna autenticazione richiesta
+        if path in PUBLIC_ENDPOINTS:
+            return await call_next(request)
+
+        # Richieste locali dirette (senza Origin) = uso CLI locale = permesso
+        origin = request.headers.get("origin", "")
+        if not origin:
+            return await call_next(request)
+
+        # Per richieste da browser (con Origin), verifica token
+        # Il token deve essere inviato nel header X-Tool-Token
+        provided_token = request.headers.get("x-tool-token", "")
+
+        if not SECURITY_TOKEN:
+            # Token non ancora generato (startup race condition) - permetti
+            return await call_next(request)
+
+        if provided_token != SECURITY_TOKEN:
+            logger.warning(f"🔐 AUTH BLOCKED: Invalid token for {path}")
+            return JSONResponse(
+                status_code=401,
+                content={"error": "Authentication required", "hint": "Include X-Tool-Token header"}
+            )
+
+        return await call_next(request)
+
+# Aggiungi auth middleware (eseguito DOPO CORS)
+app.add_middleware(AuthMiddleware)
 
 @app.get("/")
 async def root():
@@ -1438,7 +1551,8 @@ async def get_status():
         "capabilities": {"pyautogui": PYAUTOGUI_AVAILABLE, "pyperclip": PYPERCLIP_AVAILABLE, "playwright": PLAYWRIGHT_AVAILABLE, "pil": PIL_AVAILABLE, "ngrok": PYNGROK_AVAILABLE},
         "viewport": {"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
         "ngrok_url": NGROK_PUBLIC_URL,
-        "references": {"lux_sdk": {"width": LUX_SDK_WIDTH, "height": LUX_SDK_HEIGHT}, "gemini_recommended": {"width": GEMINI_RECOMMENDED_WIDTH, "height": GEMINI_RECOMMENDED_HEIGHT}, "normalized_range": {"min": 0, "max": 999}}
+        "references": {"lux_sdk": {"width": LUX_SDK_WIDTH, "height": LUX_SDK_HEIGHT}, "gemini_recommended": {"width": GEMINI_RECOMMENDED_WIDTH, "height": GEMINI_RECOMMENDED_HEIGHT}, "normalized_range": {"min": 0, "max": 999}},
+        "auth_required": True  # Indica che il server richiede autenticazione
     }
 
 # ============================================================================
@@ -2562,6 +2676,10 @@ if __name__ == "__main__":
         print("✅ Pairing configuration removed")
         sys.exit(0)
 
+    # v10.6.0: Load or generate security token
+    load_or_generate_security_token()
+    token_display = SECURITY_TOKEN[:8] + "..." if SECURITY_TOKEN else "ERROR"
+
     # Start ngrok tunnel (unless disabled)
     ngrok_url = None
     if not args.no_ngrok:
@@ -2603,14 +2721,18 @@ if __name__ == "__main__":
 ║      ARCHITECT'S HAND - TOOL SERVER v{SERVICE_VERSION}                ║
 ╠══════════════════════════════════════════════════════════════╣
 ║                                                              ║
-║  🖐️  MODE: HANDS ONLY                                        ║
+║  🖐️  MODE: HANDS ONLY + SECURITY                             ║
 ║                                                              ║
 ║  ENDPOINTS:                                                  ║
 ║  ├── 🏠 LOCAL:  http://127.0.0.1:{args.port}                       ║
-║  └── 🔒 PUBLIC: {(ngrok_url or 'NOT AVAILABLE'):<42} ║
+║  └── 🔒 PUBLIC: {(ngrok_url or 'DISABLED'):<44} ║
+║                                                              ║
+║  🔐 SECURITY:                                                ║
+║  ├── CORS: Whitelist only (no open origins)                  ║
+║  ├── AUTH: Token required for browser requests               ║
+║  └── TOKEN: {token_display:<48} ║
 ║                                                              ║
 ║  PAIRING: {pairing_status:<10} User: {pairing_user:<24} ║
-║                                                              ║
 ║  CLAUDE LAUNCHER: {claude_launcher_status:<40} ║
 ║                                                              ║
 ║  VIEWPORT: {VIEWPORT_WIDTH}×{VIEWPORT_HEIGHT} (Lux SDK native)                    ║
@@ -2621,6 +2743,14 @@ if __name__ == "__main__":
 ║                                                              ║
 ╚══════════════════════════════════════════════════════════════╝
 """)
+
+    # Mostra token completo per la Web App
+    print("╔══════════════════════════════════════════════════════════════╗")
+    print("║  🔑 SECURITY TOKEN (copia nella Web App se richiesto):       ║")
+    print("╠══════════════════════════════════════════════════════════════╣")
+    print(f"║  {SECURITY_TOKEN}  ║")
+    print("╚══════════════════════════════════════════════════════════════╝")
+    print("")
 
     # v10.3.0: Auto-pairing - se non paired, apri browser e aspetta
     if not PAIRING_CONFIG:
