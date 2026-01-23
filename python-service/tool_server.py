@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 """
-tool_server.py v10.5.0 - Desktop App "Hands Only" Server + Playwright MCP Style
+tool_server.py v10.6.0 - Desktop App "Hands Only" Server + Playwright MCP Style
 ================================================================================
 
-NOVITÀ v10.5.0: CLAUDE LAUNCHER AUTO-START
-==========================================
-Il Tool Server avvia automaticamente Claude Launcher (desktop app Electron) all'avvio:
-- Trova automaticamente la versione più recente nella cartella release
-- Avvia in background senza bloccare il Tool Server
-- Health check su porta 3847 per verificare che sia pronto
-- Chiude automaticamente Claude Launcher alla chiusura del Tool Server
-- Skip se già in esecuzione
+NOVITÀ v10.6.0: SECURITY HARDENING
+==================================
+Autenticazione obbligatoria per TUTTE le richieste a endpoint sensibili:
+- Token richiesto anche per richieste senza Origin header (curl, attacchi via ngrok)
+- Protegge da attacchi remoti via ngrok tunnel
+- La Web App funziona normalmente (ha già il token dal pairing)
 
 CHANGELOG:
 - v8.4.2: Aggiunto /browser/dom/tree endpoint
@@ -24,6 +22,7 @@ CHANGELOG:
 - v10.3.0: Zero-click auto pairing - Web App invia credenziali automaticamente
 - v10.4.0: Tracing, console/network capture, assertions (Playwright-inspired testing features)
 - v10.5.0: Claude Launcher auto-start - avvia automaticamente l'app desktop Electron
+- v10.6.0: Security hardening - auth obbligatoria per tutte le richieste sensibili
 """
 
 import argparse
@@ -1503,7 +1502,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
     Middleware di autenticazione:
     - Endpoint pubblici: accessibili senza token
     - Endpoint sensibili: richiedono X-Tool-Token header
-    - Richieste locali senza Origin: bypass auth (uso diretto CLI)
+    - TUTTE le richieste (con o senza Origin) richiedono token per endpoint sensibili
     """
 
     async def dispatch(self, request, call_next):
@@ -1513,13 +1512,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
         if path in PUBLIC_ENDPOINTS:
             return await call_next(request)
 
-        # Richieste locali dirette (senza Origin) = uso CLI locale = permesso
-        origin = request.headers.get("origin", "")
-        if not origin:
-            return await call_next(request)
-
-        # Per richieste da browser (con Origin), verifica token
-        # Il token deve essere inviato nel header X-Tool-Token
+        # TUTTE le richieste a endpoint sensibili richiedono token
+        # (protegge da attacchi via curl/ngrok senza Origin header)
         provided_token = request.headers.get("x-tool-token", "")
 
         if not SECURITY_TOKEN:
