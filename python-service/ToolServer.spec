@@ -22,7 +22,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='ToolServer_v10.6.0',
+    name='ToolServer_v10.6.1',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

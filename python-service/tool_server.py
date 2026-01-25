@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-tool_server.py v10.6.0 - Desktop App "Hands Only" Server + Playwright MCP Style
+tool_server.py v10.6.1 - Desktop App "Hands Only" Server + Playwright MCP Style
 ================================================================================
 
-NOVITÀ v10.6.0: SECURITY HARDENING
-==================================
-Autenticazione obbligatoria per TUTTE le richieste a endpoint sensibili:
-- Token richiesto anche per richieste senza Origin header (curl, attacchi via ngrok)
-- Protegge da attacchi remoti via ngrok tunnel
-- La Web App funziona normalmente (ha già il token dal pairing)
+NOVITÀ v10.6.1: LOG FILE ACCESS FOR CLAUDE CODE
+================================================
+Permette a Claude Code di leggere autonomamente i log:
+- File logging per Tool Server con rotazione automatica (5MB x 3 files)
+- Browser console logs salvati su file separato
+- Endpoint /logs/read per lettura programmatica
+- Endpoint /logs/paths per ottenere i path dei file
 
 CHANGELOG:
 - v8.4.2: Aggiunto /browser/dom/tree endpoint
@@ -23,6 +24,7 @@ CHANGELOG:
 - v10.4.0: Tracing, console/network capture, assertions (Playwright-inspired testing features)
 - v10.5.0: Claude Launcher auto-start - avvia automaticamente l'app desktop Electron
 - v10.6.0: Security hardening - auth obbligatoria per tutte le richieste sensibili
+- v10.6.1: Log file access - Claude Code può leggere autonomamente server/browser logs
 """
 
 import argparse
@@ -31,6 +33,7 @@ import base64
 import io
 import json
 import logging
+import logging.handlers
 import os
 import re
 import sys
@@ -67,7 +70,7 @@ except ImportError:
 # CONFIGURATION
 # ============================================================================
 
-SERVICE_VERSION = "10.6.0"  # Security hardening: CORS + Auth Token
+SERVICE_VERSION = "10.6.1"  # Log file access for Claude Code
 SERVICE_PORT = 8766
 
 # ============================================================================
@@ -151,13 +154,32 @@ BROWSER_PROFILE_DIR = Path.home() / ".architect-hand-browser"
 # LOGGING
 # ============================================================================
 
+# Log file path - accessibile per lettura esterna (es. Claude Code)
+LOG_FILE_PATH = Path.home() / ".tool_server_logs" / "tool_server.log"
+LOG_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+# Configure root logger with both console and file handlers
 logging.basicConfig(
     level=logging.INFO,
     format='[%(asctime)s.%(msecs)03d] [%(levelname)s] %(message)s',
-    datefmt='%H:%M:%S'
+    datefmt='%H:%M:%S',
+    handlers=[
+        # Console handler (esistente)
+        logging.StreamHandler(),
+        # File handler (nuovo) - con rotazione automatica
+        logging.handlers.RotatingFileHandler(
+            LOG_FILE_PATH,
+            maxBytes=5*1024*1024,  # 5 MB per file
+            backupCount=3,         # Mantieni 3 backup
+            encoding='utf-8'
+        )
+    ]
 )
 logger = logging.getLogger(__name__)
 logging.getLogger("pyngrok").setLevel(logging.WARNING)
+
+# Browser console logs file - separato per chiarezza
+BROWSER_CONSOLE_LOG_PATH = Path.home() / ".tool_server_logs" / "browser_console.log"
 
 # ============================================================================
 # DEPENDENCY CHECKS
@@ -2433,6 +2455,10 @@ async def browser_console(req: ConsoleRequest):
             clear=req.clear
         )
 
+        # v10.6.1: Save to file for external reading (Claude Code)
+        if messages:
+            _save_browser_console_to_file(req.session_id, messages)
+
         # Count by type
         type_counts = {}
         for m in messages:
@@ -2485,6 +2511,112 @@ async def browser_network(req: NetworkRequest):
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+# ============================================================================
+# v10.6.1: Log Reading Endpoints (for Claude Code autonomous log access)
+# ============================================================================
+
+class LogReadRequest(BaseModel):
+    """Request to read logs from file"""
+    source: Literal["server", "browser", "all"] = "all"
+    lines: int = 200  # Number of lines to return (from end)
+    filter_level: Optional[str] = None  # Filter by log level: INFO, WARNING, ERROR
+    filter_text: Optional[str] = None  # Filter by text content
+
+class LogReadResponse(BaseModel):
+    """Response with log content"""
+    success: bool
+    logs: Dict[str, str] = {}  # source -> content
+    line_counts: Dict[str, int] = {}  # source -> number of lines
+    error: Optional[str] = None
+
+def _read_log_file(path: Path, lines: int, filter_level: Optional[str], filter_text: Optional[str]) -> Tuple[str, int]:
+    """Read last N lines from log file with optional filtering"""
+    if not path.exists():
+        return f"Log file not found: {path}", 0
+
+    try:
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            all_lines = f.readlines()
+
+        # Apply filters
+        filtered_lines = all_lines
+        if filter_level:
+            filtered_lines = [l for l in filtered_lines if f"[{filter_level.upper()}]" in l]
+        if filter_text:
+            filtered_lines = [l for l in filtered_lines if filter_text.lower() in l.lower()]
+
+        # Get last N lines
+        result_lines = filtered_lines[-lines:]
+        return "".join(result_lines), len(result_lines)
+    except Exception as e:
+        return f"Error reading log: {e}", 0
+
+def _save_browser_console_to_file(session_id: str, messages: List[Dict]) -> None:
+    """Save browser console messages to file for external reading"""
+    try:
+        with open(BROWSER_CONSOLE_LOG_PATH, 'a', encoding='utf-8') as f:
+            for msg in messages:
+                timestamp = msg.get("timestamp", datetime.now().isoformat())
+                msg_type = msg.get("type", "LOG").upper()
+                text = msg.get("text", "")
+                location = msg.get("location", {})
+                loc_str = f"{location.get('url', '')}:{location.get('line', 0)}" if location.get('url') else ""
+                f.write(f"[{timestamp}] [{msg_type}] [{session_id[:8]}] {text}")
+                if loc_str:
+                    f.write(f" @ {loc_str}")
+                f.write("\n")
+    except Exception as e:
+        logger.warning(f"Failed to save browser console to file: {e}")
+
+@app.post("/logs/read", response_model=LogReadResponse)
+async def read_logs(req: LogReadRequest):
+    """
+    Read log files for external tools (e.g., Claude Code).
+
+    This endpoint allows autonomous access to:
+    - Tool Server logs (server operations, errors, debug info)
+    - Browser console logs (JavaScript console from automated browser)
+
+    Usage by Claude Code:
+        curl -X POST http://localhost:8766/logs/read \\
+             -H "Content-Type: application/json" \\
+             -d '{"source": "all", "lines": 100}'
+    """
+    logs = {}
+    line_counts = {}
+
+    try:
+        if req.source in ["server", "all"]:
+            content, count = _read_log_file(LOG_FILE_PATH, req.lines, req.filter_level, req.filter_text)
+            logs["server"] = content
+            line_counts["server"] = count
+
+        if req.source in ["browser", "all"]:
+            content, count = _read_log_file(BROWSER_CONSOLE_LOG_PATH, req.lines, req.filter_level, req.filter_text)
+            logs["browser"] = content
+            line_counts["browser"] = count
+
+        return LogReadResponse(
+            success=True,
+            logs=logs,
+            line_counts=line_counts
+        )
+    except Exception as e:
+        logger.error(f"Error reading logs: {e}")
+        return LogReadResponse(success=False, error=str(e))
+
+@app.get("/logs/paths")
+async def get_log_paths():
+    """Return the paths to log files for direct file access"""
+    return {
+        "server_log": str(LOG_FILE_PATH),
+        "browser_console_log": str(BROWSER_CONSOLE_LOG_PATH),
+        "exists": {
+            "server": LOG_FILE_PATH.exists(),
+            "browser": BROWSER_CONSOLE_LOG_PATH.exists()
+        }
+    }
 
 # ============================================================================
 # v10.4.0: Assertion/Verification Endpoints
