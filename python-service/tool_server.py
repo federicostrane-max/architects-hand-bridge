@@ -25,6 +25,7 @@ CHANGELOG:
 - v10.5.0: Claude Launcher auto-start - avvia automaticamente l'app desktop Electron
 - v10.6.0: Security hardening - auth obbligatoria per tutte le richieste sensibili
 - v10.6.1: Log file access - Claude Code può leggere autonomamente server/browser logs
+- v10.7.0: Gateway proxy - Tool Server come gateway centrale per Claude Launcher e Clawdbot
 """
 
 import argparse
@@ -48,7 +49,8 @@ from pathlib import Path
 from typing import Any, Optional, Literal, List, Dict, Tuple
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query
+import httpx
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -70,7 +72,7 @@ except ImportError:
 # CONFIGURATION
 # ============================================================================
 
-SERVICE_VERSION = "10.6.1"  # Log file access for Claude Code
+SERVICE_VERSION = "10.7.0"  # Gateway proxy for Claude Launcher & Clawdbot
 SERVICE_PORT = 8766
 
 # ============================================================================
@@ -2779,15 +2781,129 @@ async def browser_verify_title(req: VerifyTitleRequest):
 async def coordinates_convert(x: int, y: int, from_space: str, to_space: str):
     rx, ry = x, y
     sw, sh = pyautogui.size() if PYAUTOGUI_AVAILABLE else (1920, 1080)
-    
+
     if from_space == "normalized" and to_space == "viewport":
         rx, ry = CoordinateConverter.normalized_to_viewport(x, y)
     elif from_space == "viewport" and to_space == "normalized":
         rx, ry = CoordinateConverter.viewport_to_normalized(x, y)
     elif from_space == "lux_sdk" and to_space == "screen":
         rx, ry = CoordinateConverter.lux_sdk_to_screen(x, y, sw, sh)
-    
+
     return {"success": True, "x": rx, "y": ry}
+
+# ============================================================================
+# GATEWAY PROXY - Forward requests to local services
+# ============================================================================
+
+# Local services registry
+LOCAL_SERVICES = {
+    "claude_launcher": {"port": 3847, "base_path": "/api", "name": "Claude Launcher"},
+    "clawdbot": {"port": 8767, "base_path": "", "name": "Clawdbot Service"},
+}
+
+async def forward_to_service(target_url: str, request: Request, timeout: float = 30.0) -> Response:
+    """Forward a request to a local service and return the response"""
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        # Forward headers (exclude hop-by-hop headers)
+        headers = {
+            k: v for k, v in request.headers.items()
+            if k.lower() not in ['host', 'content-length', 'transfer-encoding', 'connection']
+        }
+
+        # Forward body if present
+        body = None
+        if request.method in ["POST", "PUT", "PATCH"]:
+            body = await request.body()
+
+        try:
+            response = await client.request(
+                method=request.method,
+                url=target_url,
+                headers=headers,
+                content=body,
+                params=dict(request.query_params)
+            )
+
+            # Filter response headers
+            response_headers = {
+                k: v for k, v in response.headers.items()
+                if k.lower() not in ['content-encoding', 'transfer-encoding', 'content-length']
+            }
+
+            return Response(
+                content=response.content,
+                status_code=response.status_code,
+                headers=response_headers,
+                media_type=response.headers.get('content-type')
+            )
+        except httpx.ConnectError:
+            raise HTTPException(status_code=503, detail=f"Service unavailable: {target_url}")
+        except httpx.TimeoutException:
+            raise HTTPException(status_code=504, detail=f"Service timeout: {target_url}")
+
+@app.api_route("/proxy/claude-launcher/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+async def proxy_claude_launcher(path: str, request: Request):
+    """Proxy requests to Claude Launcher API (porta 3847)"""
+    service = LOCAL_SERVICES["claude_launcher"]
+    target_url = f"http://127.0.0.1:{service['port']}{service['base_path']}/{path}"
+    logger.info(f"[Gateway] Proxying to Claude Launcher: {request.method} {path}")
+    return await forward_to_service(target_url, request, timeout=30.0)
+
+@app.api_route("/proxy/clawdbot/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+async def proxy_clawdbot(path: str, request: Request):
+    """Proxy requests to Clawdbot Service (porta 8767)"""
+    service = LOCAL_SERVICES["clawdbot"]
+    target_url = f"http://127.0.0.1:{service['port']}/{path}"
+    logger.info(f"[Gateway] Proxying to Clawdbot: {request.method} {path}")
+    # Longer timeout for browser automation tasks
+    return await forward_to_service(target_url, request, timeout=120.0)
+
+@app.get("/services/status")
+async def services_status():
+    """Health check of all desktop apps managed by this gateway"""
+    results = {
+        "tool_server": {
+            "status": "running",
+            "port": SERVICE_PORT,
+            "version": SERVICE_VERSION,
+            "ngrok_url": NGROK_PUBLIC_URL
+        }
+    }
+
+    async with httpx.AsyncClient(timeout=3.0) as client:
+        # Check Claude Launcher
+        try:
+            resp = await client.get(f"http://127.0.0.1:{LOCAL_SERVICES['claude_launcher']['port']}/api/health")
+            data = resp.json() if resp.status_code == 200 else {}
+            results["claude_launcher"] = {
+                "status": "running" if resp.status_code == 200 else "error",
+                "port": LOCAL_SERVICES["claude_launcher"]["port"],
+                "sessions": data.get("sessions", 0) if isinstance(data, dict) else 0
+            }
+        except Exception:
+            results["claude_launcher"] = {
+                "status": "offline",
+                "port": LOCAL_SERVICES["claude_launcher"]["port"]
+            }
+
+        # Check Clawdbot Service
+        try:
+            resp = await client.get(f"http://127.0.0.1:{LOCAL_SERVICES['clawdbot']['port']}/health")
+            data = resp.json() if resp.status_code == 200 else {}
+            results["clawdbot"] = {
+                "status": "running" if resp.status_code == 200 else "error",
+                "port": LOCAL_SERVICES["clawdbot"]["port"],
+                "version": data.get("version", "unknown"),
+                "browser_connected": data.get("browser_connected", False),
+                "active_tasks": data.get("active_tasks", 0)
+            }
+        except Exception:
+            results["clawdbot"] = {
+                "status": "offline",
+                "port": LOCAL_SERVICES["clawdbot"]["port"]
+            }
+
+    return results
 
 # ============================================================================
 # MAIN
