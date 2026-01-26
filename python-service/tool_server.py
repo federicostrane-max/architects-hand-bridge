@@ -1279,7 +1279,12 @@ class BrowserSession:
             }
 
         except Exception as e:
-            logger.error(f"❌ DOM tree extraction failed: {e}")
+            # Navigation-related errors are expected and not critical
+            err_str = str(e)
+            if "navigation" in err_str.lower() or "context was destroyed" in err_str.lower():
+                logger.debug(f"⏭️ DOM snapshot skipped (page navigating): {err_str[:50]}")
+            else:
+                logger.error(f"❌ DOM tree extraction failed: {e}")
             return {"error": str(e)}
 
     def _build_selector(self, el: Dict) -> str:
@@ -1464,6 +1469,12 @@ ALLOWED_ORIGINS = [
     "http://127.0.0.1:5173",
 ]
 
+# Pattern per origini con wildcard (es. *.lovableproject.com per editor Lovable)
+ALLOWED_ORIGIN_PATTERNS = [
+    r"^https://[a-z0-9-]+\.lovableproject\.com$",  # Editor Lovable (UUID subdomain)
+    r"^https://[a-z0-9-]+\.lovable\.app$",         # App Lovable deployate
+]
+
 class SecureCORSMiddleware(BaseHTTPMiddleware):
     """
     CORS middleware sicuro che:
@@ -1481,8 +1492,15 @@ class SecureCORSMiddleware(BaseHTTPMiddleware):
             response = await call_next(request)
             return response
 
-        # Verifica se l'origine è nella whitelist
+        # Verifica se l'origine è nella whitelist (esatta o pattern)
         origin_allowed = origin in ALLOWED_ORIGINS
+
+        # Se non trovato in lista esatta, prova con i pattern regex
+        if not origin_allowed:
+            for pattern in ALLOWED_ORIGIN_PATTERNS:
+                if re.match(pattern, origin):
+                    origin_allowed = True
+                    break
 
         # Se origine non autorizzata, blocca la richiesta
         if not origin_allowed:
