@@ -1,6 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 """
-PyInstaller spec file for Architect's Hand Bridge Launcher
+PyInstaller spec file for Tool Server Auto-Launcher
 
 Build command:
   pyinstaller ArchitectsHandBridge.spec
@@ -22,11 +22,11 @@ a = Analysis(
     pathex=[str(BASE_DIR)],
     binaries=[],
     datas=[],
-    hiddenimports=['tkinter', 'tkinter.ttk'],
+    hiddenimports=[],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=['tkinter'],  # Non serve più tkinter
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
@@ -49,7 +49,7 @@ exe = EXE(
     upx=True,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=False,  # False = GUI mode (nessuna console nera)
+    console=True,  # True = mostra console per vedere i log
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
