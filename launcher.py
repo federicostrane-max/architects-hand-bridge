@@ -68,9 +68,11 @@ def find_project_root():
 PROJECT_ROOT = find_project_root()
 PYTHON_SERVICE_DIR = PROJECT_ROOT / "python-service"
 TASKER_SERVICE_SCRIPT = PYTHON_SERVICE_DIR / "tasker_service.py"
+TOOL_SERVER_SCRIPT = PYTHON_SERVICE_DIR / "tool_server.py"
 
 # Processi globali
 tasker_process = None
+tool_server_process = None
 electron_process = None
 running = True
 
@@ -161,6 +163,32 @@ def start_tasker_service():
     return tasker_process
 
 
+def start_tool_server():
+    """Avvia Tool Server (Python FastAPI su porta 8766)"""
+    global tool_server_process
+
+    python_cmd = find_python()
+    print(f"[LAUNCHER] Avvio Tool Server con {python_cmd}...")
+    print(f"[LAUNCHER] Script: {TOOL_SERVER_SCRIPT}")
+    print(f"[LAUNCHER] CWD: {PYTHON_SERVICE_DIR}")
+
+    # Avvia in una nuova finestra console
+    if sys.platform == "win32":
+        tool_server_process = subprocess.Popen(
+            [python_cmd, str(TOOL_SERVER_SCRIPT)],
+            cwd=str(PYTHON_SERVICE_DIR),
+            creationflags=subprocess.CREATE_NEW_CONSOLE
+        )
+    else:
+        tool_server_process = subprocess.Popen(
+            [python_cmd, str(TOOL_SERVER_SCRIPT)],
+            cwd=str(PYTHON_SERVICE_DIR)
+        )
+
+    print(f"[LAUNCHER] Tool Server avviato (PID: {tool_server_process.pid})")
+    return tool_server_process
+
+
 def start_electron_bridge():
     """Avvia Electron Bridge (npm start)"""
     global electron_process
@@ -196,7 +224,7 @@ def start_electron_bridge():
 
 def stop_all():
     """Ferma tutti i processi"""
-    global running, tasker_process, electron_process
+    global running, tasker_process, tool_server_process, electron_process
     running = False
 
     print("\n[LAUNCHER] Arresto servizi...")
@@ -208,6 +236,14 @@ def stop_all():
             electron_process.wait(timeout=5)
         except subprocess.TimeoutExpired:
             electron_process.kill()
+
+    if tool_server_process and tool_server_process.poll() is None:
+        print("[LAUNCHER] Arresto Tool Server...")
+        tool_server_process.terminate()
+        try:
+            tool_server_process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            tool_server_process.kill()
 
     if tasker_process and tasker_process.poll() is None:
         print("[LAUNCHER] Arresto Tasker Service...")
@@ -239,14 +275,24 @@ def run_console_mode():
         input("Premi INVIO per uscire...")
         return
 
+    if not TOOL_SERVER_SCRIPT.exists():
+        print(f"[ERRORE] File non trovato: {TOOL_SERVER_SCRIPT}")
+        input("Premi INVIO per uscire...")
+        return
+
     # Registra handler per Ctrl+C
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
     # Avvia Tasker Service
     start_tasker_service()
-    print("[LAUNCHER] Attendo avvio Tasker Service (3 sec)...")
-    time.sleep(3)
+    print("[LAUNCHER] Attendo avvio Tasker Service (2 sec)...")
+    time.sleep(2)
+
+    # Avvia Tool Server
+    start_tool_server()
+    print("[LAUNCHER] Attendo avvio Tool Server (2 sec)...")
+    time.sleep(2)
 
     # Avvia Electron Bridge
     start_electron_bridge()
@@ -255,6 +301,7 @@ def run_console_mode():
     print("=" * 50)
     print("  SERVIZI AVVIATI")
     print("  - Tasker Service: http://127.0.0.1:8765")
+    print("  - Tool Server:    http://127.0.0.1:8766")
     print("  - Electron Bridge: in esecuzione")
     print()
     print("  Premi Ctrl+C per arrestare tutto")
@@ -292,7 +339,7 @@ def run_gui_mode():
         def __init__(self):
             self.root = tk.Tk()
             self.root.title("Architect's Hand Bridge")
-            self.root.geometry("400x300")
+            self.root.geometry("400x350")
             self.root.resizable(False, False)
 
             # Stile
@@ -315,6 +362,13 @@ def run_gui_mode():
             ttk.Label(tasker_frame, text="Tasker Service (8765):").pack(side=tk.LEFT)
             self.tasker_status = ttk.Label(tasker_frame, text="⏹ Fermo", style="Red.TLabel")
             self.tasker_status.pack(side=tk.RIGHT)
+
+            # Status Tool Server
+            tool_server_frame = ttk.Frame(main_frame)
+            tool_server_frame.pack(fill=tk.X, pady=5)
+            ttk.Label(tool_server_frame, text="Tool Server (8766):").pack(side=tk.LEFT)
+            self.tool_server_status = ttk.Label(tool_server_frame, text="⏹ Fermo", style="Red.TLabel")
+            self.tool_server_status.pack(side=tk.RIGHT)
 
             # Status Electron Bridge
             electron_frame = ttk.Frame(main_frame)
@@ -359,10 +413,15 @@ def run_gui_mode():
             # Log percorsi per debug
             self.log(f"Root: {PROJECT_ROOT}")
             self.log(f"Tasker: {TASKER_SERVICE_SCRIPT.exists()}")
+            self.log(f"Tool Server: {TOOL_SERVER_SCRIPT.exists()}")
 
             if not TASKER_SERVICE_SCRIPT.exists():
-                self.log(f"ERRORE: File non trovato!")
-                self.log(f"Path: {TASKER_SERVICE_SCRIPT}")
+                self.log(f"ERRORE: Tasker non trovato!")
+                self.start_btn.config(state=tk.NORMAL)
+                return
+
+            if not TOOL_SERVER_SCRIPT.exists():
+                self.log(f"ERRORE: Tool Server non trovato!")
                 self.start_btn.config(state=tk.NORMAL)
                 return
 
@@ -374,7 +433,14 @@ def run_gui_mode():
                 self.root.after(0, lambda: self.log("Tasker Service avviato"))
                 self.root.after(0, lambda: self.tasker_status.config(text="⏳ Avvio...", style="Orange.TLabel"))
 
-                time.sleep(3)
+                time.sleep(2)
+
+                self.root.after(0, lambda: self.log("Avvio Tool Server..."))
+                start_tool_server()
+                self.root.after(0, lambda: self.log("Tool Server avviato"))
+                self.root.after(0, lambda: self.tool_server_status.config(text="⏳ Avvio...", style="Orange.TLabel"))
+
+                time.sleep(2)
 
                 self.root.after(0, lambda: self.log("Avvio Electron Bridge..."))
                 start_electron_bridge()
@@ -396,6 +462,12 @@ def run_gui_mode():
                 self.tasker_status.config(text="✓ Attivo", style="Green.TLabel")
             else:
                 self.tasker_status.config(text="⏹ Fermo", style="Red.TLabel")
+
+            # Aggiorna status Tool Server
+            if tool_server_process and tool_server_process.poll() is None:
+                self.tool_server_status.config(text="✓ Attivo", style="Green.TLabel")
+            else:
+                self.tool_server_status.config(text="⏹ Fermo", style="Red.TLabel")
 
             # Aggiorna status Electron
             if electron_process and electron_process.poll() is None:
@@ -424,7 +496,9 @@ def log_paths():
     print(f"  PROJECT_ROOT: {PROJECT_ROOT}")
     print(f"  PYTHON_SERVICE_DIR: {PYTHON_SERVICE_DIR}")
     print(f"  TASKER_SERVICE_SCRIPT: {TASKER_SERVICE_SCRIPT}")
+    print(f"  TOOL_SERVER_SCRIPT: {TOOL_SERVER_SCRIPT}")
     print(f"  TASKER exists: {TASKER_SERVICE_SCRIPT.exists()}")
+    print(f"  TOOL_SERVER exists: {TOOL_SERVER_SCRIPT.exists()}")
     print(f"  package.json exists: {(PROJECT_ROOT / 'package.json').exists()}")
     print("=" * 50)
 
