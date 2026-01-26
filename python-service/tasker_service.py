@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-tasker_service.py v7.4.0 - Unified Multi-Provider Computer Use
-=============================================================
+tasker_service.py v8.0.0 - Unified Multi-Provider Computer Use (SDK Aligned)
+============================================================================
 
 SUPPORTED PROVIDERS:
 
 1. LUX (Vision + PyAutoGUI - controlla il TUO PC)
-   - actor   : AsyncActor per task single-goal
-   - thinker : AsyncActor con lux-thinker-1 (più ragionamento)
-   - tasker  : TaskerAgent con todos strutturati
+   - actor   : AsyncDefaultAgent con lux-actor-1 (max 30 steps)
+   - thinker : AsyncDefaultAgent con lux-thinker-1 (max 120 steps)
+   - tasker  : TaskerAgent con todos strutturati (60 steps/todo)
 
 2. GEMINI CUA (Vision pura - browser dedicato)
    - Usa Playwright con Edge + persistent context
@@ -39,6 +39,9 @@ Versioni:
 - v7.5.5: FIX WINDOW DETECT - Cerca Edge per processo (msedge.exe) via psutil,
           non per titolo (che non contiene "edge")
 - v7.5.6: MAXIMIZE - Massimizza Edge a schermo intero dopo averlo portato in primo piano
+- v8.0.0: SDK ALIGNMENT - Usa AsyncDefaultAgent invece di loop manuale con AsyncActor,
+          temperature default 0.1 (LOW), thinker max_steps=100 (default)/120 (hard limit),
+          actor max_steps=20 (default)/30 (hard limit), costanti importate da oagi.constants
 """
 
 import asyncio
@@ -64,7 +67,7 @@ from pydantic import BaseModel, Field
 # CONFIGURATION
 # ============================================================================
 
-SERVICE_VERSION = "7.5.6"
+SERVICE_VERSION = "8.0.0"
 SERVICE_PORT = 8765
 
 # ==========================================================================
@@ -491,14 +494,13 @@ except ImportError:
 
 # OpenAGI Lux SDK (oagi)
 OAGI_AVAILABLE = False
-ASYNC_ACTOR_AVAILABLE = False
+ASYNC_DEFAULT_AGENT_AVAILABLE = False
 TASKER_AGENT_AVAILABLE = False
 ASYNC_AGENT_OBSERVER_AVAILABLE = False
-RESET_HANDLER_AVAILABLE = False
 
 try:
     from oagi import (
-        AsyncActor,
+        AsyncDefaultAgent,  # High-level agent wrapper (SDK pattern)
         TaskerAgent,
         AsyncAgentObserver,
         AsyncScreenshotMaker,
@@ -506,14 +508,38 @@ try:
         PyautoguiConfig,
         ImageConfig  # Per configurare resize screenshot a 1260x700
     )
-    from oagi.handler.utils import reset_handler  # Per reset stato handler a inizio/fine task
-    ASYNC_ACTOR_AVAILABLE = True
+    # Importa costanti ufficiali SDK
+    from oagi.constants import (
+        MODEL_ACTOR,
+        MODEL_THINKER,
+        DEFAULT_MAX_STEPS,
+        DEFAULT_MAX_STEPS_THINKER,
+        DEFAULT_MAX_STEPS_TASKER,
+        DEFAULT_TEMPERATURE_LOW,
+        DEFAULT_STEP_DELAY,
+        DEFAULT_REFLECTION_INTERVAL,
+        DEFAULT_REFLECTION_INTERVAL_TASKER,
+        MAX_STEPS_ACTOR,
+        MAX_STEPS_THINKER,
+    )
+    ASYNC_DEFAULT_AGENT_AVAILABLE = True
     TASKER_AGENT_AVAILABLE = True
     ASYNC_AGENT_OBSERVER_AVAILABLE = True
     OAGI_AVAILABLE = True
-    RESET_HANDLER_AVAILABLE = True
-    logger.log("✅ OAGI SDK completo (AsyncActor, TaskerAgent, handlers, reset_handler)")
+    logger.log("✅ OAGI SDK completo (AsyncDefaultAgent, TaskerAgent, constants)")
 except ImportError as e:
+    # Fallback per costanti se import fallisce
+    MODEL_ACTOR = "lux-actor-1"
+    MODEL_THINKER = "lux-thinker-1"
+    DEFAULT_MAX_STEPS = 20
+    DEFAULT_MAX_STEPS_THINKER = 100
+    DEFAULT_MAX_STEPS_TASKER = 60
+    DEFAULT_TEMPERATURE_LOW = 0.1
+    DEFAULT_STEP_DELAY = 0.3
+    DEFAULT_REFLECTION_INTERVAL = 4
+    DEFAULT_REFLECTION_INTERVAL_TASKER = 20
+    MAX_STEPS_ACTOR = 30
+    MAX_STEPS_THINKER = 120
     logger.log(f"⚠️ OAGI SDK non disponibile: {e}", "WARNING")
 
 # Google GenAI (google-genai, NOT google-generativeai)
@@ -545,32 +571,34 @@ class TaskRequest(BaseModel):
     task_description: str
     start_url: Optional[str] = None
     mode: Literal["actor", "thinker", "tasker", "gemini", "gemini_cua", "gemini_hybrid"] = "actor"
-    
+
     # API Keys (passate dalla web app)
     api_key: Optional[str] = None  # OAGI API key per Lux, oppure Gemini API key se mode=gemini
     gemini_api_key: Optional[str] = None  # Gemini API key (alternativa)
-    
-    # Lux settings (default da SDK ufficiale oagi/constants.py)
-    model: str = "lux-actor-1"
-    max_steps: int = 20              # DEFAULT_MAX_STEPS = 20 (Actor)
+
+    # Lux settings - ALLINEATI A SDK UFFICIALE oagi/constants.py
+    # NOTA: max_steps viene validato e cappato automaticamente in base al modello
+    # - actor: default 20, max 30 (MAX_STEPS_ACTOR)
+    # - thinker: default 100, max 120 (MAX_STEPS_THINKER)
+    max_steps: Optional[int] = None  # Se None, usa default in base al mode
     max_steps_per_todo: int = 60     # DEFAULT_MAX_STEPS_TASKER = 60
-    temperature: float = 0.5         # DEFAULT_TEMPERATURE = 0.5
+    temperature: float = 0.1         # DEFAULT_TEMPERATURE_LOW = 0.1 (SDK factories usano LOW!)
     step_delay: float = 0.3          # DEFAULT_STEP_DELAY = 0.3
     todos: Optional[List[str]] = None
-    
+
     # PyAutoGUI settings
     drag_duration: float = 0.5
     scroll_amount: int = 3
     wait_duration: float = 1.0
     action_pause: float = 0.1
-    
+
     # Screenshot settings
     enable_screenshot_resize: bool = True
-    
+
     # Gemini settings
     headless: bool = False
     highlight_mouse: bool = False
-    
+
     # Browser reuse settings
     reuse_browser: bool = True  # True = riusa pagina esistente, False = nuova pagina
     new_tab: bool = False  # True = apre nuova tab nello stesso browser (mantiene login)
@@ -892,6 +920,58 @@ async def open_edge_persistent(url: Optional[str] = None, wait_seconds: float = 
 
 
 # ============================================================================
+# LUX: MAX STEPS VALIDATION (SDK Hard Limits)
+# ============================================================================
+
+def get_model_for_mode(mode: str) -> str:
+    """Restituisce il modello corretto in base al mode."""
+    if mode == "thinker":
+        return MODEL_THINKER  # "lux-thinker-1"
+    return MODEL_ACTOR  # "lux-actor-1"
+
+
+def get_default_max_steps(mode: str) -> int:
+    """Restituisce il max_steps default in base al mode."""
+    if mode == "thinker":
+        return DEFAULT_MAX_STEPS_THINKER  # 100
+    return DEFAULT_MAX_STEPS  # 20
+
+
+def validate_max_steps(max_steps: Optional[int], mode: str) -> int:
+    """
+    Valida e limita max_steps secondo i limiti hard dell'SDK.
+
+    SDK Hard Limits (da oagi/constants.py):
+    - actor:   default=20, max=30  (MAX_STEPS_ACTOR)
+    - thinker: default=100, max=120 (MAX_STEPS_THINKER)
+
+    Args:
+        max_steps: valore richiesto (None = usa default)
+        mode: "actor" o "thinker"
+
+    Returns:
+        max_steps validato e cappato se necessario
+    """
+    if mode == "thinker":
+        hard_limit = MAX_STEPS_THINKER  # 120
+        default = DEFAULT_MAX_STEPS_THINKER  # 100
+    else:
+        hard_limit = MAX_STEPS_ACTOR  # 30
+        default = DEFAULT_MAX_STEPS  # 20
+
+    # Se None, usa default
+    if max_steps is None:
+        return default
+
+    # Valida contro hard limit
+    if max_steps > hard_limit:
+        logger.log(f"⚠️ max_steps ({max_steps}) supera limite per {mode}. Cap a {hard_limit}.", "WARNING")
+        return hard_limit
+
+    return max_steps
+
+
+# ============================================================================
 # LUX: COORDINATE SCALING
 # ============================================================================
 # NOTA: ResizedScreenshotMaker rimossa - ora usiamo AsyncScreenshotMaker con
@@ -961,48 +1041,108 @@ def type_via_clipboard(text: str):
 
 
 # ============================================================================
-# LUX: ACTOR/THINKER MODE EXECUTION
+# LUX: ACTOR/THINKER MODE EXECUTION (v8.0.0 - SDK Aligned)
 # ============================================================================
+
+class ExecutionContextObserver:
+    """
+    Observer custom che integra AsyncDefaultAgent con il nostro ExecutionContext.
+
+    Riceve eventi dall'SDK (StepEvent, ActionEvent) e li logga nel nostro
+    sistema di logging + report HTML.
+    """
+
+    def __init__(self, ctx: 'ExecutionContext', max_steps: int):
+        self.ctx = ctx
+        self.max_steps = max_steps
+        self.step_count = 0
+
+    async def on_event(self, event) -> None:
+        """Gestisce eventi dall'SDK e li logga nel nostro ExecutionContext."""
+        event_type = getattr(event, 'type', None)
+
+        if event_type == "step":
+            # StepEvent: LLM ha restituito una decisione
+            self.step_count = event.step_num
+            self.ctx.start_step(event.step_num, self.max_steps)
+
+            # Salva screenshot
+            if hasattr(event, 'image') and event.image:
+                self.ctx.save_screenshot(event.image, "before")
+
+            # Log reasoning
+            if hasattr(event, 'step') and event.step:
+                step = event.step
+                if hasattr(step, 'reason') and step.reason:
+                    self.ctx.log_reasoning(step.reason)
+
+        elif event_type == "action":
+            # ActionEvent: azioni sono state eseguite
+            if hasattr(event, 'actions'):
+                for action in event.actions:
+                    action_type = str(action.type.value) if hasattr(action.type, "value") else str(action.type)
+                    argument = str(action.argument) if hasattr(action, "argument") and action.argument else ""
+
+                    # Estrai coordinate se presenti
+                    coordinates = None
+                    if hasattr(action, 'coordinate') and action.coordinate:
+                        coordinates = (action.coordinate.x, action.coordinate.y)
+
+                    self.ctx.log_action(action_type, argument, coordinates)
+
+            # Log errori se presenti
+            if hasattr(event, 'error') and event.error:
+                self.ctx.log(f"⚠️ Action error: {event.error}", "WARNING")
+
+        elif event_type == "plan":
+            # PlanEvent: eventi di planning/reflection
+            if hasattr(event, 'reasoning') and event.reasoning:
+                phase = getattr(event, 'phase', 'unknown')
+                self.ctx.log(f"🧠 [{phase.upper()}] {event.reasoning}")
+
 
 async def execute_with_actor(request: TaskRequest) -> TaskResponse:
     """
-    Esegue task usando AsyncActor (per mode actor/thinker).
+    Esegue task usando AsyncDefaultAgent (SDK pattern ufficiale).
 
-    - actor: usa lux-actor-1 (veloce, meno ragionamento)
-    - thinker: usa lux-thinker-1 (più lento, più ragionamento)
+    - actor:   usa lux-actor-1 (max 30 steps, default 20)
+    - thinker: usa lux-thinker-1 (max 120 steps, default 100)
 
-    v7.5.0: Usa ExecutionContext per logging isolato con:
-    - Screenshot salvati per ogni step
-    - Reasoning di Lux catturato
-    - Report HTML automatico
+    v8.0.0: Usa AsyncDefaultAgent invece del loop manuale con AsyncActor.
+            Temperature default 0.1 (LOW), hard limits validati automaticamente.
 
-    v7.5.1: Apre automaticamente Edge con profilo persistente se start_url è fornito
+    CUSTOM FEATURES MANTENUTE:
+    - Edge persistent profile (mantiene login tra sessioni)
+    - ExecutionContext logging + HTML report
     """
     # Crea contesto isolato per questa esecuzione
     ctx = ExecutionContext(request.mode, request.task_description)
 
-    if not ASYNC_ACTOR_AVAILABLE:
-        ctx.finish(False, "AsyncActor non disponibile. Installa: pip install openagi")
+    if not ASYNC_DEFAULT_AGENT_AVAILABLE:
+        ctx.finish(False, "AsyncDefaultAgent non disponibile. Installa: pip install oagi")
         return TaskResponse(
             success=False,
-            error="AsyncActor non disponibile. Installa: pip install openagi",
+            error="AsyncDefaultAgent non disponibile. Installa: pip install oagi",
             mode_used=request.mode,
             log_file=ctx.get_log_path()
         )
 
-    # Se c'è un start_url, apri Edge con profilo persistente
+    # CUSTOM: Se c'è un start_url, apri Edge con profilo persistente
     if request.start_url:
         ctx.log(f"🌐 Apertura Edge per URL: {request.start_url}")
         browser_opened = await open_edge_persistent(request.start_url, wait_seconds=3.0)
         if not browser_opened:
             ctx.log("⚠️ Impossibile aprire Edge, Lux procederà comunque", "WARNING")
 
-    # Seleziona modello
-    model = "lux-thinker-1" if request.mode == "thinker" else "lux-actor-1"
+    # Determina modello e max_steps in base al mode (SDK pattern)
+    model = get_model_for_mode(request.mode)
+    max_steps = validate_max_steps(request.max_steps, request.mode)
 
-    ctx.log(f"LUX {request.mode.upper()} MODE - v{SERVICE_VERSION}")
+    ctx.log(f"LUX {request.mode.upper()} MODE - v{SERVICE_VERSION} (SDK Aligned)")
     ctx.log(f"Model: {model}")
-    ctx.log(f"Max steps: {request.max_steps}")
+    ctx.log(f"Max steps: {max_steps} (validated)")
+    ctx.log(f"Temperature: {request.temperature}")
+    ctx.log(f"Step delay: {request.step_delay}s")
 
     # Screen info
     if PYAUTOGUI_AVAILABLE:
@@ -1011,8 +1151,8 @@ async def execute_with_actor(request: TaskRequest) -> TaskResponse:
         ctx.log(f"Lux reference: {LUX_REF_WIDTH}x{LUX_REF_HEIGHT} (ufficiale)")
         ctx.log(f"Scale factor: {screen_width/LUX_REF_WIDTH:.2f}x, {screen_height/LUX_REF_HEIGHT:.2f}y")
 
-    step_count = 0
-    done = False
+    # Crea observer custom per logging nel nostro ExecutionContext
+    observer = ExecutionContextObserver(ctx, max_steps)
 
     try:
         # API key
@@ -1020,7 +1160,7 @@ async def execute_with_actor(request: TaskRequest) -> TaskResponse:
         if not api_key:
             raise ValueError("OAGI_API_KEY non configurata")
 
-        # Crea handlers
+        # Crea handlers (SDK pattern)
         pyautogui_config = PyautoguiConfig(
             drag_duration=request.drag_duration,
             scroll_amount=request.scroll_amount,
@@ -1044,79 +1184,32 @@ async def execute_with_actor(request: TaskRequest) -> TaskResponse:
         action_handler = AsyncPyautoguiActionHandler(config=pyautogui_config)
         ctx.log("🎮 Action handler: PyAutoGUI")
 
-        # Reset handler state
-        if RESET_HANDLER_AVAILABLE:
-            reset_handler(action_handler)
-            ctx.log("🔄 Handler state reset")
+        # Crea AsyncDefaultAgent (SDK pattern - gestisce loop, reset_handler, etc.)
+        agent = AsyncDefaultAgent(
+            api_key=api_key,
+            model=model,
+            max_steps=max_steps,
+            temperature=request.temperature,
+            step_observer=observer,
+            step_delay=request.step_delay,
+        )
 
-        # Execution loop
-        async with AsyncActor(api_key=api_key, model=model) as actor:
-            await actor.init_task(
-                task_desc=request.task_description,
-                max_steps=request.max_steps
-            )
+        ctx.log("🚀 Avvio AsyncDefaultAgent.execute()...")
 
-            while not done and step_count < request.max_steps:
-                step_count += 1
-                ctx.start_step(step_count, request.max_steps)
-
-                # Cattura screenshot
-                screenshot_b64 = await image_provider()
-
-                # Salva screenshot PRIMA dell'azione
-                ctx.save_screenshot(screenshot_b64, "before")
-
-                # Chiedi azione a Lux
-                step_result = await actor.step(screenshot_b64)
-
-                # Log reasoning (se disponibile)
-                if hasattr(step_result, 'reasoning') and step_result.reasoning:
-                    ctx.log_reasoning(step_result.reasoning)
-                elif hasattr(step_result, 'thought') and step_result.thought:
-                    ctx.log_reasoning(step_result.thought)
-
-                # Controlla se task completato
-                if step_result.stop:
-                    ctx.log("✅ Task completato!")
-                    done = True
-                    break
-
-                # Esegui azioni
-                for action in step_result.actions:
-                    action_type = str(action.type.value) if hasattr(action.type, "value") else str(action.type)
-                    argument = str(action.argument) if hasattr(action, "argument") else ""
-
-                    # Estrai coordinate se presenti
-                    coordinates = None
-                    if hasattr(action, 'x') and hasattr(action, 'y'):
-                        coordinates = (action.x, action.y)
-                    elif hasattr(action, 'coordinate') and action.coordinate:
-                        coordinates = (action.coordinate.x, action.coordinate.y)
-
-                    ctx.log_action(action_type, argument, coordinates)
-
-                    # Esegui via SDK handler
-                    await action_handler([action])
-
-                    # Delay tra azioni
-                    await asyncio.sleep(request.step_delay)
-
-                # Salva screenshot DOPO le azioni
-                screenshot_after = await image_provider()
-                ctx.save_screenshot(screenshot_after, "after")
-
-        # Reset handler state a fine
-        if RESET_HANDLER_AVAILABLE:
-            reset_handler(action_handler)
-            ctx.log("🔄 Handler state reset (fine)")
+        # Execute (SDK gestisce tutto internamente: loop, reset_handler, events)
+        success = await agent.execute(
+            instruction=request.task_description,
+            action_handler=action_handler,
+            image_provider=image_provider,
+        )
 
         # Finalizza e genera report
-        ctx.finish(done)
+        ctx.finish(success)
 
         return TaskResponse(
-            success=done,
-            message="Task completato" if done else f"Max steps ({request.max_steps}) raggiunto",
-            steps_executed=step_count,
+            success=success,
+            message="Task completato" if success else f"Max steps ({max_steps}) raggiunto",
+            steps_executed=observer.step_count,
             mode_used=request.mode,
             actions_log=ctx.steps,
             logs=ctx.get_logs(),
@@ -1135,7 +1228,7 @@ async def execute_with_actor(request: TaskRequest) -> TaskResponse:
         return TaskResponse(
             success=False,
             error=str(e),
-            steps_executed=step_count,
+            steps_executed=observer.step_count,
             mode_used=request.mode,
             logs=ctx.get_logs(),
             log_file=ctx.get_log_path(),
@@ -1144,7 +1237,7 @@ async def execute_with_actor(request: TaskRequest) -> TaskResponse:
 
 
 # ============================================================================
-# LUX: TASKER MODE EXECUTION (con Todos)
+# LUX: TASKER MODE EXECUTION (v8.0.0 - SDK Aligned)
 # ============================================================================
 
 async def execute_with_tasker(request: TaskRequest) -> TaskResponse:
@@ -1154,15 +1247,19 @@ async def execute_with_tasker(request: TaskRequest) -> TaskResponse:
     Ogni todo viene eseguito in sequenza con max_steps_per_todo step.
     Il TaskerAgent traccia quali todos sono completati.
 
-    v7.5.0: Usa ExecutionContext per logging isolato.
-    v7.5.1: Apre automaticamente Edge con profilo persistente se start_url è fornito.
+    v8.0.0: SDK Aligned - usa costanti importate da oagi.constants,
+            temperatura default 0.1 (LOW), reflection_interval da SDK.
+
+    CUSTOM FEATURES MANTENUTE:
+    - Edge persistent profile (mantiene login tra sessioni)
+    - ExecutionContext logging + HTML report
     """
     todos = request.todos or []
 
     # Crea contesto isolato per questa esecuzione
     ctx = ExecutionContext("tasker", request.task_description)
 
-    # Se c'è un start_url, apri Edge con profilo persistente
+    # CUSTOM: Se c'è un start_url, apri Edge con profilo persistente
     if request.start_url:
         ctx.log(f"🌐 Apertura Edge per URL: {request.start_url}")
         browser_opened = await open_edge_persistent(request.start_url, wait_seconds=3.0)
@@ -1170,10 +1267,10 @@ async def execute_with_tasker(request: TaskRequest) -> TaskResponse:
             ctx.log("⚠️ Impossibile aprire Edge, Lux procederà comunque", "WARNING")
 
     if not TASKER_AGENT_AVAILABLE:
-        ctx.finish(False, "TaskerAgent non disponibile. Installa: pip install openagi")
+        ctx.finish(False, "TaskerAgent non disponibile. Installa: pip install oagi")
         return TaskResponse(
             success=False,
-            error="TaskerAgent non disponibile. Installa: pip install openagi",
+            error="TaskerAgent non disponibile. Installa: pip install oagi",
             mode_used="tasker",
             log_file=ctx.get_log_path(),
             report_file=ctx.get_report_path()
@@ -1189,7 +1286,7 @@ async def execute_with_tasker(request: TaskRequest) -> TaskResponse:
             report_file=ctx.get_report_path()
         )
 
-    ctx.log(f"LUX TASKER MODE - v{SERVICE_VERSION}")
+    ctx.log(f"LUX TASKER MODE - v{SERVICE_VERSION} (SDK Aligned)")
     ctx.log(f"Todos: {len(todos)}")
     for i, todo in enumerate(todos):
         ctx.log(f"  [{i+1}] {todo[:60]}...")
@@ -1199,6 +1296,9 @@ async def execute_with_tasker(request: TaskRequest) -> TaskResponse:
         screen_width, screen_height = pyautogui.size()
         ctx.log(f"Screen reale: {screen_width}x{screen_height}")
         ctx.log(f"Lux reference: {LUX_REF_WIDTH}x{LUX_REF_HEIGHT} (ufficiale)")
+
+    # Crea observer custom per logging nel nostro ExecutionContext
+    observer = ExecutionContextObserver(ctx, request.max_steps_per_todo * len(todos))
 
     try:
         # API key
@@ -1214,20 +1314,13 @@ async def execute_with_tasker(request: TaskRequest) -> TaskResponse:
             action_pause=request.action_pause
         )
 
-        # Crea observer (opzionale)
-        observer = None
-        if ASYNC_AGENT_OBSERVER_AVAILABLE:
-            observer = AsyncAgentObserver()
-            ctx.log("📊 Observer abilitato")
-
         # Crea image provider
         if request.enable_screenshot_resize:
-            # Usa ImageConfig ufficiale dell'SDK per resize a 1260x700
             image_config = ImageConfig(
                 format="JPEG",
                 quality=85,
-                width=LUX_REF_WIDTH,   # 1260
-                height=LUX_REF_HEIGHT  # 700
+                width=LUX_REF_WIDTH,
+                height=LUX_REF_HEIGHT
             )
             image_provider = AsyncScreenshotMaker(config=image_config)
             ctx.log(f"📸 Screenshot resize: {LUX_REF_WIDTH}x{LUX_REF_HEIGHT} (SDK ufficiale)")
@@ -1239,31 +1332,23 @@ async def execute_with_tasker(request: TaskRequest) -> TaskResponse:
         action_handler = AsyncPyautoguiActionHandler(config=pyautogui_config)
         ctx.log("🎮 Action handler: PyAutoGUI")
 
-        # Reset handler state a inizio automazione (best practice SDK)
-        if RESET_HANDLER_AVAILABLE:
-            reset_handler(action_handler)
-            ctx.log("🔄 Handler state reset")
-
-        # Crea TaskerAgent con parametri da SDK (constants.py)
-        tasker_kwargs = {
-            "api_key": api_key,
-            "base_url": "https://api.agiopen.org",
-            "model": "lux-actor-1",  # Tasker usa sempre actor
-            "max_steps": request.max_steps_per_todo,         # DEFAULT_MAX_STEPS_TASKER = 60
-            "temperature": request.temperature,              # DEFAULT_TEMPERATURE = 0.5
-            "reflection_interval": 20,                       # DEFAULT_REFLECTION_INTERVAL_TASKER = 20
-        }
-
-        if observer:
-            tasker_kwargs["step_observer"] = observer
-
+        # Crea TaskerAgent con parametri SDK (costanti importate)
         ctx.log(f"Creating TaskerAgent:")
-        ctx.log(f"  model: lux-actor-1")
-        ctx.log(f"  max_steps_per_todo: {request.max_steps_per_todo}")
-        ctx.log(f"  temperature: {request.temperature}")
-        ctx.log(f"  reflection_interval: 20")
+        ctx.log(f"  model: {MODEL_ACTOR}")
+        ctx.log(f"  max_steps_per_todo: {request.max_steps_per_todo} (SDK default: {DEFAULT_MAX_STEPS_TASKER})")
+        ctx.log(f"  temperature: {request.temperature} (SDK LOW: {DEFAULT_TEMPERATURE_LOW})")
+        ctx.log(f"  reflection_interval: {DEFAULT_REFLECTION_INTERVAL_TASKER}")
+        ctx.log(f"  step_delay: {request.step_delay}s")
 
-        tasker = TaskerAgent(**tasker_kwargs)
+        tasker = TaskerAgent(
+            api_key=api_key,
+            model=MODEL_ACTOR,  # Tasker usa sempre actor (SDK)
+            max_steps=request.max_steps_per_todo,
+            temperature=request.temperature,
+            reflection_interval=DEFAULT_REFLECTION_INTERVAL_TASKER,  # 20 (SDK)
+            step_observer=observer,
+            step_delay=request.step_delay,
+        )
 
         # Set task e todos
         tasker.set_task(
@@ -1271,11 +1356,11 @@ async def execute_with_tasker(request: TaskRequest) -> TaskResponse:
             todos=todos
         )
 
-        ctx.log("🚀 Avvio esecuzione TaskerAgent...")
+        ctx.log("🚀 Avvio TaskerAgent.execute()...")
 
-        # Esegui
+        # Esegui (SDK gestisce reset_handler internamente)
         success = await tasker.execute(
-            instruction="",  # Task già impostato via set_task
+            instruction=request.task_description,  # Passa instruction per compatibilità
             action_handler=action_handler,
             image_provider=image_provider
         )
@@ -1287,7 +1372,8 @@ async def execute_with_tasker(request: TaskRequest) -> TaskResponse:
         try:
             memory = tasker.get_memory()
             if memory:
-                ctx.log(f"📋 Summary: {memory.task_execution_summary}")
+                if memory.task_execution_summary:
+                    ctx.log(f"📋 Summary: {memory.task_execution_summary}")
 
                 for i, todo_mem in enumerate(memory.todos):
                     status = todo_mem.status.value if hasattr(todo_mem.status, 'value') else str(todo_mem.status)
@@ -1303,27 +1389,13 @@ async def execute_with_tasker(request: TaskRequest) -> TaskResponse:
             ctx.log(f"⚠️ Memory non disponibile: {mem_err}", "WARNING")
             completed_todos = len(todos) if success else 0
 
-        # Esporta report observer (oltre al nostro report HTML)
-        if observer:
-            try:
-                observer_file = ctx.execution_dir / "observer_history.html"
-                observer.export("html", str(observer_file))
-                ctx.log(f"📊 Observer report: {observer_file}")
-            except Exception as obs_err:
-                ctx.log(f"⚠️ Export observer fallito: {obs_err}", "WARNING")
-
-        # Reset handler state a fine automazione (best practice SDK)
-        if RESET_HANDLER_AVAILABLE:
-            reset_handler(action_handler)
-            ctx.log("🔄 Handler state reset (fine)")
-
         # Finalizza e genera report
         ctx.finish(success)
 
         return TaskResponse(
             success=success,
             message=f"Completati {completed_todos}/{len(todos)} todos",
-            steps_executed=request.max_steps_per_todo * len(todos),
+            steps_executed=observer.step_count,
             completed_todos=completed_todos,
             total_todos=len(todos),
             mode_used="tasker",
