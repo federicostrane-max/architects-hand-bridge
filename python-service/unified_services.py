@@ -13,6 +13,7 @@ Funzionalità:
 3. Riavvia automaticamente se crashano
 4. Singolo entry point per Claude Launcher
 5. Graceful shutdown quando il processo padre termina
+6. AUTO-CLEANUP: Libera automaticamente le porte occupate prima dell'avvio
 
 Uso:
     python unified_services.py [--no-tool-server] [--no-tasker]
@@ -30,15 +31,17 @@ import os
 import time
 import argparse
 import logging
+import socket
+import psutil
 from pathlib import Path
-from typing import Optional, Dict
+from typing import Optional, Dict, List, Tuple
 import aiohttp
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"  # Aggiunto auto-cleanup porte
 
 # Percorsi dei servizi (nella stessa directory di questo script)
 SCRIPT_DIR = Path(__file__).parent.absolute()
@@ -79,6 +82,132 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# ============================================================================
+# PORT UTILITIES - Verifica e pulizia porte occupate
+# ============================================================================
+
+def is_port_in_use(port: int) -> bool:
+    """Verifica se una porta è in uso."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(('127.0.0.1', port))
+            return False
+        except OSError:
+            return True
+
+
+def get_process_using_port(port: int) -> Optional[Tuple[int, str, str]]:
+    """
+    Trova il processo che sta usando una porta specifica.
+    Ritorna (pid, name, cmdline) oppure None.
+    """
+    try:
+        for conn in psutil.net_connections(kind='inet'):
+            if conn.laddr.port == port and conn.status == 'LISTEN':
+                try:
+                    proc = psutil.Process(conn.pid)
+                    cmdline = ' '.join(proc.cmdline()) if proc.cmdline() else proc.name()
+                    return (conn.pid, proc.name(), cmdline)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    return (conn.pid, "unknown", "unknown")
+    except Exception as e:
+        logger.warning(f"Errore nel trovare processo su porta {port}: {e}")
+    return None
+
+
+def kill_process_on_port(port: int, force: bool = False) -> bool:
+    """
+    Termina il processo che sta usando una porta.
+
+    Args:
+        port: La porta da liberare
+        force: Se True, usa SIGKILL invece di SIGTERM
+
+    Returns:
+        True se la porta è stata liberata, False altrimenti
+    """
+    proc_info = get_process_using_port(port)
+
+    if not proc_info:
+        logger.info(f"[Port {port}] Nessun processo in ascolto")
+        return True
+
+    pid, name, cmdline = proc_info
+    logger.info(f"[Port {port}] Trovato processo PID {pid} ({name})")
+    logger.info(f"[Port {port}] Cmdline: {cmdline[:100]}...")
+
+    try:
+        proc = psutil.Process(pid)
+
+        # Prima prova con SIGTERM (graceful)
+        logger.info(f"[Port {port}] Invio SIGTERM a PID {pid}")
+        proc.terminate()
+
+        # Attendi fino a 5 secondi
+        try:
+            proc.wait(timeout=5)
+            logger.info(f"[Port {port}] Processo {pid} terminato gracefully")
+        except psutil.TimeoutExpired:
+            if force:
+                logger.warning(f"[Port {port}] Timeout, invio SIGKILL a PID {pid}")
+                proc.kill()
+                proc.wait(timeout=3)
+                logger.info(f"[Port {port}] Processo {pid} terminato forzatamente")
+            else:
+                logger.warning(f"[Port {port}] Processo {pid} non risponde a SIGTERM")
+                return False
+
+        # Verifica che la porta sia libera
+        time.sleep(0.5)  # Attendi che il SO rilasci la porta
+        if is_port_in_use(port):
+            logger.warning(f"[Port {port}] Porta ancora in uso dopo kill")
+            return False
+
+        logger.info(f"[Port {port}] ✅ Porta liberata con successo")
+        return True
+
+    except psutil.NoSuchProcess:
+        logger.info(f"[Port {port}] Processo {pid} non esiste più")
+        return True
+    except psutil.AccessDenied:
+        logger.error(f"[Port {port}] Accesso negato per terminare PID {pid}")
+        return False
+    except Exception as e:
+        logger.error(f"[Port {port}] Errore terminando processo: {e}")
+        return False
+
+
+def cleanup_ports(ports: List[int], force: bool = True) -> Dict[int, bool]:
+    """
+    Libera una lista di porte se occupate.
+
+    Args:
+        ports: Lista di porte da controllare/liberare
+        force: Se True, forza la terminazione se SIGTERM non funziona
+
+    Returns:
+        Dict con porta -> True/False (liberata/fallita)
+    """
+    results = {}
+
+    logger.info(f"=== Verifica porte: {ports} ===")
+
+    for port in ports:
+        if is_port_in_use(port):
+            logger.warning(f"[Port {port}] ⚠️ OCCUPATA - tentativo di liberarla...")
+            results[port] = kill_process_on_port(port, force=force)
+        else:
+            logger.info(f"[Port {port}] ✅ Libera")
+            results[port] = True
+
+    # Riepilogo
+    freed = sum(1 for r in results.values() if r)
+    blocked = sum(1 for r in results.values() if not r)
+    logger.info(f"=== Riepilogo porte: {freed} libere, {blocked} bloccate ===")
+
+    return results
+
 
 # ============================================================================
 # SERVICE MANAGER
@@ -194,7 +323,23 @@ class UnifiedServiceManager:
         logger.info(f"=== Unified Services Launcher v{VERSION} ===")
         logger.info(f"Servizi da avviare: {len(self.services)}")
 
+        # FASE 1: Libera le porte occupate prima di avviare i servizi
+        ports_to_check = [s.port for s in self.services.values()]
+        port_results = cleanup_ports(ports_to_check, force=True)
+
+        # Verifica che tutte le porte siano state liberate
+        blocked_ports = [p for p, ok in port_results.items() if not ok]
+        if blocked_ports:
+            logger.error(f"⚠️ Impossibile liberare porte: {blocked_ports}")
+            logger.error("Alcuni servizi potrebbero non avviarsi correttamente")
+
+        # FASE 2: Avvia i servizi
         for service_id, service in self.services.items():
+            # Salta se la porta non è stata liberata
+            if service.port in blocked_ports:
+                logger.error(f"[{service.name}] Skipped - porta {service.port} bloccata")
+                continue
+
             if service.start():
                 # Attendi che il servizio sia pronto
                 await self._wait_for_service(service)
@@ -247,6 +392,13 @@ class UnifiedServiceManager:
         logger.info(f"[{service.name}] Tentativo restart {service.restart_count}/{MAX_RESTART_ATTEMPTS}")
 
         await asyncio.sleep(RESTART_DELAY)
+
+        # Verifica e libera la porta prima del restart
+        if is_port_in_use(service.port):
+            logger.warning(f"[{service.name}] Porta {service.port} ancora occupata, tento di liberarla...")
+            if not kill_process_on_port(service.port, force=True):
+                logger.error(f"[{service.name}] Impossibile liberare porta {service.port}")
+                return
 
         if service.start():
             await self._wait_for_service(service)
