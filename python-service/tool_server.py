@@ -372,6 +372,78 @@ def stop_claude_launcher():
 atexit.register(stop_claude_launcher)
 
 # ============================================================================
+# CLAWDBOT POPUP MESSAGES
+# ============================================================================
+
+# Active session ID for Clawdbot messages (set when browser session starts)
+CLAWDBOT_ACTIVE_SESSION_ID: Optional[str] = None
+
+def send_clawdbot_message(text: str, msg_type: Literal["info", "success", "error"] = "info") -> bool:
+    """
+    Send a message to Claude Launcher's Clawdbot popup.
+
+    Messages are formatted as:
+    - [Clawdbot] text       -> info (→)
+    - [Clawdbot OK] text    -> success (✓)
+    - [Clawdbot ERROR] text -> error (✗)
+
+    The Claude Launcher intercepts these and shows them in a dedicated popup.
+    """
+    global CLAWDBOT_ACTIVE_SESSION_ID
+
+    if not CLAWDBOT_ACTIVE_SESSION_ID:
+        # Try to get active session from Claude Launcher
+        try:
+            resp = requests.get(
+                f"http://localhost:{CLAUDE_LAUNCHER_PORT}/api/sessions",
+                timeout=2
+            )
+            if resp.status_code == 200:
+                sessions = resp.json().get("sessions", [])
+                # Find first active session
+                for s in sessions:
+                    if s.get("status") == "ready":
+                        CLAWDBOT_ACTIVE_SESSION_ID = s.get("id")
+                        break
+        except Exception as e:
+            logger.debug(f"Could not get active session: {e}")
+            return False
+
+    if not CLAWDBOT_ACTIVE_SESSION_ID:
+        logger.debug("No active Claude Launcher session for Clawdbot messages")
+        return False
+
+    # Format message based on type
+    if msg_type == "success":
+        formatted = f"[Clawdbot OK] {text}"
+    elif msg_type == "error":
+        formatted = f"[Clawdbot ERROR] {text}"
+    else:
+        formatted = f"[Clawdbot] {text}"
+
+    try:
+        resp = requests.post(
+            f"http://localhost:{CLAUDE_LAUNCHER_PORT}/api/sessions/{CLAWDBOT_ACTIVE_SESSION_ID}/message",
+            json={"message": formatted},
+            timeout=5
+        )
+        if resp.status_code == 200:
+            logger.debug(f"Clawdbot message sent: {formatted[:50]}...")
+            return True
+        else:
+            logger.warning(f"Clawdbot message failed: {resp.status_code}")
+            return False
+    except Exception as e:
+        logger.debug(f"Could not send Clawdbot message: {e}")
+        return False
+
+def set_clawdbot_session(session_id: str):
+    """Set the active session ID for Clawdbot messages"""
+    global CLAWDBOT_ACTIVE_SESSION_ID
+    CLAWDBOT_ACTIVE_SESSION_ID = session_id
+    logger.info(f"🔗 Clawdbot session set: {session_id}")
+
+# ============================================================================
 # NGROK TUNNEL
 # ============================================================================
 
@@ -1690,10 +1762,15 @@ async def do_click(req: ClickRequest):
         if req.scope == "browser":
             session = session_manager.get_session(req.session_id) if req.session_id else session_manager.get_active_session()
             if not session or not session.is_alive():
+                send_clawdbot_message("No active browser session", "error")
                 return ActionResponse(success=False, error="No active browser session")
 
             if req.coordinate_origin == "normalized":
                 x, y = CoordinateConverter.normalized_to_viewport(x, y)
+
+            # Send Clawdbot message before click
+            click_desc = f"{req.click_type} click" if req.click_type != "single" else "click"
+            send_clawdbot_message(f"Clicking at ({x}, {y})...")
 
             if req.click_type == "double":
                 await session.page.mouse.dblclick(x, y)
@@ -1705,6 +1782,7 @@ async def do_click(req: ClickRequest):
                 await session.page.mouse.click(x, y)
 
             logger.info(f"🖱️ Click: ({x}, {y}) [{req.click_type}]")
+            send_clawdbot_message(f"Clicked at ({x}, {y})", "success")
             response = ActionResponse(success=True, executed_with="playwright", details={"x": x, "y": y, "click_type": req.click_type})
 
         elif req.scope == "desktop" and PYAUTOGUI_AVAILABLE:
@@ -1753,11 +1831,18 @@ async def do_type(req: TypeRequest):
         if req.scope == "browser":
             session = session_manager.get_session(req.session_id) if req.session_id else session_manager.get_active_session()
             if not session or not session.is_alive():
+                send_clawdbot_message("No active browser session", "error")
                 return ActionResponse(success=False, error="No active browser session")
+
+            # Send Clawdbot message before typing
+            text_preview = req.text[:30] + "..." if len(req.text) > 30 else req.text
+            send_clawdbot_message(f"Typing: \"{text_preview}\"...")
+
             if req.selector:
                 await session.page.click(req.selector)
             await session.page.keyboard.type(req.text, delay=50)
             logger.info(f"⌨️ Type: '{req.text[:20]}...'")
+            send_clawdbot_message(f"Typed {len(req.text)} characters", "success")
             response = ActionResponse(success=True, executed_with="playwright")
         elif req.scope == "desktop" and PYAUTOGUI_AVAILABLE:
             type_via_clipboard(req.text) if req.method == "clipboard" else pyautogui.typewrite(req.text)
@@ -1952,13 +2037,19 @@ async def do_click_by_ref(req: ClickByRefRequest):
     try:
         session = session_manager.get_session(req.session_id)
         if not session or not session.is_alive():
+            send_clawdbot_message("Session not found", "error")
             return ActionResponse(success=False, error="Session not found")
 
         element = session.get_element_by_ref(req.ref)
         if not element:
+            send_clawdbot_message(f"Element ref '{req.ref}' not found", "error")
             return ActionResponse(success=False, error=f"Ref '{req.ref}' not found. Call /browser/dom/tree first to get fresh refs.")
 
         x, y = element['x'], element['y']
+
+        # Send Clawdbot message with element info
+        element_name = element.get('name', element.get('role', 'element'))[:40]
+        send_clawdbot_message(f"Clicking: {element_name} (ref={req.ref})...")
 
         async def click_action():
             if req.click_type == "double":
@@ -1973,6 +2064,7 @@ async def do_click_by_ref(req: ClickByRefRequest):
         await _retry_with_backoff(click_action)
 
         logger.info(f"🖱️ Click by ref: {req.ref} → ({x}, {y}) [{req.click_type}]")
+        send_clawdbot_message(f"Clicked: {element_name}", "success")
         response = ActionResponse(
             success=True,
             executed_with="playwright",
@@ -2268,7 +2360,10 @@ async def browser_snapshot(session_id: str = Query(...), format: str = Query("te
 @app.post("/browser/start")
 async def browser_start(req: BrowserStartRequest):
     if not PLAYWRIGHT_AVAILABLE:
+        send_clawdbot_message("Playwright not available", "error")
         raise HTTPException(500, "Playwright not available")
+
+    send_clawdbot_message(f"Starting browser session...")
     sid = await session_manager.create_session(req.start_url, req.headless)
     session = session_manager.get_session(sid)
 
@@ -2287,6 +2382,9 @@ async def browser_start(req: BrowserStartRequest):
         response["snapshot_title"] = snap_title
         response["snapshot_ref_count"] = snap_count
 
+    start_url = req.start_url or "about:blank"
+    send_clawdbot_message(f"Browser ready: {start_url}", "success")
+
     return response
 
 @app.post("/browser/stop")
@@ -2304,20 +2402,32 @@ async def browser_status(session_id: Optional[str] = None):
 async def browser_navigate(req: NavigateRequest):
     session = session_manager.get_session(req.session_id)
     if not session or not session.is_alive():
+        send_clawdbot_message(f"Session not found", "error")
         return {"success": False, "error": "Session not found"}
-    await session.page.goto(req.url, wait_until="domcontentloaded", timeout=30000)
-    logger.info(f"🌐 Navigate: {req.url}")
 
-    response = {"success": True, "url": session.page.url}
+    # Send Clawdbot message before navigation
+    send_clawdbot_message(f"Navigating to {req.url}...")
 
-    # v10.2.0: ALWAYS include snapshot for browser actions
-    snap, snap_url, snap_title, snap_count = await take_auto_snapshot(session)
-    response["snapshot"] = snap
-    response["snapshot_url"] = snap_url
-    response["snapshot_title"] = snap_title
-    response["snapshot_ref_count"] = snap_count
+    try:
+        await session.page.goto(req.url, wait_until="domcontentloaded", timeout=30000)
+        logger.info(f"🌐 Navigate: {req.url}")
 
-    return response
+        response = {"success": True, "url": session.page.url}
+
+        # v10.2.0: ALWAYS include snapshot for browser actions
+        snap, snap_url, snap_title, snap_count = await take_auto_snapshot(session)
+        response["snapshot"] = snap
+        response["snapshot_url"] = snap_url
+        response["snapshot_title"] = snap_title
+        response["snapshot_ref_count"] = snap_count
+
+        # Send success message with page title
+        send_clawdbot_message(f"Page loaded: {snap_title or session.page.url}", "success")
+
+        return response
+    except Exception as e:
+        send_clawdbot_message(f"Navigation failed: {str(e)[:100]}", "error")
+        raise
 
 @app.post("/browser/reload")
 async def browser_reload(session_id: str = Query(...)):
