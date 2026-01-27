@@ -121,6 +121,10 @@ class ExecutionContext:
     Risolve race condition: ogni task ha il suo logger/directory.
     """
 
+    # Claude Launcher API configuration (for popup notifications)
+    LAUNCHER_API_URL = "http://localhost:3847/api"
+    LAUNCHER_ENABLED = True  # Set to False to disable popup notifications
+
     def __init__(self, mode: str, task_description: str):
         self.mode = mode
         self.task_description = task_description
@@ -134,6 +138,7 @@ class ExecutionContext:
         # Files
         self.log_file = self.execution_dir / "execution.log"
         self.report_file = self.execution_dir / "report.html"
+        self.actions_file = self.execution_dir / "actions.json"  # Real-time actions for web app
         self.screenshots_dir = self.execution_dir / "screenshots"
         self.screenshots_dir.mkdir(exist_ok=True)
 
@@ -144,8 +149,17 @@ class ExecutionContext:
         self.success = False
         self.error: Optional[str] = None
 
+        # Launcher session (for popup)
+        self._launcher_session_id: Optional[str] = None
+
         # Scrivi header
         self._write_header()
+
+        # Initialize actions.json
+        self._init_actions_file()
+
+        # Send start message to popup
+        self.send_lux_message(f"🚀 Avvio task: {task_description[:50]}...", "info")
 
     def _write_header(self):
         header = [
@@ -162,6 +176,108 @@ class ExecutionContext:
         with open(self.log_file, 'w', encoding='utf-8') as f:
             f.write('\n'.join(header))
         self.log(f"📁 Execution directory: {self.execution_dir}")
+
+    def _init_actions_file(self):
+        """Initialize actions.json file for real-time tracking (web app use)"""
+        initial_data = {
+            "execution_id": self.execution_id,
+            "mode": self.mode,
+            "task": self.task_description,
+            "start_time": self.start_time.isoformat(),
+            "status": "running",
+            "actions": []
+        }
+        try:
+            with open(self.actions_file, 'w', encoding='utf-8') as f:
+                json.dump(initial_data, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"[WARN] Failed to init actions.json: {e}")
+
+    def _save_action(self, action_type: str, details: dict):
+        """Save action to actions.json in real-time"""
+        try:
+            # Read current data
+            if self.actions_file.exists():
+                with open(self.actions_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+            else:
+                data = {"actions": []}
+
+            # Add new action
+            action = {
+                "step": self.current_step,
+                "timestamp": datetime.now().isoformat(),
+                "action_type": action_type,
+                **details
+            }
+            data["actions"].append(action)
+            data["last_update"] = datetime.now().isoformat()
+
+            # Write back
+            with open(self.actions_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"[WARN] Failed to save action to actions.json: {e}")
+
+    def send_lux_message(self, text: str, msg_type: Literal["info", "action", "error", "success", "warning"] = "info"):
+        """
+        Send a message to Claude Launcher's Tool Popup system.
+        The message will appear in the Lux popup (if visible).
+        Note: This is for web app integration - desktop popup may cover screen during Lux operation.
+        """
+        if not self.LAUNCHER_ENABLED:
+            return
+
+        try:
+            import urllib.request
+            import urllib.error
+
+            # Discover active session if not cached
+            if not self._launcher_session_id:
+                try:
+                    req = urllib.request.Request(f"{self.LAUNCHER_API_URL}/sessions")
+                    req.add_header("Content-Type", "application/json")
+                    with urllib.request.urlopen(req, timeout=1) as response:
+                        sessions = json.loads(response.read().decode())
+                        # Find first running session
+                        for sid, info in sessions.items():
+                            if info.get("status") == "running":
+                                self._launcher_session_id = sid
+                                break
+                except:
+                    # No session found, use execution_id
+                    self._launcher_session_id = self.execution_id
+
+            # Format message as [Lux] prefix for Tool pattern matching
+            if msg_type == "success":
+                formatted_text = f"[Lux OK] {text}"
+            elif msg_type == "error":
+                formatted_text = f"[Lux ERROR] {text}"
+            elif msg_type == "warning":
+                formatted_text = f"[Lux WARNING] {text}"
+            elif msg_type == "action":
+                formatted_text = f"[Lux ACTION] {text}"
+            else:
+                formatted_text = f"[Lux] {text}"
+
+            # Send to /sessions/{id}/input endpoint
+            payload = {
+                "input": formatted_text
+            }
+
+            req = urllib.request.Request(
+                f"{self.LAUNCHER_API_URL}/sessions/{self._launcher_session_id}/input",
+                data=json.dumps(payload).encode('utf-8'),
+                method='POST'
+            )
+            req.add_header("Content-Type", "application/json")
+
+            with urllib.request.urlopen(req, timeout=2) as response:
+                pass  # Fire and forget
+
+        except Exception as e:
+            # Silent fail - don't interrupt execution for popup errors
+            pass
 
     def log(self, message: str, level: str = "INFO"):
         """Log con timestamp - scrive su file E console"""
@@ -182,6 +298,9 @@ class ExecutionContext:
         self.log(f"\n{'='*60}")
         self.log(f"STEP {step_num}/{max_steps}")
         self.log(f"{'='*60}")
+
+        # Send step start to popup
+        self.send_lux_message(f"Step {step_num}/{max_steps}", "info")
 
     def log_reasoning(self, reasoning: str):
         """Log del reasoning di Lux"""
@@ -211,6 +330,18 @@ class ExecutionContext:
             "timestamp": datetime.now().isoformat()
         }
         self.steps.append(step_data)
+
+        # Save to actions.json for web app
+        self._save_action(action_type, {
+            "argument": argument,
+            "coordinates": {"x": coordinates[0], "y": coordinates[1]} if coordinates else None
+        })
+
+        # Send to popup (action type message)
+        action_text = f"Step {self.current_step}: {action_type}"
+        if argument:
+            action_text += f" - {argument[:40]}{'...' if len(argument) > 40 else ''}"
+        self.send_lux_message(action_text, "action")
 
     def save_screenshot(self, screenshot_data, label: str = "") -> Optional[str]:
         """
@@ -285,11 +416,34 @@ class ExecutionContext:
             self.log(f"Error: {error}")
         self.log("=" * 80)
 
+        # Update actions.json with final status
+        try:
+            if self.actions_file.exists():
+                with open(self.actions_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                data["status"] = "completed" if success else "failed"
+                data["end_time"] = end_time.isoformat()
+                data["duration_seconds"] = duration
+                data["total_steps"] = len(self.steps)
+                if error:
+                    data["error"] = error
+                with open(self.actions_file, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"[WARN] Failed to update actions.json: {e}")
+
         # Genera report HTML
         self._generate_html_report(duration)
 
+        # Send final message to popup
+        if success:
+            self.send_lux_message(f"✅ Task completato in {duration:.1f}s ({len(self.steps)} steps)", "success")
+        else:
+            self.send_lux_message(f"❌ Task fallito: {error or 'Unknown error'}", "error")
+
         print(f"\n📄 Log: {self.log_file}")
-        print(f"📊 Report: {self.report_file}\n")
+        print(f"📊 Report: {self.report_file}")
+        print(f"📋 Actions: {self.actions_file}\n")
 
     def _generate_html_report(self, duration: float):
         """Genera report HTML dettagliato"""
@@ -495,6 +649,7 @@ except ImportError:
 # OpenAGI Lux SDK (oagi)
 OAGI_AVAILABLE = False
 ASYNC_DEFAULT_AGENT_AVAILABLE = False
+ASYNC_ACTOR_AVAILABLE = False  # Alias per retrocompatibilità
 TASKER_AGENT_AVAILABLE = False
 ASYNC_AGENT_OBSERVER_AVAILABLE = False
 
@@ -523,6 +678,7 @@ try:
         MAX_STEPS_THINKER,
     )
     ASYNC_DEFAULT_AGENT_AVAILABLE = True
+    ASYNC_ACTOR_AVAILABLE = True  # Alias per retrocompatibilità
     TASKER_AGENT_AVAILABLE = True
     ASYNC_AGENT_OBSERVER_AVAILABLE = True
     OAGI_AVAILABLE = True
@@ -2450,6 +2606,141 @@ async def browser_status():
 @app.get("/screen")
 async def get_screen():
     return get_screen_info()
+
+
+# ============================================================================
+# LUX ACTIONS API (for web app integration)
+# ============================================================================
+
+@app.get("/lux/executions")
+async def list_executions(limit: int = 10):
+    """
+    List recent Lux executions for web app.
+    Returns execution IDs sorted by date (newest first).
+    """
+    try:
+        executions = []
+        for exec_dir in sorted(EXECUTION_LOGS_DIR.iterdir(), reverse=True):
+            if exec_dir.is_dir():
+                actions_file = exec_dir / "actions.json"
+                if actions_file.exists():
+                    try:
+                        with open(actions_file, 'r', encoding='utf-8') as f:
+                            data = json.load(f)
+                        executions.append({
+                            "execution_id": data.get("execution_id", exec_dir.name),
+                            "mode": data.get("mode"),
+                            "task": data.get("task", "")[:100],
+                            "status": data.get("status", "unknown"),
+                            "start_time": data.get("start_time"),
+                            "duration_seconds": data.get("duration_seconds"),
+                            "total_steps": data.get("total_steps", len(data.get("actions", [])))
+                        })
+                    except:
+                        pass
+                if len(executions) >= limit:
+                    break
+        return {"executions": executions}
+    except Exception as e:
+        return {"executions": [], "error": str(e)}
+
+
+@app.get("/lux/execution/{execution_id}")
+async def get_execution(execution_id: str):
+    """
+    Get details of a specific Lux execution.
+    Includes all actions for the web app to display.
+    """
+    try:
+        exec_dir = EXECUTION_LOGS_DIR / execution_id
+        if not exec_dir.exists():
+            raise HTTPException(status_code=404, detail="Execution not found")
+
+        actions_file = exec_dir / "actions.json"
+        if not actions_file.exists():
+            raise HTTPException(status_code=404, detail="Actions file not found")
+
+        with open(actions_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+
+        # Add screenshot paths (relative to execution dir)
+        screenshots_dir = exec_dir / "screenshots"
+        if screenshots_dir.exists():
+            data["screenshots"] = [f.name for f in screenshots_dir.iterdir() if f.suffix == '.png']
+
+        # Add report path if exists
+        report_file = exec_dir / "report.html"
+        if report_file.exists():
+            data["report_path"] = str(report_file)
+
+        return data
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/lux/execution/{execution_id}/actions")
+async def get_execution_actions(execution_id: str, since_step: int = 0):
+    """
+    Get actions for real-time polling.
+    Use since_step to get only new actions (for efficient polling).
+    """
+    try:
+        exec_dir = EXECUTION_LOGS_DIR / execution_id
+        actions_file = exec_dir / "actions.json"
+
+        if not actions_file.exists():
+            raise HTTPException(status_code=404, detail="Execution not found")
+
+        with open(actions_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+
+        actions = data.get("actions", [])
+        # Filter to only new actions
+        new_actions = [a for a in actions if a.get("step", 0) > since_step]
+
+        return {
+            "status": data.get("status", "unknown"),
+            "total_actions": len(actions),
+            "new_actions": new_actions,
+            "last_update": data.get("last_update")
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/lux/current")
+async def get_current_execution():
+    """
+    Get the currently running execution (if any).
+    Useful for web app to auto-connect to ongoing task.
+    """
+    try:
+        # Find most recent running execution
+        for exec_dir in sorted(EXECUTION_LOGS_DIR.iterdir(), reverse=True):
+            if exec_dir.is_dir():
+                actions_file = exec_dir / "actions.json"
+                if actions_file.exists():
+                    try:
+                        with open(actions_file, 'r', encoding='utf-8') as f:
+                            data = json.load(f)
+                        if data.get("status") == "running":
+                            return {
+                                "running": True,
+                                "execution_id": data.get("execution_id", exec_dir.name),
+                                "mode": data.get("mode"),
+                                "task": data.get("task"),
+                                "start_time": data.get("start_time"),
+                                "actions_count": len(data.get("actions", []))
+                            }
+                    except:
+                        pass
+        return {"running": False}
+    except Exception as e:
+        return {"running": False, "error": str(e)}
 
 
 # ============================================================================
