@@ -41,7 +41,7 @@ import aiohttp
 # CONFIGURATION
 # ============================================================================
 
-VERSION = "1.1.0"  # Aggiunto auto-cleanup porte
+VERSION = "1.2.0"  # Aumentato timeout avvio per ngrok
 
 # Percorsi dei servizi (nella stessa directory di questo script)
 SCRIPT_DIR = Path(__file__).parent.absolute()
@@ -52,14 +52,16 @@ SERVICES = {
         "script": SCRIPT_DIR / "tool_server.py",
         "port": 8766,
         "health_endpoint": "/",
-        "enabled": True
+        "enabled": True,
+        "startup_timeout": 60  # Tool Server ha bisogno di più tempo per ngrok
     },
     "tasker_service": {
         "name": "Tasker Service",
         "script": SCRIPT_DIR / "tasker_service.py",
         "port": 8765,
         "health_endpoint": "/status",
-        "enabled": True
+        "enabled": True,
+        "startup_timeout": 30  # Tasker Service si avvia velocemente
     }
 }
 
@@ -68,6 +70,7 @@ HEALTH_CHECK_INTERVAL = 10  # secondi tra health check
 HEALTH_CHECK_TIMEOUT = 5    # timeout per singola richiesta
 MAX_RESTART_ATTEMPTS = 3    # tentativi massimi di restart
 RESTART_DELAY = 2           # secondi tra restart
+DEFAULT_STARTUP_TIMEOUT = 30  # timeout default per avvio servizi
 
 # Logging setup
 LOG_DIR = Path.home() / ".claude-launcher"
@@ -222,6 +225,7 @@ class ServiceProcess:
         self.script = config["script"]
         self.port = config["port"]
         self.health_endpoint = config["health_endpoint"]
+        self.startup_timeout = config.get("startup_timeout", DEFAULT_STARTUP_TIMEOUT)
         self.process: Optional[subprocess.Popen] = None
         self.restart_count = 0
         self.last_health_check: Optional[float] = None
@@ -346,15 +350,25 @@ class UnifiedServiceManager:
             else:
                 logger.error(f"Impossibile avviare {service.name}")
 
-    async def _wait_for_service(self, service: ServiceProcess, timeout: int = 30):
-        """Attende che un servizio sia pronto."""
+    async def _wait_for_service(self, service: ServiceProcess, timeout: int = None):
+        """Attende che un servizio sia pronto.
+
+        Args:
+            service: Il servizio da attendere
+            timeout: Timeout in secondi (default: usa startup_timeout del servizio)
+        """
+        if timeout is None:
+            timeout = service.startup_timeout
+
+        logger.info(f"[{service.name}] Attesa avvio (timeout: {timeout}s)...")
         start_time = time.time()
         while time.time() - start_time < timeout:
             if await service.health_check():
-                logger.info(f"[{service.name}] Pronto e funzionante")
+                elapsed = int(time.time() - start_time)
+                logger.info(f"[{service.name}] ✅ Pronto e funzionante (avviato in {elapsed}s)")
                 return True
             await asyncio.sleep(1)
-        logger.warning(f"[{service.name}] Timeout attesa avvio")
+        logger.warning(f"[{service.name}] ⚠️ Timeout attesa avvio ({timeout}s)")
         return False
 
     async def monitor_loop(self):
