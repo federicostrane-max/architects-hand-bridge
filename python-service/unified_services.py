@@ -41,7 +41,7 @@ import aiohttp
 # CONFIGURATION
 # ============================================================================
 
-VERSION = "1.2.0"  # Aumentato timeout avvio per ngrok
+VERSION = "1.3.0"  # Aggiunto cleanup ngrok zombie sessions
 
 # Percorsi dei servizi (nella stessa directory di questo script)
 SCRIPT_DIR = Path(__file__).parent.absolute()
@@ -179,6 +179,38 @@ def kill_process_on_port(port: int, force: bool = False) -> bool:
     except Exception as e:
         logger.error(f"[Port {port}] Errore terminando processo: {e}")
         return False
+
+
+def cleanup_ngrok_sessions() -> int:
+    """
+    Termina tutti i processi ngrok zombie per liberare sessioni.
+
+    Returns:
+        Numero di processi ngrok terminati
+    """
+    killed = 0
+    try:
+        for proc in psutil.process_iter(['pid', 'name']):
+            try:
+                if proc.info['name'] and 'ngrok' in proc.info['name'].lower():
+                    logger.info(f"[ngrok] Trovato processo zombie PID {proc.info['pid']}")
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=3)
+                    except psutil.TimeoutExpired:
+                        proc.kill()
+                    killed += 1
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+    except Exception as e:
+        logger.warning(f"[ngrok] Errore durante cleanup: {e}")
+
+    if killed > 0:
+        logger.info(f"[ngrok] ✅ Terminati {killed} processi zombie")
+    else:
+        logger.info("[ngrok] Nessun processo zombie trovato")
+
+    return killed
 
 
 def cleanup_ports(ports: List[int], force: bool = True) -> Dict[int, bool]:
@@ -326,6 +358,9 @@ class UnifiedServiceManager:
         """Avvia tutti i servizi configurati."""
         logger.info(f"=== Unified Services Launcher v{VERSION} ===")
         logger.info(f"Servizi da avviare: {len(self.services)}")
+
+        # FASE 0: Termina processi ngrok zombie (liberano sessioni per nuovo tunnel)
+        cleanup_ngrok_sessions()
 
         # FASE 1: Libera le porte occupate prima di avviare i servizi
         ports_to_check = [s.port for s in self.services.values()]
