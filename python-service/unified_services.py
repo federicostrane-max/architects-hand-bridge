@@ -41,7 +41,7 @@ import aiohttp
 # CONFIGURATION
 # ============================================================================
 
-VERSION = "1.3.0"  # Aggiunto cleanup ngrok zombie sessions
+VERSION = "1.4.0"  # Fix signal handler crash su Windows
 
 # Percorsi dei servizi (nella stessa directory di questo script)
 SCRIPT_DIR = Path(__file__).parent.absolute()
@@ -435,12 +435,18 @@ class UnifiedServiceManager:
         """Gestisce il crash di un servizio."""
         if service.restart_count >= MAX_RESTART_ATTEMPTS:
             logger.error(f"[{service.name}] Raggiunto limite massimo restart ({MAX_RESTART_ATTEMPTS})")
+            logger.error(f"[{service.name}] Servizio disabilitato per questa sessione")
+            # Non prova più a riavviare questo servizio
             return
 
         service.restart_count += 1
         logger.info(f"[{service.name}] Tentativo restart {service.restart_count}/{MAX_RESTART_ATTEMPTS}")
 
-        await asyncio.sleep(RESTART_DELAY)
+        # Delay esponenziale tra restart per evitare loop rapidi
+        delay = RESTART_DELAY * (2 ** (service.restart_count - 1))  # 2s, 4s, 8s
+        logger.info(f"[{service.name}] Attesa {delay}s prima del restart...")
+
+        await asyncio.sleep(delay)
 
         # Verifica e libera la porta prima del restart
         if is_port_in_use(service.port):
@@ -488,16 +494,22 @@ class UnifiedServiceManager:
 # ============================================================================
 
 manager: Optional[UnifiedServiceManager] = None
+_loop: Optional[asyncio.AbstractEventLoop] = None
 
 def signal_handler(signum, frame):
     """Handler per segnali di terminazione."""
     logger.info(f"Ricevuto segnale {signum}, arresto in corso...")
-    if manager:
-        # Programma lo shutdown nel event loop
-        asyncio.create_task(manager.stop_all())
+    if manager and _loop:
+        # Usa call_soon_threadsafe per schedulare lo shutdown in modo sicuro
+        # Questo è necessario perché il signal handler può essere chiamato
+        # da un thread diverso da quello del loop asyncio
+        _loop.call_soon_threadsafe(manager._shutdown_event.set)
 
 async def main():
-    global manager
+    global manager, _loop
+
+    # Salva riferimento al loop per il signal handler
+    _loop = asyncio.get_running_loop()
 
     # Parse arguments
     parser = argparse.ArgumentParser(description="Unified Services Launcher")
